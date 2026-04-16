@@ -818,3 +818,25 @@ print(f"       Info.plist (bundle name), GoogleService-Info.plist (Firebase conf
 print(f"  7. Update project.yml: name, bundleId, scheme name")
 print(f"  8. Run: cd App && xcodegen generate --spec project.yml")
 PYEOF
+
+# ── copy shared assets ────────────────────────────────────────────────────────
+
+ASSETS_SRC="$SCRIPT_DIR/assets/Assets.xcassets"
+
+if [[ -n "$OUTPUT_DIR" ]]; then
+    ASSETS_DST="$OUTPUT_DIR/App/Sources/App/Resources/Assets.xcassets"
+else
+    REPO_PARENT="$(dirname "$SCRIPT_DIR")"
+    SPORT_NAME_CAP="$(python3 -c "import yaml; s=yaml.safe_load(open('$SCRIPT_DIR/sports/$SPORT_SLUG.yaml')); print(s['sport']['name'].replace(' ',''))")"
+    PREFIX="$(python3 -c "import yaml; s=yaml.safe_load(open('$SCRIPT_DIR/sports/$SPORT_SLUG.yaml')); print(s['sport']['prefix'])")"
+    ASSETS_DST="$REPO_PARENT/$PREFIX-$SPORT_NAME_CAP-Client-iOS/App/Sources/App/Resources/Assets.xcassets"
+fi
+
+if [[ -d "$ASSETS_SRC" ]]; then
+    mkdir -p "$(dirname "$ASSETS_DST")"
+    cp -r "$ASSETS_SRC" "$ASSETS_DST"
+    echo "  copied Assets.xcassets → App/Sources/App/Resources/"
+    echo "         (AppIcon, InAppIcon, LaunchBackground — shared Black Katt branding)"
+else
+    echo "  warning: $ASSETS_SRC not found — skipping asset copy"
+fi
