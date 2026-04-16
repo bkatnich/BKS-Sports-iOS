@@ -171,7 +171,7 @@ config_keys += f"""\
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Utilities", f"ConfigurationKeys+{swift_name}.swift"), config_keys)
+write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"ConfigurationKeys+{swift_name}.swift"), config_keys)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. SportPositionMap extension
@@ -204,7 +204,7 @@ extension SportPositionMap {{
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Utilities", f"SportPositionMap+{swift_name}.swift"), pos_map)
+write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportPositionMap+{swift_name}.swift"), pos_map)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. ScoringCalculator implementation
@@ -279,7 +279,7 @@ extension ScoringCalculator where Self == {calc_name} {{
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Utilities", f"{calc_name}.swift"), calc_file)
+write(os.path.join(out_dir, "App/Sources/Core/Sport", f"{calc_name}.swift"), calc_file)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. GameEntry.swift
@@ -422,7 +422,7 @@ struct TeamScheduleCache: Codable {{
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Models/GameEntry.swift"), game_entry)
+write(os.path.join(out_dir, "App/Sources/Core/Models/GameEntry.swift"), game_entry)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. TierThresholds+<Sport>.swift
@@ -457,7 +457,7 @@ extension TierDisplayable {{
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Views", f"TierThresholds+{swift_name}.swift"), tier_thresh)
+write(os.path.join(out_dir, "App/Sources/Core/UI", f"TierThresholds+{swift_name}.swift"), tier_thresh)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. SportConfiguration factory extension
@@ -535,7 +535,7 @@ extension SportConfiguration {{
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Utilities", f"SportConfiguration+{swift_name}.swift"), sport_config)
+write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportConfiguration+{swift_name}.swift"), sport_config)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. GameLogViews.swift (sport-specific stat pills)
@@ -776,7 +776,7 @@ struct GameLogErrorView: View {{
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Features/Trending/GameLogViews.swift"), gamelog_views)
+write(os.path.join(out_dir, "App/Sources/Features/Trending/Views/GameLogViews.swift"), gamelog_views)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
@@ -787,13 +787,13 @@ print(f"✅ Scaffolded {app_name} at:")
 print(f"   {out_dir}")
 print()
 print("Generated files:")
-print(f"  App/Sources/Utilities/ConfigurationKeys+{swift_name}.swift")
-print(f"  App/Sources/Utilities/SportPositionMap+{swift_name}.swift")
-print(f"  App/Sources/Utilities/{calc_name}.swift")
-print(f"  App/Sources/Utilities/SportConfiguration+{swift_name}.swift")
-print(f"  App/Sources/Views/TierThresholds+{swift_name}.swift")
-print(f"  App/Sources/Models/GameEntry.swift")
-print(f"  App/Sources/Features/Trending/GameLogViews.swift")
+print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
+print(f"  App/Sources/Core/Sport/SportPositionMap+{swift_name}.swift")
+print(f"  App/Sources/Core/Sport/{calc_name}.swift")
+print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
+print(f"  App/Sources/Core/UI/TierThresholds+{swift_name}.swift")
+print(f"  App/Sources/Core/Models/GameEntry.swift")
+print(f"  App/Sources/Features/Trending/Views/GameLogViews.swift")
 print()
 print("Next steps:")
 print(f"  1. Copy BKS-Basketball-Client-iOS/App/ structure into {out_dir}/App/")
