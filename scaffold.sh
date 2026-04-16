@@ -303,10 +303,12 @@ init_assigns = "\n".join([f"        self.{s['key']} = {s['key']}" for s in stat_
 def avg_block(a):
     k = a["key"]
     src = a["sourceKey"]
+    d0 = chr(36) + "0"
+    d1 = chr(36) + "1"
     return f"""\
     var {k}: Double {{
         guard !entries.isEmpty else {{ return 0 }}
-        return Double(entries.reduce(0) {{ $0 + $1.{src} }}) / Double(entries.count)
+        return Double(entries.reduce(0) {{ {d0} + {d1}.{src} }}) / Double(entries.count)
     }}
 """
 
@@ -315,10 +317,12 @@ def pct_block(p):
     k = p["key"]
     made = p["madeKey"]
     att  = p["attemptedKey"]
+    d0 = chr(36) + "0"
+    d1 = chr(36) + "1"
     return f"""\
     var {k}: Double {{
-        let totalMade = entries.reduce(0) {{ $0 + $1.{made} }}
-        let totalAttempted = entries.reduce(0) {{ $0 + $1.{att} }}
+        let totalMade = entries.reduce(0) {{ {d0} + {d1}.{made} }}
+        let totalAttempted = entries.reduce(0) {{ {d0} + {d1}.{att} }}
         guard totalAttempted > 0 else {{ return 0 }}
         return Double(totalMade) / Double(totalAttempted) * 100
     }}
