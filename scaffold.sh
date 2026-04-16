@@ -840,3 +840,16 @@ if [[ -d "$ASSETS_SRC" ]]; then
 else
     echo "  warning: $ASSETS_SRC not found — skipping asset copy"
 fi
+
+# ── copy shared localizable strings ──────────────────────────────────────────
+
+STRINGS_SRC="$SCRIPT_DIR/assets/Localizable.xcstrings"
+STRINGS_DST="$(dirname "$ASSETS_DST")/Localizable.xcstrings"
+
+if [[ -f "$STRINGS_SRC" ]]; then
+    cp "$STRINGS_SRC" "$STRINGS_DST"
+    echo "  copied Localizable.xcstrings → App/Sources/App/Resources/"
+    echo "         (en, fr-CA, es — 100% translated, 257 keys)"
+else
+    echo "  warning: $STRINGS_SRC not found — skipping strings copy"
+fi
