@@ -1,0 +1,348 @@
+# BKS Basketball — Sport Specification
+# This file is the source of truth for all sport-specific values used
+# by the scaffold script to generate a new BKS app for this sport.
+
+sport:
+  name: Basketball
+  slug: basketball
+  prefix: BKS
+  appName: BKS Basketball
+  bundleId: com.blackkatt.bksbasketball
+  league: NBA
+  platform: iOS
+  deploymentTarget: "17.0"
+  xcodeVersion: "26.4"
+  swiftVersion: "5.10"
+
+# ---------------------------------------------------------------------------
+# Tab configuration
+# ---------------------------------------------------------------------------
+tabs:
+  trending:
+    label: Trending
+    icon: flame
+    hotLabel: Hot
+    coldLabel: Cold
+  prospecting:
+    label: Prospecting
+    icon: magnifyingglass
+    gemsLabel: Gems
+    foolsGoldLabel: "Fool's Gold"
+  projecting:
+    label: Projecting
+    icon: chart.line.uptrend.xyaxis
+    boomLabel: Boom
+    bustLabel: Bust
+
+# ---------------------------------------------------------------------------
+# Position filter chips (order determines display order in UI)
+# ---------------------------------------------------------------------------
+positions:
+  - label: Guards
+    terms: [Guard, G, PG, SG, Point Guard, Shooting Guard]
+  - label: Forwards
+    terms: [Forward, F, SF, PF, Small Forward, Power Forward]
+  - label: Centers
+    terms: [Center, C]
+
+# ---------------------------------------------------------------------------
+# Tier definitions (maps to TierLevel: elite / good / solid / bottom)
+# ---------------------------------------------------------------------------
+tiers:
+  elite:
+    label: Elite
+    thresholds:
+      - label: "Avg ≥ 35 min/game"
+        systemImage: clock
+      - label: "Avg ≥ 40 DK pts/game"
+        systemImage: bolt.fill
+  good:
+    label: Good
+    thresholds:
+      - label: "Avg ≥ 28 min/game"
+        systemImage: clock
+      - label: "Avg ≥ 28 DK pts/game"
+        systemImage: bolt.fill
+  solid:
+    label: Solid
+    thresholds:
+      - label: "Avg ≥ 20 min/game"
+        systemImage: clock
+      - label: "Avg ≥ 18 DK pts/game"
+        systemImage: bolt.fill
+  bottom:
+    label: Bottom Feeder
+    thresholds: []
+
+# ---------------------------------------------------------------------------
+# DFS scoring
+# ---------------------------------------------------------------------------
+scoring:
+  platform: draftkings
+  formula: nba_classic
+  calculator: DraftKingsNBACalculator
+  stats:
+    - key: points
+      type: Int
+      multiplier: 1.0
+    - key: threePointersMade
+      type: Int
+      multiplier: 0.5
+    - key: rebounds
+      type: Int
+      multiplier: 1.25
+    - key: assists
+      type: Int
+      multiplier: 1.5
+    - key: steals
+      type: Int
+      multiplier: 2.0
+    - key: blocks
+      type: Int
+      multiplier: 2.0
+    - key: turnovers
+      type: Int
+      multiplier: -0.5
+  bonuses:
+    - name: double_double
+      qualifyingStats: [points, rebounds, assists, steals, blocks]
+      threshold: 2
+      value: 1.5
+    - name: triple_double
+      qualifyingStats: [points, rebounds, assists, steals, blocks]
+      threshold: 3
+      value: 3.0
+
+# ---------------------------------------------------------------------------
+# Season structure
+# ---------------------------------------------------------------------------
+season:
+  hasPlayoffs: true
+  modes: [regular_season, playoffs, offseason]
+  offseasonMonths: [7, 8, 9]   # July–September
+
+# ---------------------------------------------------------------------------
+# Remote packages (pinned versions)
+# ---------------------------------------------------------------------------
+packages:
+  bkscore:
+    url: git@github.com:bkatnich/BKSCore.git
+    from: "1.0.1"
+  bksuicore:
+    url: git@github.com:bkatnich/BKSUICore.git
+    from: "1.0.4"
+  swinject:
+    url: https://github.com/Swinject/Swinject.git
+    from: "2.9.0"
+  firebaseSDK:
+    url: https://github.com/firebase/firebase-ios-sdk.git
+    from: "11.0.0"
+  firebaseProducts: [FirebaseAnalytics, FirebaseAuth, FirebaseAppCheck, FirebaseFirestore]
+
+# ---------------------------------------------------------------------------
+# API endpoints and field lists per service
+# ---------------------------------------------------------------------------
+api:
+  players:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_players
+    fields:
+      - id
+      - first_name
+      - last_name
+      - team
+      - position
+      - headshot_url
+      - nba_person_id
+      - player_tier
+      - avg_fantasy_score
+      - avg_fantasy_score_home
+      - avg_fantasy_score_away
+      - avg_minutes
+      - recent_game_scores
+      - trend_score
+      - trend_direction
+      - trend_acceleration
+      - hot_streak
+      - is_surging
+      - surging_category_count
+      - confidence_score
+      - consistency_score
+      - injury_status
+      - previous_injury_status
+      - injury_status_changed_at
+      - is_return_game_window
+      - days_since_return
+      - is_role_change
+      - usage_efficiency_signal
+    params: {}
+
+  opportunities:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_opportunities
+    fields:
+      - id
+      - first_name
+      - last_name
+      - team
+      - position
+      - opponent_abbr
+      - headshot_url
+      - nba_person_id
+      - opportunity_score
+      - opportunity_tier
+      - player_tier
+      - mode
+      - platform
+      - injury_status
+      - is_surging
+      - is_home
+      - playoff_rotation_multiplier
+      - rotation_tier
+      - playoff_trend_trust
+      - playoff_games_played
+    params:
+      limit: 25
+      platform: dk
+      mode: balanced
+
+  projections:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_projections
+    fields: []
+    params:
+      lookahead: 5
+      platform: dk
+      mode: gpp
+
+  todayGames:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_today_games
+
+  gameLog:
+    baseURL: https://api.balldontlie.io/v1
+    # Requires API key injected via GameLogAPIKey in Info.plist
+    apiKeyRequired: true
+
+# ---------------------------------------------------------------------------
+# Game log stat fields — drives GameEntry.swift and GameLogViews.swift
+# ---------------------------------------------------------------------------
+gamelog:
+  # Condition that marks a game as Did Not Play
+  isDNPCondition: 'minutes == "0" || minutes.isEmpty || minutes == "00"'
+
+  # Core game context fields (always present, not sport-specific)
+  context:
+    - key: gameID
+      type: String
+    - key: gameDate
+      type: Date
+    - key: opponent
+      type: String
+    - key: opponentAbbreviation
+      type: String
+    - key: isHomeGame
+      type: Bool
+    - key: result
+      type: GameResult
+    - key: plusMinus
+      type: String
+
+  # Sport-specific stat fields
+  stats:
+    - key: minutes
+      type: String
+      label: MIN
+      isPlayingTime: true
+    - key: points
+      type: Int
+      label: PTS
+    - key: rebounds
+      type: Int
+      label: REB
+    - key: assists
+      type: Int
+      label: AST
+    - key: steals
+      type: Int
+      label: STL
+    - key: blocks
+      type: Int
+      label: BLK
+    - key: turnovers
+      type: Int
+      label: TO
+    - key: fieldGoalsMade
+      type: Int
+      label: FGM
+    - key: fieldGoalsAttempted
+      type: Int
+      label: FGA
+    - key: threePointersMade
+      type: Int
+      label: 3PM
+    - key: threePointersAttempted
+      type: Int
+      label: 3PA
+    - key: freeThrowsMade
+      type: Int
+      label: FTM
+    - key: freeThrowsAttempted
+      type: Int
+      label: FTA
+
+  # Computed averages exposed on PlayerGameLog
+  averages:
+    - key: averagePoints
+      sourceKey: points
+      label: PPG
+    - key: averageRebounds
+      sourceKey: rebounds
+      label: RPG
+    - key: averageAssists
+      sourceKey: assists
+      label: APG
+    - key: averageSteals
+      sourceKey: steals
+      label: SPG
+
+  # Shooting percentage computed from made/attempted pairs
+  percentages:
+    - key: fieldGoalPercentage
+      madeKey: fieldGoalsMade
+      attemptedKey: fieldGoalsAttempted
+      label: FG%
+
+  # Display layout in GameLogTableView
+  display:
+    primary:
+      - key: dk          # synthetic — computed by ScoringCalculator
+        label: DK
+        localizationKey: gamelog.header.dk
+        color: dkGreen
+      - key: points
+        label: PTS
+        localizationKey: gamelog.header.pts
+      - key: rebounds
+        label: REB
+        localizationKey: gamelog.header.reb
+      - key: assists
+        label: AST
+        localizationKey: gamelog.header.ast
+    secondary:
+      - key: steals
+        label: STL
+        localizationKey: gamelog.header.stl
+      - key: blocks
+        label: BLK
+        localizationKey: gamelog.header.blk
+      - key: threePointersMade
+        label: 3PM
+        localizationKey: gamelog.header.3pm
+      - key: turnovers
+        label: TO
+        localizationKey: gamelog.header.to
+      - key: minutes
+        label: MIN
+        localizationKey: gamelog.header.min
+
+# ---------------------------------------------------------------------------
+# Context file (used by LLM scaffold prompts)
+# ---------------------------------------------------------------------------
+context: context/basketball.md
