@@ -533,9 +533,7 @@ extension SportConfiguration {{
         ],
         opportunityParams: OpportunityParams(limit: {opp_limit}, platform: "{opp_platform}", mode: "{opp_mode}"),
         projectionParams: ProjectionParams(lookahead: {proj_look}, platform: "{proj_plat}", mode: "{proj_mode}"),
-        teamAbbreviationByID: [
-{team_lookup_comment}
-        ]
+        teamAbbreviationByID: [:] {team_lookup_comment}
     )
 }}
 """
@@ -784,6 +782,108 @@ struct GameLogErrorView: View {{
 write(os.path.join(out_dir, "App/Sources/Features/Trending/Views/GameLogViews.swift"), gamelog_views)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 8a. ScoringCalculator.swift  (protocol — app-side, not in BKSCore)
+# ─────────────────────────────────────────────────────────────────────────────
+
+scoring_calculator_proto = header() + f"""\
+import Foundation
+
+/// Computes a DFS fantasy score for a single game entry.
+///
+/// Each sport/platform combination provides its own implementation.
+protocol ScoringCalculator {{
+    /// Returns the DFS fantasy score for the given game entry stats.
+    func score(for entry: GameEntry) -> Double
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Sport", "ScoringCalculator.swift"), scoring_calculator_proto)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8b. SportPositionMap.swift  (base struct — app-side, not in BKSCore)
+# ─────────────────────────────────────────────────────────────────────────────
+
+sport_position_map_base = header() + f"""\
+import Foundation
+
+/// Maps broad UI chip labels to the raw position strings returned by the API,
+/// enabling sport-agnostic position filtering.
+struct SportPositionMap {{
+    let filterChips: [String]
+    private let terms: [String: [String]]
+
+    init(filterChips: [String], terms: [String: [String]]) {{
+        self.filterChips = filterChips
+        self.terms = terms
+    }}
+
+    func matchesChip(_ chip: String?, position: String?) -> Bool {{
+        guard let chip else {{ return true }}
+        guard let position, !position.isEmpty else {{ return false }}
+        guard let chipTerms = terms[chip] else {{ return false }}
+        let pos = position.lowercased()
+        for term in chipTerms where pos == term.lowercased() {{ return true }}
+        if pos.contains("-") {{
+            let parts = pos.split(separator: "-").map {{ $0.lowercased() }}
+            for part in parts {{
+                for term in chipTerms where part == term.lowercased() {{ return true }}
+            }}
+        }}
+        return false
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Sport", "SportPositionMap.swift"), sport_position_map_base)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8c. SportConfiguration.swift  (base struct — app-side, not in BKSCore)
+# ─────────────────────────────────────────────────────────────────────────────
+
+sport_config_base = header() + f"""\
+import BKSCore
+import BKSUICore
+
+// MARK: - SportConfiguration
+
+/// Centralises all sport-specific values used by services, views, and reducers.
+struct SportConfiguration {{
+    let slug: String
+    let cacheKeyPrefix: String
+    let positionMap: SportPositionMap
+    let scoringCalculator: any ScoringCalculator
+    let tierThresholds: [TierLevel: [TierThreshold]]
+    let trendingFields: [String]
+    let opportunityFields: [String]
+    let opportunityParams: OpportunityParams
+    let projectionParams: ProjectionParams
+    let teamAbbreviationByID: [Int: String]
+
+    struct OpportunityParams {{
+        let limit: Int
+        let platform: String
+        let mode: String
+    }}
+
+    struct ProjectionParams {{
+        let lookahead: Int
+        let platform: String
+        let mode: String
+    }}
+
+    func teamAbbreviation(for teamID: Int) -> String {{
+        teamAbbreviationByID[teamID] ?? ""
+    }}
+
+    func thresholds(for level: TierLevel) -> [TierThreshold] {{
+        tierThresholds[level] ?? []
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Sport", "SportConfiguration.swift"), sport_config_base)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 8. SportConfiguration+Environment.swift
 #    Defines the SwiftUI EnvironmentKey for SportConfiguration.
 #    This is app-side code — not part of BKSCore or BKSUICore.
@@ -819,6 +919,356 @@ extension View {{
 """
 
 write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportConfiguration+Environment.swift"), sport_config_env)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8d. Bootstrap files  (App/Sources/App/Bootstrap/)
+#     Minimal entry point + DI container + Firebase wiring.
+#     Feature views/services are ported manually as development continues.
+# ─────────────────────────────────────────────────────────────────────────────
+
+bootstrap_app = header() + f"""\
+import BackgroundTasks
+import BKSCore
+import BKSUICore
+import FirebaseAnalytics
+import FirebaseAppCheck
+import FirebaseCore
+import OSLog
+import SwiftUI
+import Swinject
+import UIKit
+
+@main
+struct {type_prefix}App: App {{
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "AppLifecycle"
+    )
+
+    @ObservedObject private var authStore: Store<AuthState, AuthIntent>
+    @StateObject private var networkMonitor = NetworkMonitor()
+
+    private let configuration: ConfigurationProtocol
+    private let auth: AuthenticationProtocol
+    private let analyticsAdapter = FirebaseAnalyticsAdapter()
+
+    init() {{
+        Self.logLaunchDiagnostics()
+        let container = Container.defaultContainer()
+        authStore = container.require(Store<AuthState, AuthIntent>.self)
+        auth = container.require(AuthenticationProtocol.self)
+        configuration = container.require(ConfigurationProtocol.self)
+        TrendRefreshTask.register()
+    }}
+
+    private static func logLaunchDiagnostics() {{
+        let bundle = Bundle.main
+        let appName = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Unknown"
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let bundleID = bundle.bundleIdentifier ?? "Unknown"
+        let device = UIDevice.current
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
+        #if DEBUG
+            let configuration = "DEBUG"
+        #else
+            let configuration = "RELEASE"
+        #endif
+        logger.info("App Launch — \\\\(appName) v\\\\(version) (\\\\(build)) [\\\\(configuration)]")
+        logger.info("Device — \\\\(device.model) · \\\\(device.systemName) \\\\(osVersion)")
+        logger.debug("Bundle ID — \\\\(bundleID)")
+    }}
+
+    @State private var splashDismissed = false
+
+    private var authSessionResolved: Bool {{
+        if case .undetermined = authStore.state.session {{ return false }}
+        return true
+    }}
+
+    var body: some Scene {{
+        WindowGroup {{
+            rootView
+                .environmentObject(networkMonitor)
+                .appConfiguration(configuration)
+                .sportConfiguration(.{slug})
+                .analytics(analyticsAdapter)
+                .task {{ authStore.send(.checkStoredCredential) }}
+                .onReceive(
+                    NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+                ) {{ _ in
+                    analyticsAdapter.logEvent(AnalyticsEvent.appBackgrounded, parameters: nil)
+                    TrendRefreshTask.scheduleIfNeeded()
+                }}
+                .onReceive(
+                    NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
+                ) {{ _ in
+                    analyticsAdapter.logEvent(AnalyticsEvent.appForegrounded, parameters: nil)
+                }}
+                .preferredColorScheme(.dark)
+        }}
+    }}
+
+    private var rootView: some View {{
+        ZStack {{
+            switch authStore.state.session {{
+            case .undetermined:
+                Color.clear
+            case .unauthenticated:
+                // TODO: Add SignInView once feature views are ported
+                Color.clear
+            case .authenticated:
+                // TODO: Add AppShell once feature views are ported
+                Color.clear
+            }}
+            if !splashDismissed {{
+                SplashView(onDismiss: {{ splashDismissed = true }},
+                           authSessionResolved: authSessionResolved)
+            }}
+        }}
+        .animation(.easeInOut(duration: 0.4), value: {{
+            if case .authenticated = authStore.state.session {{ return true }}
+            return false
+        }}())
+    }}
+}}
+
+// MARK: - AppDelegate
+
+final class AppDelegate: NSObject, UIApplicationDelegate {{
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "AppDelegate"
+    )
+
+    private static func loadDetailedAnalyticsPreference() {{
+        guard let data = UserDefaults.standard.data(forKey: UserPreferences.storageKey),
+              let prefs = try? JSONDecoder().decode(UserPreferences.self, from: data)
+        else {{ return }}
+        FirebaseAnalyticsAdapter.detailedEnabled = prefs.detailedAnalyticsEnabled
+    }}
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {{
+        #if DEBUG
+            AppCheck.setAppCheckProviderFactory(AppCheckDebugProviderFactory())
+            let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
+            logger.debug("Bundle identifier: \\\\(bundleID)")
+        #else
+            AppCheck.setAppCheckProviderFactory(AppAttestProviderFactory())
+        #endif
+        FirebaseApp.configure()
+        Analytics.setAnalyticsCollectionEnabled(true)
+        Analytics.logEvent(AnalyticsEvent.appStartUp, parameters: nil)
+        Self.loadDetailedAnalyticsPreference()
+        return true
+    }}
+}}
+"""
+
+bootstrap_container = header() + f"""\
+import Alamofire
+import BKSCore
+import BKSUICore
+import FirebaseAuth
+import Swinject
+
+// MARK: - Resolver + require
+
+extension Resolver {{
+    func require<T>(_ type: T.Type, name: String? = nil) -> T {{
+        if let name {{
+            guard let resolved = resolve(type, name: name) else {{
+                preconditionFailure("DI: missing registration for \\\\(type) (name: \\\\(name))")
+            }}
+            return resolved
+        }}
+        guard let resolved = resolve(type) else {{
+            preconditionFailure("DI: missing registration for \\\\(type)")
+        }}
+        return resolved
+    }}
+}}
+
+// MARK: - Container
+
+extension Container {{
+    @MainActor
+    static func defaultContainer() -> Container {{
+        let container = Container()
+        container.registerSportConfiguration()
+        container.registerCoreServices()
+        container.registerFeatureStores()
+        return container
+    }}
+
+    private func registerSportConfiguration() {{
+        register(SportConfiguration.self) {{ _ in .{slug} }}.inObjectScope(.container)
+    }}
+
+    private func registerCoreServices() {{
+        register(LoggerProtocol.self) {{ _ in AppLogger(category: "General") }}
+        register(StorageProtocol.self) {{ _ in Storage() }}
+        register(ConfigurationProtocol.self) {{ resolver in
+            Configuration(storage: resolver.require(StorageProtocol.self))
+        }}
+        register(NetworkProtocol.self, name: "firebase") {{ _ in
+            let authInterceptor = FirebaseAuthInterceptor {{ forcingRefresh in
+                guard let user = Auth.auth().currentUser else {{
+                    struct Unauthenticated: Error {{}}
+                    throw Unauthenticated()
+                }}
+                return try await user.getIDToken(forcingRefresh: forcingRefresh)
+            }}
+            let retryPolicy = RetryPolicy(retryLimit: 2, exponentialBackoffBase: 2, exponentialBackoffScale: 0.5)
+            let interceptor = Interceptor(adapters: [authInterceptor], retriers: [authInterceptor, retryPolicy])
+            return Network(interceptor: interceptor)
+        }}
+        register(NetworkProtocol.self, name: "apiKey") {{ resolver in
+            let config = resolver.require(ConfigurationProtocol.self)
+            let apiKeyInterceptor = APIKeyInterceptor(apiKey: config.value(for: .gameLogAPIKey))
+            let retryPolicy = RetryPolicy(retryLimit: 2, exponentialBackoffBase: 2, exponentialBackoffScale: 0.5)
+            let interceptor = Interceptor(adapters: [apiKeyInterceptor], retriers: [retryPolicy])
+            return Network(interceptor: interceptor)
+        }}
+        register(MetricsCollectorProtocol.self) {{ _ in MetricsCollector() }}.inObjectScope(.container)
+        register(AuthenticationProtocol.self) {{ resolver in
+            Authentication(configuration: resolver.require(ConfigurationProtocol.self))
+        }}
+    }}
+
+    @MainActor
+    private func registerFeatureStores() {{
+        register(Store<AuthState, AuthIntent>.self) {{ resolver in
+            let storage = resolver.require(StorageProtocol.self)
+            let auth = resolver.require(AuthenticationProtocol.self)
+            return MainActor.assumeIsolated {{
+                Store(initial: AuthState(), reduce: AuthState.makeReduce(storage: storage, auth: auth))
+            }}
+        }}
+    }}
+}}
+"""
+
+bootstrap_auth = header() + f"""\
+import FirebaseAuth
+import BKSCore
+import Foundation
+import OSLog
+
+final class Authentication: AuthenticationProtocol {{
+    private let logger = os.Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "Authentication"
+    )
+
+    init(configuration: ConfigurationProtocol) {{}}
+
+    func createUser(withEmail email: String, password: String) async throws -> AuthResult {{
+        let result = try await Auth.auth().createUser(withEmail: email, password: password)
+        return AuthResult(provider: .email, userID: result.user.uid,
+                         email: result.user.email, displayName: result.user.displayName)
+    }}
+
+    func signIn(withEmail email: String, password: String) async throws -> AuthResult {{
+        let result = try await Auth.auth().signIn(withEmail: email, password: password)
+        return AuthResult(provider: .email, userID: result.user.uid,
+                         email: result.user.email, displayName: result.user.displayName)
+    }}
+
+    func sendPasswordReset(toEmail email: String) async throws {{
+        try await Auth.auth().sendPasswordReset(withEmail: email)
+    }}
+
+    func signOut() {{
+        try? Auth.auth().signOut()
+    }}
+
+    func deleteAccount() async throws {{
+        try await Auth.auth().currentUser?.delete()
+    }}
+
+    func validateCredential(_ credential: StoredCredential) async -> Bool {{
+        guard let user = Auth.auth().currentUser else {{ return false }}
+        return (try? await user.getIDToken(forcingRefresh: false)) != nil
+    }}
+}}
+"""
+
+bootstrap_analytics = header() + f"""\
+import BKSCore
+import FirebaseAnalytics
+
+struct FirebaseAnalyticsAdapter: AnalyticsConfigurable {{
+    static var detailedEnabled = false
+
+    func setDetailedCollectionEnabled(_ enabled: Bool) {{
+        Self.detailedEnabled = enabled
+    }}
+
+    func logEvent(_ name: String, parameters: [String: String]?) {{
+        Analytics.logEvent(name, parameters: parameters)
+    }}
+
+    func logDetailedEvent(_ name: String, parameters: [String: String]?) {{
+        guard Self.detailedEnabled else {{ return }}
+        Analytics.logEvent(name, parameters: parameters)
+    }}
+}}
+"""
+
+bootstrap_trend = header() + f"""\
+import BackgroundTasks
+import OSLog
+
+enum TrendRefreshTask {{
+    static let identifier = "{bundle_id}.trendrefresh"
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "TrendRefreshTask"
+    )
+
+    static func register() {{
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) {{ task in
+            guard let processingTask = task as? BGProcessingTask else {{ return }}
+            scheduleIfNeeded()
+            // TODO: wire up services once they are ported
+            processingTask.setTaskCompleted(success: true)
+        }}
+    }}
+
+    static func scheduleIfNeeded() {{
+        let request = BGProcessingTaskRequest(identifier: identifier)
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = false
+        request.earliestBeginDate = nextScheduledDate()
+        try? BGTaskScheduler.shared.submit(request)
+    }}
+
+    private static func nextScheduledDate() -> Date {{
+        var components = Calendar.current.dateComponents([.year, .month, .day], from: Date.now)
+        components.hour = 3; components.minute = 0; components.second = 0
+        guard let todayAt3am = Calendar.current.date(from: components) else {{
+            return Date.now.addingTimeInterval(86400)
+        }}
+        return todayAt3am > Date.now
+            ? todayAt3am
+            : Calendar.current.date(byAdding: .day, value: 1, to: todayAt3am) ?? todayAt3am
+    }}
+}}
+"""
+
+bootstrap_dir = os.path.join(out_dir, "App/Sources/App/Bootstrap")
+write(os.path.join(bootstrap_dir, f"{type_prefix}App.swift"), bootstrap_app)
+write(os.path.join(bootstrap_dir, "DependencyContainer.swift"), bootstrap_container)
+write(os.path.join(bootstrap_dir, "Authentication.swift"), bootstrap_auth)
+write(os.path.join(bootstrap_dir, "FirebaseAnalyticsAdapter.swift"), bootstrap_analytics)
+write(os.path.join(bootstrap_dir, "TrendRefreshTask.swift"), bootstrap_trend)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. project.yml  (XcodeGen spec)
@@ -1592,6 +2042,9 @@ print(f"   {out_dir}")
 print()
 print("Swift source files:")
 print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
+print(f"  App/Sources/Core/Sport/ScoringCalculator.swift")
+print(f"  App/Sources/Core/Sport/SportPositionMap.swift")
+print(f"  App/Sources/Core/Sport/SportConfiguration.swift")
 print(f"  App/Sources/Core/Sport/SportPositionMap+{swift_name}.swift")
 print(f"  App/Sources/Core/Sport/{calc_name}.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
@@ -1599,6 +2052,11 @@ print(f"  App/Sources/Core/UI/TierThresholds+{swift_name}.swift")
 print(f"  App/Sources/Core/Models/GameEntry.swift")
 print(f"  App/Sources/Features/Trending/Views/GameLogViews.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+Environment.swift")
+print(f"  App/Sources/App/Bootstrap/{type_prefix}App.swift")
+print(f"  App/Sources/App/Bootstrap/DependencyContainer.swift")
+print(f"  App/Sources/App/Bootstrap/Authentication.swift")
+print(f"  App/Sources/App/Bootstrap/FirebaseAnalyticsAdapter.swift")
+print(f"  App/Sources/App/Bootstrap/TrendRefreshTask.swift")
 print()
 print("Project infrastructure:")
 print(f"  App/project.yml                                  ← XcodeGen spec (packages, targets, schemes)")

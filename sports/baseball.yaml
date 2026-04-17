@@ -113,10 +113,10 @@ scoring:
       type: Int
       multiplier: 5.0
     - key: sacrificeFly
-      type: Double
+      type: Int
       multiplier: 1.25
     - key: sacrificeHit
-      type: Double
+      type: Int
       multiplier: 1.25
     # Pitcher stats
     - key: inningsPitched
@@ -185,7 +185,7 @@ packages:
 # ---------------------------------------------------------------------------
 api:
   players:
-    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_players  # TODO: MLB endpoint
+    url: https://us-central1-bks-baseball.cloudfunctions.net/get_players
     fields:
       - id
       - first_name
@@ -217,7 +217,7 @@ api:
     params: {}
 
   opportunities:
-    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_opportunities  # TODO: MLB endpoint
+    url: https://us-central1-bks-baseball.cloudfunctions.net/get_opportunities
     fields:
       - id
       - first_name
@@ -244,7 +244,7 @@ api:
       mode: balanced
 
   projections:
-    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_projections  # TODO: MLB endpoint
+    url: https://us-central1-bks-baseball.cloudfunctions.net/get_projections
     fields: []
     params:
       lookahead: 5
@@ -252,7 +252,7 @@ api:
       mode: gpp
 
   todayGames:
-    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_today_games  # TODO: MLB endpoint
+    url: https://us-central1-bks-baseball.cloudfunctions.net/get_today_games
 
   gameLog:
     baseURL: https://api.balldontlie.io/mlb/v1
