@@ -52,23 +52,35 @@ tiers:
   elite:
     label: Elite
     thresholds:
+      - label: "Simplified PER ≥ 23"
+        systemImage: chart.line.uptrend.xyaxis
+      - label: "True Shooting ≥ 60%"
+        systemImage: target
       - label: "Avg ≥ 35 min/game"
         systemImage: clock
-      - label: "Avg ≥ 40 DK pts/game"
+      - label: "Avg ≥ 38 DK pts/game"
         systemImage: bolt.fill
   good:
     label: Good
     thresholds:
+      - label: "Simplified PER ≥ 16"
+        systemImage: chart.line.uptrend.xyaxis
+      - label: "True Shooting ≥ 57%"
+        systemImage: target
       - label: "Avg ≥ 28 min/game"
         systemImage: clock
-      - label: "Avg ≥ 28 DK pts/game"
+      - label: "Avg ≥ 26 DK pts/game"
         systemImage: bolt.fill
   solid:
     label: Solid
     thresholds:
+      - label: "Simplified PER ≥ 11"
+        systemImage: chart.line.uptrend.xyaxis
+      - label: "True Shooting ≥ 54%"
+        systemImage: target
       - label: "Avg ≥ 20 min/game"
         systemImage: clock
-      - label: "Avg ≥ 18 DK pts/game"
+      - label: "Avg ≥ 16 DK pts/game"
         systemImage: bolt.fill
   bottom:
     label: Bottom Feeder
