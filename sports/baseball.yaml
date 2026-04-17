@@ -1,0 +1,425 @@
+# BKS Baseball — Sport Specification
+# This file is the source of truth for all sport-specific values used
+# by the scaffold script to generate a new BKS app for this sport.
+
+sport:
+  name: Baseball
+  slug: baseball
+  prefix: BKS
+  appName: BKS Baseball
+  bundleId: com.blackkatt.bksbaseball
+  league: MLB
+  platform: iOS
+  deploymentTarget: "17.0"
+  xcodeVersion: "26.4"
+  swiftVersion: "5.10"
+
+# ---------------------------------------------------------------------------
+# Tab configuration
+# ---------------------------------------------------------------------------
+tabs:
+  trending:
+    label: Trending
+    icon: flame
+    hotLabel: Hot
+    coldLabel: Cold
+  prospecting:
+    label: Prospecting
+    icon: magnifyingglass
+    gemsLabel: Gems
+    foolsGoldLabel: "Fool's Gold"
+  projecting:
+    label: Projecting
+    icon: chart.line.uptrend.xyaxis
+    boomLabel: Boom
+    bustLabel: Bust
+
+# ---------------------------------------------------------------------------
+# Position filter chips (order determines display order in UI)
+# ---------------------------------------------------------------------------
+positions:
+  - label: Pitchers
+    terms: [Pitchers, P]
+  - label: Infielders
+    terms: [Infielder, Inf, First Base, FB, Second Base, SB, Short Stop, SS, Third Base, TB, Catcher, C]
+  - label: Outfielders
+    terms: [Outfielder, Out, Right Fielder, RF, Center Fielder, Centre Fielder, CF, Left Fielder, LF]
+
+# ---------------------------------------------------------------------------
+# Tier definitions (maps to TierLevel: elite / good / solid / bottom)
+# ---------------------------------------------------------------------------
+tiers:
+  elite:
+    label: Elite
+    thresholds:
+      - label: "6.0+ WAR (season)"
+        systemImage: star.fill
+      - label: "ERA+ 150+ / wRC+ 130+"
+        systemImage: chart.bar.fill
+  good:
+    label: Pretty Good
+    thresholds:
+      - label: "3.5 – 5.9 WAR"
+        systemImage: star.leadinghalf.filled
+      - label: "ERA+ 115–149 / wRC+ 110–129"
+        systemImage: chart.bar
+  solid:
+    label: Solid
+    thresholds:
+      - label: "2.0 – 3.4 WAR"
+        systemImage: checkmark.seal.fill
+      - label: "ERA+ 100–114 / wRC+ 95–109"
+        systemImage: chart.bar
+  bottom:
+    label: Benchwarmer
+    thresholds:
+      - label: "Below 1.5 WAR"
+        systemImage: minus.circle
+
+# ---------------------------------------------------------------------------
+# DFS scoring
+# ---------------------------------------------------------------------------
+scoring:
+  platform: draftkings
+  formula: mlb_classic
+  calculator: DraftKingsMLBCalculator
+  stats:
+    # Hitter stats
+    - key: single
+      type: Int
+      multiplier: 3.0
+    - key: double
+      type: Int
+      multiplier: 5.0
+    - key: triple
+      type: Int
+      multiplier: 8.0
+    - key: homeRun
+      type: Int
+      multiplier: 10.0
+    - key: rbi
+      type: Int
+      multiplier: 2.0
+    - key: run
+      type: Int
+      multiplier: 2.0
+    - key: walk
+      type: Int
+      multiplier: 2.0
+    - key: hitByPitch
+      type: Int
+      multiplier: 2.0
+    - key: stolenBase
+      type: Int
+      multiplier: 5.0
+    - key: sacrificeFly
+      type: Double
+      multiplier: 1.25
+    - key: sacrificeHit
+      type: Double
+      multiplier: 1.25
+    # Pitcher stats
+    - key: inningsPitched
+      type: Double
+      multiplier: 2.25
+    - key: strikeoutPitching
+      type: Int
+      multiplier: 2.0
+    - key: win
+      type: Int
+      multiplier: 4.0
+    - key: earnedRunAllowed
+      type: Int
+      multiplier: -2.0
+    - key: hitAgainst
+      type: Int
+      multiplier: -0.6
+    - key: walkAgainst
+      type: Int
+      multiplier: -0.6
+    - key: hitBatsmanAgainst
+      type: Int
+      multiplier: -0.6
+  bonuses:
+    - name: complete_game
+      qualifyingStats: [completeGame]
+      threshold: 1
+      value: 2.5
+    - name: complete_game_shutout
+      qualifyingStats: [completeGameShutout]
+      threshold: 1
+      value: 2.5
+    - name: no_hitter
+      qualifyingStats: [noHitter]
+      threshold: 1
+      value: 5.0
+
+# ---------------------------------------------------------------------------
+# Season structure
+# ---------------------------------------------------------------------------
+season:
+  hasPlayoffs: true
+  modes: [regular_season, playoffs, offseason]
+  offseasonMonths: [10, 11, 12, 1, 2, 3]   # October–March
+
+# ---------------------------------------------------------------------------
+# Remote packages (pinned versions)
+# ---------------------------------------------------------------------------
+packages:
+  bkscore:
+    url: git@github.com:bkatnich/BKSCore.git
+    from: "1.0.1"
+  bksuicore:
+    url: git@github.com:bkatnich/BKSUICore.git
+    from: "1.0.16"
+  swinject:
+    url: https://github.com/Swinject/Swinject.git
+    from: "2.9.0"
+  firebaseSDK:
+    url: https://github.com/firebase/firebase-ios-sdk.git
+    from: "11.0.0"
+  firebaseProducts: [FirebaseAnalytics, FirebaseAuth, FirebaseAppCheck, FirebaseFirestore]
+
+# ---------------------------------------------------------------------------
+# API endpoints and field lists per service
+# ---------------------------------------------------------------------------
+api:
+  players:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_players  # TODO: MLB endpoint
+    fields:
+      - id
+      - first_name
+      - last_name
+      - team
+      - position
+      - headshot_url
+      - mlb_person_id
+      - player_tier
+      - avg_fantasy_score
+      - avg_fantasy_score_home
+      - avg_fantasy_score_away
+      - recent_game_scores
+      - trend_score
+      - trend_direction
+      - trend_acceleration
+      - hot_streak
+      - is_surging
+      - surging_category_count
+      - confidence_score
+      - consistency_score
+      - injury_status
+      - previous_injury_status
+      - injury_status_changed_at
+      - is_return_game_window
+      - days_since_return
+      - is_role_change
+      - usage_efficiency_signal
+    params: {}
+
+  opportunities:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_opportunities  # TODO: MLB endpoint
+    fields:
+      - id
+      - first_name
+      - last_name
+      - team
+      - position
+      - opponent_abbr
+      - headshot_url
+      - mlb_person_id
+      - opportunity_score
+      - opportunity_tier
+      - player_tier
+      - mode
+      - platform
+      - injury_status
+      - is_surging
+      - is_home
+      - probable_pitcher
+      - batting_order
+      - park_factor
+    params:
+      limit: 25
+      platform: dk
+      mode: balanced
+
+  projections:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_projections  # TODO: MLB endpoint
+    fields: []
+    params:
+      lookahead: 5
+      platform: dk
+      mode: gpp
+
+  todayGames:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_today_games  # TODO: MLB endpoint
+
+  gameLog:
+    baseURL: https://api.balldontlie.io/mlb/v1
+    # Requires API key injected via GameLogAPIKey in Info.plist
+    # Full stat access requires GOAT tier ($39.99/mo) or All-Access ($499.99/mo)
+    apiKeyRequired: true
+
+# ---------------------------------------------------------------------------
+# Game log stat fields — drives GameEntry.swift and GameLogViews.swift
+# ---------------------------------------------------------------------------
+gamelog:
+  # Condition that marks a game as Did Not Play (no at-bats and no innings pitched)
+  isDNPCondition: 'atBats == 0 && inningsPitched == 0.0'
+
+  # Core game context fields (always present, not sport-specific)
+  context:
+    - key: gameID
+      type: String
+    - key: gameDate
+      type: Date
+    - key: opponent
+      type: String
+    - key: opponentAbbreviation
+      type: String
+    - key: isHomeGame
+      type: Bool
+    - key: result
+      type: GameResult
+
+  # All stat fields (hitter + pitcher combined — GameEntry holds all per-game stats)
+  stats:
+    - key: atBats
+      type: Int
+      label: AB
+    - key: single
+      type: Int
+      label: 1B
+    - key: double
+      type: Int
+      label: 2B
+    - key: triple
+      type: Int
+      label: 3B
+    - key: homeRun
+      type: Int
+      label: HR
+    - key: rbi
+      type: Int
+      label: RBI
+    - key: run
+      type: Int
+      label: R
+    - key: walk
+      type: Int
+      label: BB
+    - key: hitByPitch
+      type: Int
+      label: HBP
+    - key: stolenBase
+      type: Int
+      label: SB
+    - key: sacrificeFly
+      type: Int
+      label: SF
+    - key: sacrificeHit
+      type: Int
+      label: SH
+    - key: inningsPitched
+      type: Double
+      label: IP
+    - key: strikeoutPitching
+      type: Int
+      label: K
+    - key: win
+      type: Int
+      label: W
+    - key: earnedRunAllowed
+      type: Int
+      label: ER
+    - key: hitAgainst
+      type: Int
+      label: H
+    - key: walkAgainst
+      type: Int
+      label: BB
+    - key: hitBatsmanAgainst
+      type: Int
+      label: HBP
+    - key: completeGame
+      type: Int
+      label: CG
+    - key: completeGameShutout
+      type: Int
+      label: SHO
+    - key: noHitter
+      type: Int
+      label: NH
+
+  # Computed averages exposed on PlayerGameLog
+  averages:
+    - key: battingAverage
+      sourceKey: atBats
+      label: AVG
+    - key: averageHomeRuns
+      sourceKey: homeRun
+      label: HR/G
+    - key: averageRBI
+      sourceKey: rbi
+      label: RBI/G
+    - key: averageERA
+      sourceKey: earnedRunAllowed
+      label: ERA
+
+  # Slash-line percentages computed from raw counts
+  percentages:
+    - key: onBasePct
+      madeKey: walk
+      attemptedKey: atBats
+      label: OBP
+    - key: sluggingPct
+      madeKey: homeRun
+      attemptedKey: atBats
+      label: SLG
+
+  # Display layout in GameLogTableView
+  display:
+    primary:
+      - key: dk          # synthetic — computed by ScoringCalculator
+        label: DK
+        localizationKey: gamelog.header.dk
+        color: dkGreen
+      - key: homeRun
+        label: HR
+        localizationKey: gamelog.header.hr
+      - key: rbi
+        label: RBI
+        localizationKey: gamelog.header.rbi
+      - key: run
+        label: R
+        localizationKey: gamelog.header.r
+    secondary:
+      - key: single
+        label: 1B
+        localizationKey: gamelog.header.1b
+      - key: double
+        label: 2B
+        localizationKey: gamelog.header.2b
+      - key: triple
+        label: 3B
+        localizationKey: gamelog.header.3b
+      - key: stolenBase
+        label: SB
+        localizationKey: gamelog.header.sb
+      - key: walk
+        label: BB
+        localizationKey: gamelog.header.bb
+      - key: inningsPitched
+        label: IP
+        localizationKey: gamelog.header.ip
+      - key: strikeoutPitching
+        label: K
+        localizationKey: gamelog.header.k
+      - key: earnedRunAllowed
+        label: ER
+        localizationKey: gamelog.header.er
+
+# ---------------------------------------------------------------------------
+# Context file (used by LLM scaffold prompts)
+# ---------------------------------------------------------------------------
+context: context/baseball.md

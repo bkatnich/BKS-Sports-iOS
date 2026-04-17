@@ -50,7 +50,7 @@ OUTPUT_DIR="${2:-}"
 
 # ── python helper: parse yaml and emit scaffold ───────────────────────────────
 
-python3 << PYEOF
+SCRIPT_DIR="$SCRIPT_DIR" SPORT_SLUG="$SPORT_SLUG" OUTPUT_DIR="$OUTPUT_DIR" python3 << 'PYEOF'
 import sys, os, re, textwrap
 sys.path.insert(0, '')
 
@@ -60,9 +60,9 @@ except ImportError:
     print("Error: pyyaml not installed. Run: pip3 install pyyaml")
     sys.exit(1)
 
-SCRIPT_DIR  = "${SCRIPT_DIR}"
-SPORT_SLUG  = "${SPORT_SLUG}"
-OUTPUT_DIR  = "${OUTPUT_DIR}"  # empty string means auto-derive
+SCRIPT_DIR  = os.environ["SCRIPT_DIR"]
+SPORT_SLUG  = os.environ["SPORT_SLUG"]
+OUTPUT_DIR  = os.environ.get("OUTPUT_DIR", "")  # empty string means auto-derive
 
 # ── load spec ─────────────────────────────────────────────────────────────────
 
@@ -190,6 +190,7 @@ terms_block = ",\n".join(terms_lines)
 
 pos_map = header() + f"""\
 import Foundation
+import BKSCore
 
 // MARK: - {league} {name}
 
@@ -214,7 +215,8 @@ formula      = scoring.get("formula", "classic")
 stats        = scoring.get("stats", [])
 bonuses      = scoring.get("bonuses", [])
 
-# Build score expression
+# Build score expression — use var + individual += lines to avoid Swift type-checker timeouts
+# on long chained expressions (which occur with 10+ addends).
 score_lines = []
 for i, s in enumerate(stats):
     key = s["key"]
@@ -234,30 +236,33 @@ for i, s in enumerate(stats):
         score_lines.append(f"        var total = {expr}")
     else:
         if mul >= 0:
-            score_lines.append(f"            + {expr}")
+            score_lines.append(f"        total += {expr}")
         else:
-            # negative multiplier: emit as subtraction
-            pos_expr = expr.replace(f" * {mul}", f" * {abs(mul)}")
-            score_lines.append(f"            - {pos_expr}")
+            pos_expr = cast + f" * {abs(mul)}"
+            score_lines.append(f"        total -= {pos_expr}")
 score_expr = "\n".join(score_lines)
 
 # Build bonus logic
 bonus_lines = []
-for b in bonuses:
+for i, b in enumerate(bonuses):
     qualifying = b.get("qualifyingStats", [])
     threshold  = b["threshold"]
     value      = b["value"]
+    # Use bonus name (snake_case → camelCase) or fallback to index for unique var names
+    raw_name   = b.get("name", f"bonus{i}")
+    var_name   = re.sub(r"_([a-z])", lambda m: m.group(1).upper(), raw_name)
     if qualifying:
         quals = ", ".join([f"entry.{q}" for q in qualifying])
         d0 = chr(36) + "0"  # builds "$0" without triggering heredoc shell expansion
         bonus_lines.append(
-            f"        let doubles{threshold} = [{quals}].filter {{ {d0} >= 10 }}.count\n"
-            f"        if doubles{threshold} >= {threshold} {{ total += {value} }}"
+            f"        let {var_name}Count = [{quals}].filter {{ {d0} >= {threshold} }}.count\n"
+            f"        if {var_name}Count >= {threshold} {{ total += {value} }}"
         )
 bonus_block = "\n".join(bonus_lines)
 
 calc_file = header() + f"""\
 import Foundation
+import BKSCore
 
 // MARK: - DraftKings {league} {name} ({formula})
 
@@ -779,6 +784,805 @@ struct GameLogErrorView: View {{
 write(os.path.join(out_dir, "App/Sources/Features/Trending/Views/GameLogViews.swift"), gamelog_views)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 8. SportConfiguration+Environment.swift
+#    Defines the SwiftUI EnvironmentKey for SportConfiguration.
+#    This is app-side code — not part of BKSCore or BKSUICore.
+# ─────────────────────────────────────────────────────────────────────────────
+
+sport_config_env = header() + f"""\
+import SwiftUI
+
+// MARK: - EnvironmentKey
+
+private struct SportConfigurationKey: EnvironmentKey {{
+    static let defaultValue: SportConfiguration = .{slug}
+}}
+
+// MARK: - EnvironmentValues
+
+extension EnvironmentValues {{
+    /// The active sport configuration injected into the SwiftUI environment.
+    var sportConfiguration: SportConfiguration {{
+        get {{ self[SportConfigurationKey.self] }}
+        set {{ self[SportConfigurationKey.self] = newValue }}
+    }}
+}}
+
+// MARK: - View Helper
+
+extension View {{
+    /// Injects a `SportConfiguration` into the SwiftUI environment.
+    func sportConfiguration(_ config: SportConfiguration) -> some View {{
+        environment(\\.sportConfiguration, config)
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportConfiguration+Environment.swift"), sport_config_env)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. project.yml  (XcodeGen spec)
+# ─────────────────────────────────────────────────────────────────────────────
+
+pkg      = packages
+bkscore_from  = pkg.get("bkscore",   {}).get("from", "1.0.1")
+bksuicore_from = pkg.get("bksuicore", {}).get("from", "1.0.16")
+swinject_from = pkg.get("swinject",  {}).get("from", "2.9.0")
+firebase_from = pkg.get("firebaseSDK", {}).get("from", "11.0.0")
+firebase_products = pkg.get("firebaseProducts", ["FirebaseAnalytics", "FirebaseAuth", "FirebaseAppCheck", "FirebaseFirestore"])
+
+firebase_deps = "\n".join(
+    [f"      - package: FirebaseSDK\n        product: {p}" for p in firebase_products]
+)
+
+app_target = f"{prefix}{swift_name}"  # e.g. BKSBaseball
+
+project_yml = f"""\
+name: {app_target}
+options:
+  bundleIdPrefix: {bundle_id}
+  developmentLanguage: en
+  deploymentTarget:
+    iOS: "{deploy_tgt}"
+  xcodeVersion: "{xcode_ver}"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+packages:
+  BKSCore:
+    url: git@github.com:bkatnich/BKSCore.git
+    from: "{bkscore_from}"
+  BKSUICore:
+    url: git@github.com:bkatnich/BKSUICore.git
+    from: "{bksuicore_from}"
+  Swinject:
+    url: https://github.com/Swinject/Swinject.git
+    from: "{swinject_from}"
+  FirebaseSDK:
+    url: https://github.com/firebase/firebase-ios-sdk.git
+    from: "{firebase_from}"
+
+schemes:
+  {app_target}:
+    build:
+      targets:
+        {app_target}: all
+        {app_target}Tests: [test]
+    run:
+      config: Debug
+      commandLineArguments:
+        "-FIRAnalyticsDebugEnabled": true
+      environmentVariables:
+        - variable: FIRAAppCheckDebugToken
+          value: $(FIRA_APP_CHECK_DEBUG_TOKEN)
+          isEnabled: true
+    test:
+      config: Debug
+      targets:
+        - {app_target}Tests
+
+targets:
+  {app_target}:
+    type: application
+    platform: iOS
+    configFiles:
+      Debug: Config/Debug.xcconfig
+      Release: Config/Release.xcconfig
+    preBuildScripts:
+      - script: |
+          if command -v swiftlint > /dev/null; then
+            swiftlint --config "${{PROJECT_DIR}}/../.swiftlint.yml"
+          elif [ -f /opt/homebrew/bin/swiftlint ]; then
+            /opt/homebrew/bin/swiftlint --config "${{PROJECT_DIR}}/../.swiftlint.yml"
+          else
+            echo "warning: SwiftLint not installed"
+          fi
+        name: SwiftLint
+        basedOnDependencyAnalysis: false
+    sources:
+      - path: Sources
+        excludes:
+          - "**/.gitkeep"
+    settings:
+      base:
+        INFOPLIST_FILE: Sources/App/Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: false
+        CODE_SIGN_ENTITLEMENTS: Sources/App/Resources/{app_target}.entitlements
+        SWIFT_VERSION: "{swift_ver}"
+        TARGETED_DEVICE_FAMILY: "1"
+        PRODUCT_BUNDLE_IDENTIFIER: {bundle_id}
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    dependencies:
+      - package: BKSCore
+        product: BKSCore
+      - package: BKSUICore
+        product: BKSUICore
+      - package: Swinject
+{firebase_deps}
+    resources:
+      - path: Sources/App/Resources/Assets.xcassets
+      - path: Sources/App/Resources/Localizable.xcstrings
+      - path: Sources/App/Resources/PrivacyInfo.xcprivacy
+      - path: Sources/App/Resources/Configuration.plist
+      - path: Sources/App/Resources/GoogleService-Info.plist
+
+  {app_target}Tests:
+    type: bundle.unit-test
+    platform: iOS
+    configFiles:
+      Debug: Config/{app_target}Tests.xcconfig
+      Release: Config/{app_target}Tests.xcconfig
+    sources:
+      - path: Tests
+        excludes:
+          - "**/.gitkeep"
+    settings:
+      base:
+        SWIFT_VERSION: "{swift_ver}"
+        GENERATE_INFOPLIST_FILE: true
+    dependencies:
+      - target: {app_target}
+"""
+
+write(os.path.join(out_dir, "App/project.yml"), project_yml)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. xcconfig files
+# ─────────────────────────────────────────────────────────────────────────────
+
+base_xcconfig = f"""\
+// Base.xcconfig — shared across all configurations
+// Do not put secrets in this file.
+
+IPHONEOS_DEPLOYMENT_TARGET = {deploy_tgt}
+SWIFT_VERSION = {swift_ver}
+SDKROOT = iphoneos
+PRODUCT_NAME = $(TARGET_NAME)
+
+// Versioning
+MARKETING_VERSION = 0.0.1
+CURRENT_PROJECT_VERSION = 1
+
+// App target
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+CODE_SIGN_ENTITLEMENTS = Sources/App/Resources/{app_target}.entitlements
+CODE_SIGN_IDENTITY = iPhone Developer
+DEVELOPMENT_TEAM = PSW5J993A3
+ENABLE_USER_SCRIPT_SANDBOXING = NO
+GENERATE_INFOPLIST_FILE = NO
+INFOPLIST_FILE = Sources/App/Resources/Info.plist
+LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/Frameworks
+PRODUCT_BUNDLE_IDENTIFIER = {bundle_id}
+TARGETED_DEVICE_FAMILY = 1
+
+// Compiler
+CLANG_ENABLE_MODULES = YES
+CLANG_ENABLE_OBJC_ARC = YES
+CLANG_ENABLE_OBJC_WEAK = YES
+CLANG_CXX_LANGUAGE_STANDARD = gnu++14
+CLANG_CXX_LIBRARY = libc++
+GCC_C_LANGUAGE_STANDARD = gnu11
+GCC_NO_COMMON_BLOCKS = YES
+ENABLE_STRICT_OBJC_MSGSEND = YES
+MTL_FAST_MATH = YES
+ALWAYS_SEARCH_USER_PATHS = NO
+
+// Warnings
+CLANG_ANALYZER_NONNULL = YES
+CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE
+CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES
+CLANG_WARN_BOOL_CONVERSION = YES
+CLANG_WARN_COMMA = YES
+CLANG_WARN_CONSTANT_CONVERSION = YES
+CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES
+CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR
+CLANG_WARN_DOCUMENTATION_COMMENTS = YES
+CLANG_WARN_EMPTY_BODY = YES
+CLANG_WARN_ENUM_CONVERSION = YES
+CLANG_WARN_INFINITE_RECURSION = YES
+CLANG_WARN_INT_CONVERSION = YES
+CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES
+CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES
+CLANG_WARN_OBJC_LITERAL_CONVERSION = YES
+CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR
+CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES
+CLANG_WARN_RANGE_LOOP_ANALYSIS = YES
+CLANG_WARN_STRICT_PROTOTYPES = YES
+CLANG_WARN_SUSPICIOUS_MOVE = YES
+CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE
+CLANG_WARN_UNREACHABLE_CODE = YES
+CLANG_WARN__DUPLICATE_METHOD_MATCH = YES
+GCC_WARN_64_TO_32_BIT_CONVERSION = YES
+GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR
+GCC_WARN_UNDECLARED_SELECTOR = YES
+GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE
+GCC_WARN_UNUSED_FUNCTION = YES
+GCC_WARN_UNUSED_VARIABLE = YES
+"""
+
+debug_template = f"""\
+// Debug.xcconfig — development configuration
+// Copy this file to Debug.xcconfig and fill in your secret values.
+// Debug.xcconfig is gitignored — do NOT commit it.
+
+#include "Base.xcconfig"
+
+// Debug build settings
+GCC_OPTIMIZATION_LEVEL = 0
+SWIFT_OPTIMIZATION_LEVEL = -Onone
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG
+DEBUG_INFORMATION_FORMAT = dwarf
+ENABLE_TESTABILITY = YES
+ONLY_ACTIVE_ARCH = YES
+GCC_DYNAMIC_NO_PIC = NO
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) DEBUG=1
+MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE
+COPY_PHASE_STRIP = NO
+
+// Secrets — injected into Info.plist at build time
+GAME_LOG_API_KEY = <your-balldontlie-api-key>
+FIRA_APP_CHECK_DEBUG_TOKEN = <your-firebase-app-check-debug-token>
+APP_ENVIRONMENT = development
+"""
+
+release_template = f"""\
+// Release.xcconfig — production configuration
+// Copy this file to Release.xcconfig and fill in your secret values.
+// Release.xcconfig is gitignored — do NOT commit it.
+
+#include "Base.xcconfig"
+
+// Release build settings
+SWIFT_OPTIMIZATION_LEVEL = -O
+SWIFT_COMPILATION_MODE = wholemodule
+DEBUG_INFORMATION_FORMAT = dwarf-with-dsym
+ENABLE_NS_ASSERTIONS = NO
+MTL_ENABLE_DEBUG_INFO = NO
+COPY_PHASE_STRIP = NO
+
+// Secrets — injected into Info.plist at build time
+GAME_LOG_API_KEY = <your-production-api-key>
+FIRA_APP_CHECK_DEBUG_TOKEN =
+APP_ENVIRONMENT = production
+"""
+
+tests_xcconfig = f"""\
+
+// {app_target}Tests.xcconfig — test target settings
+
+BUNDLE_LOADER = $(TEST_HOST)
+GENERATE_INFOPLIST_FILE = YES
+LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/Frameworks @loader_path/Frameworks
+PRODUCT_BUNDLE_IDENTIFIER = {bundle_id}Tests
+TARGETED_DEVICE_FAMILY = 1
+TEST_HOST = $(BUILT_PRODUCTS_DIR)/{app_target}.app/{app_target}
+"""
+
+write(os.path.join(out_dir, "App/Config/Base.xcconfig"), base_xcconfig)
+write(os.path.join(out_dir, "App/Config/Debug.xcconfig.template"), debug_template)
+write(os.path.join(out_dir, "App/Config/Release.xcconfig.template"), release_template)
+write(os.path.join(out_dir, f"App/Config/{app_target}Tests.xcconfig"), tests_xcconfig)
+
+# Write actual Debug/Release xcconfig files (gitignored; contain placeholder secrets)
+write(os.path.join(out_dir, "App/Config/Debug.xcconfig"), debug_template)
+write(os.path.join(out_dir, "App/Config/Release.xcconfig"), release_template)
+
+# Tests directory placeholder so XcodeGen finds the path
+write(os.path.join(out_dir, "App/Tests/.gitkeep"), "")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Info.plist
+# ─────────────────────────────────────────────────────────────────────────────
+
+info_plist = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>AppEnvironment</key>
+\t<string>$(APP_ENVIRONMENT)</string>
+\t<key>BGTaskSchedulerPermittedIdentifiers</key>
+\t<array>
+\t\t<string>{bundle_id}.trendrefresh</string>
+\t</array>
+\t<key>CFBundleDevelopmentRegion</key>
+\t<string>en</string>
+\t<key>CFBundleDisplayName</key>
+\t<string>{app_name}</string>
+\t<key>CFBundleExecutable</key>
+\t<string>$(EXECUTABLE_NAME)</string>
+\t<key>CFBundleIdentifier</key>
+\t<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+\t<key>CFBundleInfoDictionaryVersion</key>
+\t<string>6.0</string>
+\t<key>CFBundleName</key>
+\t<string>$(PRODUCT_NAME)</string>
+\t<key>CFBundlePackageType</key>
+\t<string>APPL</string>
+\t<key>CFBundleShortVersionString</key>
+\t<string>$(MARKETING_VERSION)</string>
+\t<key>CFBundleVersion</key>
+\t<string>$(CURRENT_PROJECT_VERSION)</string>
+\t<key>FirebaseDataCollectionDefaultEnabled</key>
+\t<true/>
+\t<key>GameLogAPIKey</key>
+\t<string>$(GAME_LOG_API_KEY)</string>
+\t<key>LSRequiresIPhoneOS</key>
+\t<true/>
+\t<key>NSHumanReadableCopyright</key>
+\t<string>Copyright 2026 Black Katt Technologies Inc.</string>
+\t<key>UIApplicationSceneManifest</key>
+\t<dict>
+\t\t<key>UIApplicationSupportsMultipleScenes</key>
+\t\t<false/>
+\t</dict>
+\t<key>UIBackgroundModes</key>
+\t<array>
+\t\t<string>fetch</string>
+\t\t<string>processing</string>
+\t</array>
+\t<key>UILaunchScreen</key>
+\t<dict>
+\t\t<key>UIColorName</key>
+\t\t<string>LaunchBackground</string>
+\t\t<key>UIImageName</key>
+\t\t<string>InAppIcon</string>
+\t</dict>
+\t<key>UIRequiredDeviceCapabilities</key>
+\t<array>
+\t\t<string>arm64</string>
+\t</array>
+\t<key>UISupportedInterfaceOrientations</key>
+\t<array>
+\t\t<string>UIInterfaceOrientationPortrait</string>
+\t</array>
+</dict>
+</plist>
+"""
+
+write(os.path.join(out_dir, "App/Sources/App/Resources/Info.plist"), info_plist)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. Configuration.plist  (runtime config — URLs baked in)
+# ─────────────────────────────────────────────────────────────────────────────
+
+config_plist = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>featureFlagsEnabled</key>
+\t<false/>
+\t<key>networkTimeoutSeconds</key>
+\t<real>30</real>
+\t<key>gameLogBaseURL</key>
+\t<string>{gamelog_base}</string>
+\t<key>getPlayersURL</key>
+\t<string>{players_url}</string>
+\t<key>getOpportunitiesURL</key>
+\t<string>{opps_url}</string>
+\t<key>gradientTopColor</key>
+\t<string>0.05,0.3,0.65</string>
+\t<key>gradientBottomColor</key>
+\t<string>0.01,0.04,0.1</string>
+</dict>
+</plist>
+"""
+
+write(os.path.join(out_dir, "App/Sources/App/Resources/Configuration.plist"), config_plist)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. Entitlements (empty shell)
+# ─────────────────────────────────────────────────────────────────────────────
+
+entitlements = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict/>
+</plist>
+"""
+
+write(os.path.join(out_dir, f"App/Sources/App/Resources/{app_target}.entitlements"), entitlements)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. PrivacyInfo.xcprivacy
+# ─────────────────────────────────────────────────────────────────────────────
+
+privacy_info = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>NSPrivacyTracking</key>
+\t<false/>
+\t<key>NSPrivacyTrackingDomains</key>
+\t<array/>
+\t<key>NSPrivacyCollectedDataTypes</key>
+\t<array>
+\t\t<!-- Firebase Analytics: Device ID or similar identifiers -->
+\t\t<dict>
+\t\t\t<key>NSPrivacyCollectedDataType</key>
+\t\t\t<string>NSPrivacyCollectedDataTypeDeviceID</string>
+\t\t\t<key>NSPrivacyCollectedDataTypeLinked</key>
+\t\t\t<false/>
+\t\t\t<key>NSPrivacyCollectedDataTypeTracking</key>
+\t\t\t<false/>
+\t\t\t<key>NSPrivacyCollectedDataTypePurposes</key>
+\t\t\t<array>
+\t\t\t\t<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+\t\t\t</array>
+\t\t</dict>
+\t\t<!-- Firebase Analytics: Product Interaction -->
+\t\t<dict>
+\t\t\t<key>NSPrivacyCollectedDataType</key>
+\t\t\t<string>NSPrivacyCollectedDataTypeProductInteraction</string>
+\t\t\t<key>NSPrivacyCollectedDataTypeLinked</key>
+\t\t\t<false/>
+\t\t\t<key>NSPrivacyCollectedDataTypeTracking</key>
+\t\t\t<false/>
+\t\t\t<key>NSPrivacyCollectedDataTypePurposes</key>
+\t\t\t<array>
+\t\t\t\t<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+\t\t\t</array>
+\t\t</dict>
+\t</array>
+\t<key>NSPrivacyAccessedAPITypes</key>
+\t<array>
+\t\t<dict>
+\t\t\t<key>NSPrivacyAccessedAPIType</key>
+\t\t\t<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+\t\t\t<key>NSPrivacyAccessedAPITypeReasons</key>
+\t\t\t<array>
+\t\t\t\t<string>CA92.1</string>
+\t\t\t</array>
+\t\t</dict>
+\t\t<dict>
+\t\t\t<key>NSPrivacyAccessedAPIType</key>
+\t\t\t<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+\t\t\t<key>NSPrivacyAccessedAPITypeReasons</key>
+\t\t\t<array>
+\t\t\t\t<string>35F9.1</string>
+\t\t\t</array>
+\t\t</dict>
+\t</array>
+</dict>
+</plist>
+"""
+
+write(os.path.join(out_dir, "App/Sources/App/Resources/PrivacyInfo.xcprivacy"), privacy_info)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. GoogleService-Info.plist  (placeholder — must be replaced with real Firebase config)
+# ─────────────────────────────────────────────────────────────────────────────
+
+google_service = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<!-- TODO: Replace with real GoogleService-Info.plist from Firebase console -->
+\t<key>BUNDLE_ID</key>
+\t<string>{bundle_id}</string>
+\t<key>PROJECT_ID</key>
+\t<string>trendspotter-dbb4d</string>
+\t<key>STORAGE_BUCKET</key>
+\t<string>trendspotter-dbb4d.firebasestorage.app</string>
+\t<key>IS_ADS_ENABLED</key>
+\t<false/>
+\t<key>IS_ANALYTICS_ENABLED</key>
+\t<false/>
+\t<key>IS_GCM_ENABLED</key>
+\t<true/>
+\t<key>IS_SIGNIN_ENABLED</key>
+\t<true/>
+</dict>
+</plist>
+"""
+
+write(os.path.join(out_dir, "App/Sources/App/Resources/GoogleService-Info.plist"), google_service)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. .swiftlint.yml
+# ─────────────────────────────────────────────────────────────────────────────
+
+swiftlint_yml = """\
+# SwiftLint configuration
+
+# Paths to exclude
+excluded:
+  - Pods
+  - Build
+  - .build
+  - DerivedData
+  - .swiftpm
+  - App/.build
+  - "**/SourcePackages"
+
+# Opt-in rules beyond defaults
+opt_in_rules:
+  - closure_end_indentation
+  - closure_spacing
+  - collection_alignment
+  - contains_over_filter_count
+  - contains_over_first_not_nil
+  - empty_collection_literal
+  - empty_count
+  - empty_string
+  - enum_case_associated_values_count
+  - explicit_init
+  - fatal_error_message
+  - first_where
+  - force_unwrapping
+  - implicit_return
+  - last_where
+  - literal_expression_end_indentation
+  - modifier_order
+  - multiline_arguments
+  - multiline_parameters
+  - operator_usage_whitespace
+  - overridden_super_call
+  - pattern_matching_keywords
+  - prefer_self_in_static_references
+  - prefer_self_type_over_type_of_self
+  - private_action
+  - private_outlet
+  - prohibited_super_call
+  - redundant_nil_coalescing
+  - redundant_type_annotation
+  - sorted_first_last
+  - toggle_bool
+  - trailing_closure
+  - unneeded_parentheses_in_closure_argument
+  - vertical_parameter_alignment_on_call
+  - yoda_condition
+
+# Disabled default rules
+disabled_rules:
+  - todo
+  - opening_brace
+  - trailing_comma
+
+# Line length: warn and error at 120
+line_length:
+  warning: 120
+  error: 200
+  ignores_urls: true
+  ignores_function_declarations: false
+  ignores_comments: false
+  ignores_interpolated_strings: true
+
+# Type body length
+type_body_length:
+  warning: 300
+  error: 500
+
+# File length
+file_length:
+  warning: 400
+  error: 600
+  ignore_comment_only_lines: true
+
+# Function body length
+function_body_length:
+  warning: 40
+  error: 80
+
+# Function parameter count
+function_parameter_count:
+  warning: 5
+  error: 8
+
+# Type name rules
+type_name:
+  min_length: 3
+  max_length: 50
+
+# Identifier name rules
+identifier_name:
+  min_length:
+    warning: 2
+    error: 1
+  max_length:
+    warning: 50
+    error: 60
+  excluded:
+    - id
+    - x
+    - y
+    - i
+
+# Nesting
+nesting:
+  type_level: 2
+  function_level: 3
+
+# Cyclomatic complexity
+cyclomatic_complexity:
+  warning: 10
+  error: 20
+
+# Large tuple
+large_tuple:
+  warning: 3
+  error: 4
+
+# Multiline arguments
+multiline_arguments:
+  only_enforce_after_first_closure_on_first_line: true
+
+# Reporter
+reporter: xcode
+"""
+
+write(os.path.join(out_dir, ".swiftlint.yml"), swiftlint_yml)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. .swiftformat
+# ─────────────────────────────────────────────────────────────────────────────
+
+swiftformat = f"""\
+# SwiftFormat configuration
+# Minimum Swift version
+--swiftversion {swift_ver}
+
+# Indentation
+--indent 4
+--indentcase false
+--ifdef indent
+--xcodeindentation disabled
+
+# Braces & spacing
+--allman false
+--wraparguments before-first
+--wrapparameters before-first
+--wrapcollections before-first
+--wrapconditions after-first
+--closingparen balanced
+
+# Self
+--self remove
+--selfrequired
+
+# Imports
+--importgrouping testable-bottom
+
+# Trailing commas
+--commas always
+
+# Semicolons
+--semicolons never
+
+# Blank lines
+--trimwhitespace always
+--type-blank-lines remove
+--linebreaks lf
+
+# Marks
+--markextensions always
+
+# Redundancy
+--redundanttype inferred
+
+# Strip unused arguments
+--stripunusedargs closure-only
+
+# Organise declarations
+--organizetypes class,struct,enum,extension
+
+# Header
+--header "// Copyright {{year}} Black Katt Technologies Inc."
+
+# Line length (match SwiftLint)
+--maxwidth 120
+
+# Excluded paths
+--exclude Pods,Build,.build,DerivedData
+"""
+
+write(os.path.join(out_dir, ".swiftformat"), swiftformat)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17. .gitignore
+# ─────────────────────────────────────────────────────────────────────────────
+
+gitignore = """\
+#
+# Xcode
+#
+
+#
+# MacOS
+#
+DS_Store
+.AppleDouble
+.LSOverride
+
+#
+# User settings
+#
+xcuserdata/
+*.xcuserstate
+Pods/
+
+#
+# App packaging
+#
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+#
+# Playgrounds
+#
+timeline.xctimeline
+playground.xcworkspace
+
+#
+# Xcode automatically generates this directory with a .xcworkspacedata file and xcuserdata
+# hence it is not needed unless you have added a package configuration file to your project
+#
+.swiftpm
+.build/
+DerivedData/
+
+#
+# Index and log files
+#
+*.xcindex/
+*.xcscmblueprint
+*.xccheckout
+
+#
+# Claude Code
+#
+.claude/settings.local.json
+.claude/gen/
+
+#
+# Ignore user data inside the project
+#
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+#
+# Build configuration secrets (xcconfig with API keys)
+#
+App/Config/Debug.xcconfig
+App/Config/Release.xcconfig
+
+#
+# Custom Files
+#
+SCAFFOLD.md
+PROJECTGEN.md
+"""
+
+write(os.path.join(out_dir, ".gitignore"), gitignore)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -786,7 +1590,7 @@ print()
 print(f"✅ Scaffolded {app_name} at:")
 print(f"   {out_dir}")
 print()
-print("Generated files:")
+print("Swift source files:")
 print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
 print(f"  App/Sources/Core/Sport/SportPositionMap+{swift_name}.swift")
 print(f"  App/Sources/Core/Sport/{calc_name}.swift")
@@ -794,29 +1598,38 @@ print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
 print(f"  App/Sources/Core/UI/TierThresholds+{swift_name}.swift")
 print(f"  App/Sources/Core/Models/GameEntry.swift")
 print(f"  App/Sources/Features/Trending/Views/GameLogViews.swift")
+print(f"  App/Sources/Core/Sport/SportConfiguration+Environment.swift")
 print()
-print("Project structure (matches BKS-Basketball-Client-iOS):")
-print(f"  App/Sources/App/Bootstrap/   ← BKSBasketballApp, AppShell, DependencyContainer,")
-print(f"                                  TrendRefreshTask, Authentication, FirebaseAnalyticsAdapter")
-print(f"  App/Sources/App/Resources/   ← Info.plist, Assets.xcassets, Localizable.xcstrings,")
-print(f"                                  GoogleService-Info.plist, Configuration.plist,")
-print(f"                                  BKSBasketball.entitlements, PrivacyInfo.xcprivacy")
-print(f"  App/Sources/Core/            ← Services/, Models/, Sport/, Utilities/, UI/")
-print(f"  App/Sources/Features/        ← Trending/, Prospecting/, Projecting/ (each with Views/ + Store/)")
+print("Project infrastructure:")
+print(f"  App/project.yml                                  ← XcodeGen spec (packages, targets, schemes)")
+print(f"  App/<AppName>.xcodeproj/.../swiftpm/Package.resolved  ← pre-pinned SPM versions (no 'Missing package' errors)")
+print(f"  App/Config/Base.xcconfig                         ← shared build settings")
+print(f"  App/Config/Debug.xcconfig                        ← gitignored; pre-filled with placeholders, add real secrets")
+print(f"  App/Config/Debug.xcconfig.template               ← committed template (no secrets)")
+print(f"  App/Config/Release.xcconfig                      ← gitignored; pre-filled with placeholders, add real secrets")
+print(f"  App/Config/Release.xcconfig.template             ← committed template (no secrets)")
+print(f"  App/Tests/.gitkeep                               ← placeholder so XcodeGen sees the Tests/ source path")
+print(f"  App/Config/{app_target}Tests.xcconfig")
+print(f"  App/Sources/App/Resources/Info.plist")
+print(f"  App/Sources/App/Resources/Configuration.plist    ← runtime API URLs")
+print(f"  App/Sources/App/Resources/{app_target}.entitlements")
+print(f"  App/Sources/App/Resources/PrivacyInfo.xcprivacy")
+print(f"  App/Sources/App/Resources/GoogleService-Info.plist  ← placeholder, replace with real Firebase config")
+print(f"  .swiftlint.yml")
+print(f"  .swiftformat")
+print(f"  .gitignore")
 print()
 print("Next steps:")
-print(f"  1. Clone BKS-Basketball-Client-iOS into {out_dir}/")
-print(f"     Strip basketball-specific content; the scaffold has already written sport files.")
-print(f"  2. In App/Sources/App/Bootstrap/DependencyContainer.swift:")
-print(f"       change SportConfiguration.basketball → .{slug}")
-print(f"  3. In App/Sources/App/Bootstrap/BKSBasketballApp.swift:")
-print(f"       change .sportConfiguration(.basketball) → .{slug}")
-print(f"  4. Fill in teamAbbreviationByID in App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
-print(f"  5. Wire API endpoints in App/Sources/Core/Services/ (four service files)")
-print(f"  6. Update App/Sources/App/Resources/:")
-print(f"       Info.plist (bundle name), GoogleService-Info.plist (Firebase config)")
-print(f"  7. Update project.yml: name, bundleId, scheme name")
-print(f"  8. Run: cd App && xcodegen generate --spec project.yml")
+print(f"  1. Copy Bootstrap/ source files from BKS-Basketball-Client-iOS and adapt to {swift_name}:")
+print(f"       {app_target}App.swift, AppShell.swift, DependencyContainer.swift,")
+print(f"       TrendRefreshTask.swift, Authentication.swift, FirebaseAnalyticsAdapter.swift")
+print(f"  2. In DependencyContainer.swift: SportConfiguration.basketball → .{slug}")
+print(f"  3. In {app_target}App.swift: .sportConfiguration(.basketball) → .{slug}")
+print(f"  4. Copy service files from BKS-Basketball-Client-iOS/App/Sources/Core/Services/ and adapt")
+print(f"  5. Copy feature Views/ and Store/ from BKS-Basketball-Client-iOS and adapt")
+print(f"  6. Replace App/Sources/App/Resources/GoogleService-Info.plist with real Firebase config")
+print(f"  7. Fill in teamAbbreviationByID in SportConfiguration+{swift_name}.swift")
+print(f"  8. Fill in real API keys in App/Config/Debug.xcconfig (gitignored)")
 PYEOF
 
 # ── copy shared assets ────────────────────────────────────────────────────────
@@ -852,4 +1665,212 @@ if [[ -f "$STRINGS_SRC" ]]; then
     echo "         (en, fr-CA, es — 100% translated, 257 keys)"
 else
     echo "  warning: $STRINGS_SRC not found — skipping strings copy"
+fi
+
+# ── run xcodegen ──────────────────────────────────────────────────────────────
+
+APP_DIR="$(dirname "$ASSETS_DST")/../../.."       # App/ relative to Assets.xcassets
+APP_DIR="$(cd "$APP_DIR" && pwd)"                # resolve to absolute path
+
+XCODEGEN=""
+if command -v xcodegen > /dev/null 2>&1; then
+    XCODEGEN="xcodegen"
+elif [[ -f /opt/homebrew/bin/xcodegen ]]; then
+    XCODEGEN="/opt/homebrew/bin/xcodegen"
+elif [[ -f /usr/local/bin/xcodegen ]]; then
+    XCODEGEN="/usr/local/bin/xcodegen"
+fi
+
+if [[ -n "$XCODEGEN" ]]; then
+    echo ""
+    echo "Running xcodegen..."
+    "$XCODEGEN" generate --spec "$APP_DIR/project.yml" --project "$APP_DIR"
+    echo "  ✅ Xcode project generated"
+
+    XCODEPROJ="$(find "$APP_DIR" -maxdepth 1 -name "*.xcodeproj" | head -1)"
+
+    # Write Package.resolved so Xcode has pinned versions on first open and
+    # doesn't show "Missing package product" errors.
+    if [[ -n "$XCODEPROJ" ]]; then
+        SWIFTPM_DIR="$XCODEPROJ/project.xcworkspace/xcshareddata/swiftpm"
+        mkdir -p "$SWIFTPM_DIR"
+        cat > "$SWIFTPM_DIR/Package.resolved" << 'RESOLVED_EOF'
+{
+  "originHash" : "7ed8aa1e303d9c60d4b08edd19d6e53f1343180f51491033bcc3509c3dd38a76",
+  "pins" : [
+    {
+      "identity" : "abseil-cpp-binary",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/abseil-cpp-binary.git",
+      "state" : {
+        "revision" : "bbe8b69694d7873315fd3a4ad41efe043e1c07c5",
+        "version" : "1.2024072200.0"
+      }
+    },
+    {
+      "identity" : "alamofire",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Alamofire/Alamofire.git",
+      "state" : {
+        "revision" : "e938f8c66708e7352fc7e3512647fa54255b267a",
+        "version" : "5.11.2"
+      }
+    },
+    {
+      "identity" : "app-check",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/app-check.git",
+      "state" : {
+        "revision" : "61b85103a1aeed8218f17c794687781505fbbef5",
+        "version" : "11.2.0"
+      }
+    },
+    {
+      "identity" : "bkscore",
+      "kind" : "remoteSourceControl",
+      "location" : "git@github.com:bkatnich/BKSCore.git",
+      "state" : {
+        "revision" : "c83ff215356a99fcaad4ee2849936345cf59d34b",
+        "version" : "1.0.1"
+      }
+    },
+    {
+      "identity" : "bksuicore",
+      "kind" : "remoteSourceControl",
+      "location" : "git@github.com:bkatnich/BKSUICore.git",
+      "state" : {
+        "revision" : "fc63ec0113d619fb8de21f6288a0d2eeb9e9fe58",
+        "version" : "1.0.15"
+      }
+    },
+    {
+      "identity" : "firebase-ios-sdk",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/firebase/firebase-ios-sdk.git",
+      "state" : {
+        "revision" : "fdc352fabaf5916e7faa1f96ad02b1957e93e5a5",
+        "version" : "11.15.0"
+      }
+    },
+    {
+      "identity" : "google-ads-on-device-conversion-ios-sdk",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/googleads/google-ads-on-device-conversion-ios-sdk",
+      "state" : {
+        "revision" : "a2d0f1f1666de591eb1a811f40b1706f5c63a2ed",
+        "version" : "2.3.0"
+      }
+    },
+    {
+      "identity" : "googleappmeasurement",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/GoogleAppMeasurement.git",
+      "state" : {
+        "revision" : "45ce435e9406d3c674dd249a042b932bee006f60",
+        "version" : "11.15.0"
+      }
+    },
+    {
+      "identity" : "googledatatransport",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/GoogleDataTransport.git",
+      "state" : {
+        "revision" : "617af071af9aa1d6a091d59a202910ac482128f9",
+        "version" : "10.1.0"
+      }
+    },
+    {
+      "identity" : "googleutilities",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/GoogleUtilities.git",
+      "state" : {
+        "revision" : "60da361632d0de02786f709bdc0c4df340f7613e",
+        "version" : "8.1.0"
+      }
+    },
+    {
+      "identity" : "grpc-binary",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/grpc-binary.git",
+      "state" : {
+        "revision" : "75b31c842f664a0f46a2e590a570e370249fd8f6",
+        "version" : "1.69.1"
+      }
+    },
+    {
+      "identity" : "gtm-session-fetcher",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/gtm-session-fetcher.git",
+      "state" : {
+        "revision" : "c756a29784521063b6a1202907e2cc47f41b667c",
+        "version" : "4.5.0"
+      }
+    },
+    {
+      "identity" : "interop-ios-for-google-sdks",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/interop-ios-for-google-sdks.git",
+      "state" : {
+        "revision" : "040d087ac2267d2ddd4cca36c757d1c6a05fdbfe",
+        "version" : "101.0.0"
+      }
+    },
+    {
+      "identity" : "leveldb",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/firebase/leveldb.git",
+      "state" : {
+        "revision" : "a0bc79961d7be727d258d33d5a6b2f1023270ba1",
+        "version" : "1.22.5"
+      }
+    },
+    {
+      "identity" : "nanopb",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/firebase/nanopb.git",
+      "state" : {
+        "revision" : "b7e1104502eca3a213b46303391ca4d3bc8ddec1",
+        "version" : "2.30910.0"
+      }
+    },
+    {
+      "identity" : "promises",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/promises.git",
+      "state" : {
+        "revision" : "540318ecedd63d883069ae7f1ed811a2df00b6ac",
+        "version" : "2.4.0"
+      }
+    },
+    {
+      "identity" : "swift-protobuf",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-protobuf.git",
+      "state" : {
+        "revision" : "a008af1a102ff3dd6cc3764bb69bf63226d0f5f6",
+        "version" : "1.36.1"
+      }
+    },
+    {
+      "identity" : "swinject",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Swinject/Swinject.git",
+      "state" : {
+        "revision" : "b685b549fe4d8ae265fc7a2f27d0789720425d69",
+        "version" : "2.10.0"
+      }
+    }
+  ],
+  "version" : 3
+}
+RESOLVED_EOF
+        echo "  wrote  Package.resolved (pinned package versions)"
+        echo "  Opening project in Xcode (packages pre-pinned, no resolution required)..."
+        open "$XCODEPROJ"
+    fi
+else
+    echo ""
+    echo "  warning: xcodegen not found — skipping project generation"
+    echo "           Install via: brew install xcodegen"
+    echo "           Then run:    cd $APP_DIR && xcodegen generate --spec project.yml"
 fi
