@@ -1616,6 +1616,9 @@ struct Player: Codable, Equatable, Hashable, Identifiable, Filterable {
     let confidenceScore: Double?
     let consistencyScore: Double?
 
+    // Playoff signal confidence (null = regular season)
+    let playoffDataConfidence: Double?
+
     // Injury & status
     let injuryStatus: InjuryStatus?
     let previousInjuryStatus: InjuryStatus?
@@ -1647,6 +1650,7 @@ struct Player: Codable, Equatable, Hashable, Identifiable, Filterable {
         surgingCategoryCount: Int? = nil,
         confidenceScore: Double? = nil,
         consistencyScore: Double? = nil,
+        playoffDataConfidence: Double? = nil,
         injuryStatus: InjuryStatus? = nil,
         previousInjuryStatus: InjuryStatus? = nil,
         injuryStatusChangedAt: Date? = nil,
@@ -1675,6 +1679,7 @@ struct Player: Codable, Equatable, Hashable, Identifiable, Filterable {
         self.surgingCategoryCount = surgingCategoryCount
         self.confidenceScore = confidenceScore
         self.consistencyScore = consistencyScore
+        self.playoffDataConfidence = playoffDataConfidence
         self.injuryStatus = injuryStatus
         self.previousInjuryStatus = previousInjuryStatus
         self.injuryStatusChangedAt = injuryStatusChangedAt
@@ -1682,6 +1687,29 @@ struct Player: Codable, Equatable, Hashable, Identifiable, Filterable {
         self.daysSinceReturn = daysSinceReturn
         self.isRoleChange = isRoleChange
         self.usageEfficiencySignal = usageEfficiencySignal
+    }
+}
+
+// MARK: - PlayoffConfidence
+
+extension Player {
+    /// Describes how much trust to place in trend signals during the playoffs.
+    enum PlayoffConfidence: Equatable {
+        /// Field is nil — regular season, full signal trust.
+        case regularSeason
+        /// 0–1 playoff games played (confidence < 0.15) — suppress signals entirely.
+        case pending
+        /// 2–4 playoff games (0.15 ≤ confidence < 1.0) — show signals dimmed with amber indicator.
+        case partial(Double)
+        /// 5+ playoff games (confidence == 1.0) — treat normally.
+        case full
+    }
+
+    var playoffConfidence: PlayoffConfidence {
+        guard let confidence = playoffDataConfidence else { return .regularSeason }
+        if confidence < 0.15 { return .pending }
+        if confidence < 1.0 { return .partial(confidence) }
+        return .full
     }
 }
 
@@ -2149,6 +2177,7 @@ final class TrendingsService: TrendingsServiceProtocol {{
             surgingCategoryCount: dto.surgingCategoryCount,
             confidenceScore: dto.confidenceScore,
             consistencyScore: dto.consistencyScore,
+            playoffDataConfidence: dto.playoffDataConfidence,
             injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
             previousInjuryStatus: dto.previousInjuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
             injuryStatusChangedAt: dto.injuryStatusChangedAt.flatMap {{ Self.parseISODate($0) }},
@@ -2196,6 +2225,7 @@ private struct PlayerDTO: Decodable {{
     let surgingCategoryCount: Int?
     let confidenceScore: Double?
     let consistencyScore: Double?
+    let playoffDataConfidence: Double?
     let injuryStatus: String?
     let previousInjuryStatus: String?
     let injuryStatusChangedAt: String?
@@ -2225,6 +2255,7 @@ private struct PlayerDTO: Decodable {{
         case surgingCategoryCount = "surging_category_count"
         case confidenceScore = "confidence_score"
         case consistencyScore = "consistency_score"
+        case playoffDataConfidence = "playoff_data_confidence"
         case injuryStatus = "injury_status"
         case previousInjuryStatus = "previous_injury_status"
         case injuryStatusChangedAt = "injury_status_changed_at"
@@ -2268,6 +2299,7 @@ private struct PlayerDTO: Decodable {{
         surgingCategoryCount = try container.decodeIfPresent(Int.self, forKey: .surgingCategoryCount)
         confidenceScore = try container.decodeIfPresent(Double.self, forKey: .confidenceScore)
         consistencyScore = try container.decodeIfPresent(Double.self, forKey: .consistencyScore)
+        playoffDataConfidence = try container.decodeIfPresent(Double.self, forKey: .playoffDataConfidence)
         injuryStatus = try container.decodeIfPresent(String.self, forKey: .injuryStatus)
         previousInjuryStatus = try container.decodeIfPresent(String.self, forKey: .previousInjuryStatus)
         injuryStatusChangedAt = try container.decodeIfPresent(String.self, forKey: .injuryStatusChangedAt)
@@ -4191,20 +4223,34 @@ struct RankingRow: View {
             .lineLimit(1)
             .minimumScaleFactor(0.7)
 
-            // Row 3: Badges (injury, surging)
+            // Row 3: Badges (injury, surging, playoff pending)
             let hasBadges = player.injuryStatus != nil
-                || (player.isSurging == true && player.trendDirection == .up)
+                || (player.isSurging == true && player.trendDirection == .up
+                    && player.playoffConfidence != .pending)
+                || player.playoffConfidence == .pending
             if hasBadges {
                 HStack(spacing: 3) {
                     if let status = player.injuryStatus {
                         InjuryBadge(status: status, compact: true)
                     }
-                    if player.isSurging == true, player.trendDirection == .up {
+                    if player.isSurging == true,
+                       player.trendDirection == .up,
+                       player.playoffConfidence != .pending {
                         Text("🚀")
                             .font(AppFonts.rankingBadgeIcon)
                             .padding(.horizontal, 3)
                             .padding(.vertical, 1)
                             .background(Color.purple.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                    if case .pending = player.playoffConfidence {
+                        Text(String(localized: "trending.playoff.pending",
+                                    defaultValue: "Building playoff data"))
+                            .font(AppFonts.rankingBadgeIcon)
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.12))
                             .clipShape(RoundedRectangle(cornerRadius: 3))
                     }
                 }
@@ -4322,28 +4368,60 @@ struct PlayerRowView: View {
     }
 
     @ViewBuilder private var trendArrow: some View {
-        if let direction = player.trendDirection {
-            let (name, color): (String, Color) = switch direction {
-            case .up: ("arrow.up", .green)
-            case .down: ("arrow.down", .red)
-            case .flat, .neutral: ("minus", .white.opacity(AppOpacity.separator))
+        switch player.playoffConfidence {
+        case .pending:
+            Image(systemName: "minus")
+                .font(AppFonts.playerTrendArrow)
+                .foregroundStyle(.white.opacity(AppOpacity.separator))
+        case let .partial(confidence):
+            if let direction = player.trendDirection {
+                let name: String = switch direction {
+                case .up: "arrow.up"
+                case .down: "arrow.down"
+                case .flat, .neutral: "minus"
+                }
+                Image(systemName: name)
+                    .font(AppFonts.playerTrendArrow)
+                    .foregroundStyle(Color.orange.opacity(0.4 + 0.6 * confidence))
+            } else {
+                Image(systemName: "minus")
+                    .font(AppFonts.playerTrendArrow)
+                    .foregroundStyle(.white.opacity(AppOpacity.separator))
             }
-            Image(systemName: name).font(AppFonts.playerTrendArrow).foregroundStyle(color)
-        } else {
-            Image(systemName: "minus").foregroundStyle(.white.opacity(AppOpacity.separator))
+        case .regularSeason, .full:
+            if let direction = player.trendDirection {
+                let (name, color): (String, Color) = switch direction {
+                case .up: ("arrow.up", .green)
+                case .down: ("arrow.down", .red)
+                case .flat, .neutral: ("minus", .white.opacity(AppOpacity.separator))
+                }
+                Image(systemName: name).font(AppFonts.playerTrendArrow).foregroundStyle(color)
+            } else {
+                Image(systemName: "minus").foregroundStyle(.white.opacity(AppOpacity.separator))
+            }
         }
     }
 
     private var trendScore: some View {
-        let formatted = player.confidenceScore.map { score -> String in
-            let prefix = player.trendDirection == .down ? "-" : ""
-            return prefix + String(format: "%.2f", score)
-        } ?? "-"
-        let color: Color = player.confidenceScore == nil
-            ? .white.opacity(AppOpacity.separator)
-            : (player.trendDirection == .down ? .red : .green)
-        return Text(formatted).monospacedDigit().multilineTextAlignment(.center)
-            .foregroundStyle(color)
+        switch player.playoffConfidence {
+        case .pending:
+            return Text("–").monospacedDigit().multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(AppOpacity.separator))
+        case .partial:
+            let formatted = player.confidenceScore.map { String(format: "%.2f", $0) } ?? "–"
+            return Text(formatted).monospacedDigit().multilineTextAlignment(.center)
+                .foregroundStyle(Color.orange.opacity(0.6))
+        case .regularSeason, .full:
+            let formatted = player.confidenceScore.map { score -> String in
+                let prefix = player.trendDirection == .down ? "-" : ""
+                return prefix + String(format: "%.2f", score)
+            } ?? "-"
+            let color: Color = player.confidenceScore == nil
+                ? .white.opacity(AppOpacity.separator)
+                : (player.trendDirection == .down ? .red : .green)
+            return Text(formatted).monospacedDigit().multilineTextAlignment(.center)
+                .foregroundStyle(color)
+        }
     }
 }
 """
@@ -4544,6 +4622,12 @@ struct PlayerDetailHeaderCard: View {
             RoundedRectangle(cornerRadius: AppRadius.sm)
                 .stroke(.white.opacity(AppOpacity.divider), lineWidth: 1)
         )
+        .overlay {
+            if case let .partial(confidence) = player.playoffConfidence {
+                RoundedRectangle(cornerRadius: AppRadius.sm)
+                    .strokeBorder(Color.orange.opacity(0.4 + 0.4 * confidence), lineWidth: 2)
+            }
+        }
     }
 
     private var headerInfo: some View {
@@ -4614,23 +4698,55 @@ struct PlayerDetailHeaderCard: View {
     }
 
     @ViewBuilder private var headerTrendArrow: some View {
-        if let direction = player.trendDirection {
-            let (name, color): (String, Color) = switch direction {
-            case .up: ("arrow.up", .green)
-            case .down: ("arrow.down", .red)
-            case .flat, .neutral: ("minus", .white.opacity(AppOpacity.separator))
+        switch player.playoffConfidence {
+        case .pending:
+            Image(systemName: "minus")
+                .font(AppFonts.playerTrendArrow)
+                .foregroundStyle(.white.opacity(AppOpacity.separator))
+        case let .partial(confidence):
+            if let direction = player.trendDirection {
+                let name: String = switch direction {
+                case .up: "arrow.up"
+                case .down: "arrow.down"
+                case .flat, .neutral: "minus"
+                }
+                Image(systemName: name)
+                    .font(AppFonts.playerTrendArrow)
+                    .foregroundStyle(Color.orange.opacity(0.4 + 0.6 * confidence))
+            } else {
+                Image(systemName: "minus")
+                    .font(AppFonts.playerTrendArrow)
+                    .foregroundStyle(.white.opacity(AppOpacity.separator))
             }
-            Image(systemName: name).font(AppFonts.playerTrendArrow).foregroundStyle(color)
-        } else {
-            Image(systemName: "minus").foregroundStyle(.white.opacity(AppOpacity.separator))
+        case .regularSeason, .full:
+            if let direction = player.trendDirection {
+                let (name, color): (String, Color) = switch direction {
+                case .up: ("arrow.up", .green)
+                case .down: ("arrow.down", .red)
+                case .flat, .neutral: ("minus", .white.opacity(AppOpacity.separator))
+                }
+                Image(systemName: name).font(AppFonts.playerTrendArrow).foregroundStyle(color)
+            } else {
+                Image(systemName: "minus").foregroundStyle(.white.opacity(AppOpacity.separator))
+            }
         }
     }
 
     private var headerTrendScore: some View {
-        let value = player.confidenceScore.map { String(format: "%.2f", $0) } ?? "-"
-        let opacity = player.confidenceScore == nil ? AppOpacity.separator : AppOpacity.primary
-        return Text(value).monospacedDigit().multilineTextAlignment(.center)
-            .foregroundStyle(.white.opacity(opacity))
+        switch player.playoffConfidence {
+        case .pending:
+            return Text("–").monospacedDigit().multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(AppOpacity.separator))
+        case .partial:
+            let value = player.confidenceScore.map { String(format: "%.2f", $0) } ?? "–"
+            return Text(value).monospacedDigit().multilineTextAlignment(.center)
+                .foregroundStyle(Color.orange.opacity(0.6))
+        case .regularSeason, .full:
+            let value = player.confidenceScore.map { String(format: "%.2f", $0) } ?? "-"
+            let opacity = player.confidenceScore == nil ? AppOpacity.separator : AppOpacity.primary
+            return Text(value).monospacedDigit().multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(opacity))
+        }
     }
 }
 
@@ -4747,7 +4863,9 @@ struct PlayerDetailOverviewTrendCard: View {
     }
 
     var body: some View {
-        if hasAnyData {
+        if case .pending = player.playoffConfidence {
+            playoffPendingState
+        } else if hasAnyData {
             VStack(spacing: 0) {
                 let rows = buildRows()
                 ForEach(Array(rows.enumerated()), id: \\.offset) { index, item in
@@ -4762,6 +4880,23 @@ struct PlayerDetailOverviewTrendCard: View {
         }
     }
 
+    private var playoffPendingState: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "clock.badge")
+                .font(.callout)
+                .foregroundStyle(.orange.opacity(AppOpacity.dim))
+            Text(String(localized: "trending.playoff.pendingDetail",
+                        defaultValue: "Playoff trend data is building. Check back after a few games."))
+                .font(.caption)
+                .foregroundStyle(.white.opacity(AppOpacity.separator))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .appCard()
+    }
+
     private struct TrendRow {
         let label: String
         let value: String
@@ -4771,6 +4906,15 @@ struct PlayerDetailOverviewTrendCard: View {
     // swiftlint:disable:next function_body_length
     private func buildRows() -> [TrendRow] {
         var rows: [TrendRow] = []
+
+        if case let .partial(confidence) = player.playoffConfidence {
+            rows.append(TrendRow(
+                label: String(localized: "detail.overview.playoffConfidence",
+                              defaultValue: "Playoff Data"),
+                value: String(format: "%.0f%%", confidence * 100),
+                color: .orange
+            ))
+        }
 
         if let score = player.trendScore {
             let formatted = String(format: "%+.0f%%", score * 100)

@@ -179,6 +179,7 @@ api:
       - surging_category_count
       - confidence_score
       - consistency_score
+      - playoff_data_confidence
       - injury_status
       - previous_injury_status
       - injury_status_changed_at
