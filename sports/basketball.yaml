@@ -224,6 +224,13 @@ api:
       platform: dk
       mode: gpp
 
+  leagueState:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_league_state
+
+  playoffBracket:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_playoff_bracket
+    # No query params sent — server defaults to current playoff year
+
   todayGames:
     url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_today_games
 

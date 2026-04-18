@@ -118,18 +118,22 @@ def header(year=2026):
 # 1. ConfigurationKeys+<Sport>.swift
 # ─────────────────────────────────────────────────────────────────────────────
 
-players_api     = api.get("players", {})
-opps_api        = api.get("opportunities", {})
-proj_api        = api.get("projections", {})
-today_api       = api.get("todayGames", {})
-gamelog_api     = api.get("gameLog", {})
+players_api      = api.get("players", {})
+opps_api         = api.get("opportunities", {})
+proj_api         = api.get("projections", {})
+today_api        = api.get("todayGames", {})
+gamelog_api      = api.get("gameLog", {})
+league_state_api = api.get("leagueState", {})
+bracket_api      = api.get("playoffBracket", {})
 
-players_url     = players_api.get("url", "")
-opps_url        = opps_api.get("url", "")
-proj_url        = proj_api.get("url", "")
-today_url       = today_api.get("url", "")
-gamelog_base    = gamelog_api.get("baseURL", "")
-api_key_needed  = gamelog_api.get("apiKeyRequired", False)
+players_url      = players_api.get("url", "")
+opps_url         = opps_api.get("url", "")
+proj_url         = proj_api.get("url", "")
+today_url        = today_api.get("url", "")
+gamelog_base     = gamelog_api.get("baseURL", "")
+api_key_needed   = gamelog_api.get("apiKeyRequired", False)
+league_state_url = league_state_api.get("url", "")
+bracket_url      = bracket_api.get("url", "")
 
 config_keys = header() + f"""\
 import Foundation
@@ -167,6 +171,14 @@ config_keys += f"""\
     static let getProjectionsURL = ConfigurationKey(
         name: "getProjectionsURL",
         defaultValue: "{proj_url}"
+    )
+    static let getLeagueStateURL = ConfigurationKey(
+        name: "getLeagueStateURL",
+        defaultValue: "{league_state_url}"
+    )
+    static let getPlayoffBracketURL = ConfigurationKey(
+        name: "getPlayoffBracketURL",
+        defaultValue: "{bracket_url}"
     )
 }}
 """
@@ -962,6 +974,7 @@ struct {type_prefix}App: App {{
     private let opportunitiesService: OpportunitiesServiceProtocol
     private let projectionsService: ProjectionsServiceProtocol
     private let gamesService: GamesServiceProtocol
+    private let playoffService: PlayoffServiceProtocol
     private let analyticsAdapter = FirebaseAnalyticsAdapter()
 
     init() {{
@@ -979,11 +992,13 @@ struct {type_prefix}App: App {{
         let resolvedOpportunitiesService = container.require(OpportunitiesServiceProtocol.self)
         let resolvedProjectionsService = container.require(ProjectionsServiceProtocol.self)
         let resolvedGamesService = container.require(GamesServiceProtocol.self)
+        let resolvedPlayoffService = container.require(PlayoffServiceProtocol.self)
 
         trendingsService = resolvedTrendingsService
         opportunitiesService = resolvedOpportunitiesService
         projectionsService = resolvedProjectionsService
         gamesService = resolvedGamesService
+        playoffService = resolvedPlayoffService
 
         trendingStore = container.require(Store<TrendingState, TrendingIntent>.self)
         prospectingStore = container.require(Store<ProspectingState, ProspectingIntent>.self)
@@ -1111,7 +1126,8 @@ struct {type_prefix}App: App {{
                     profileStore: profileStore,
                     credential: credential,
                     trendingsService: trendingsService,
-                    gamesService: gamesService
+                    gamesService: gamesService,
+                    playoffService: playoffService
                 )
                 .compositingGroup()
                 .transition(.opacity)
@@ -1272,6 +1288,14 @@ extension Container {{
                 storage: resolver.require(StorageProtocol.self),
                 configuration: resolver.require(ConfigurationProtocol.self),
                 sportConfiguration: resolver.require(SportConfiguration.self)
+            )
+        }}.inObjectScope(.container)
+
+        register(PlayoffServiceProtocol.self) {{ resolver in
+            PlayoffService(
+                network: resolver.require(NetworkProtocol.self, name: "firebase"),
+                storage: resolver.require(StorageProtocol.self),
+                configuration: resolver.require(ConfigurationProtocol.self)
             )
         }}.inObjectScope(.container)
     }}
@@ -1475,6 +1499,7 @@ struct AppShell: View {
     let credential: StoredCredential
     let trendingsService: TrendingsServiceProtocol
     let gamesService: GamesServiceProtocol
+    let playoffService: PlayoffServiceProtocol
     @EnvironmentObject var networkMonitor: NetworkMonitor
     @Environment(\\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\\.analytics) private var analytics
@@ -1499,7 +1524,8 @@ struct AppShell: View {
                 credential: credential,
                 profileStore: profileStore,
                 trendingsService: trendingsService,
-                gamesService: gamesService
+                gamesService: gamesService,
+                playoffService: playoffService
             )
             .tabItem {
                 Label(
@@ -1941,10 +1967,65 @@ struct ScheduledGame: Codable, Equatable, Identifiable {
 }
 """
 
+playoff_series_swift = header() + """\
+import Foundation
+
+// MARK: - PlayoffSeries
+
+struct PlayoffSeries: Codable, Equatable, Hashable, Identifiable {
+    let seriesID: String
+    let roundNumber: Int
+    let roundName: String
+    let conference: String
+    let higherSeedTeam: String
+    let lowerSeedTeam: String
+    let higherSeed: Int
+    let lowerSeed: Int
+    let winsHigherSeed: Int
+    let winsLowerSeed: Int
+    let status: SeriesStatus
+    let winner: String?
+    let gamesPlayed: Int
+    let eliminationGameNext: Bool
+    let homeCourt: [String: Bool]
+
+    var id: String { seriesID }
+
+    /// Returns true if the higher-seed team is home for the next game.
+    var isHigherSeedHomeNext: Bool? {
+        homeCourt["\\(gamesPlayed + 1)"]
+    }
+}
+
+// MARK: - SeriesStatus
+
+enum SeriesStatus: String, Codable, Equatable, Hashable {
+    case scheduled
+    case active
+    case completed
+}
+"""
+
+league_state_swift = header() + """\
+import Foundation
+
+/// Top-level league/season state fetched from the server.
+/// `SeasonMode` is defined in Opportunity.swift and shared here.
+struct LeagueState: Codable, Equatable {
+    let mode: SeasonMode
+    let playoffRound: Int?
+    let playoffStartDate: String?
+    let regularSeasonEndDate: String?
+    let season: Int?
+}
+"""
+
 write(os.path.join(models_dir, "Player.swift"), player_swift)
 write(os.path.join(models_dir, "Opportunity.swift"), opportunity_swift)
 write(os.path.join(models_dir, "Projection.swift"), projection_swift)
 write(os.path.join(models_dir, "TodaySchedule.swift"), today_schedule_swift)
+write(os.path.join(models_dir, "PlayoffSeries.swift"), playoff_series_swift)
+write(os.path.join(models_dir, "LeagueState.swift"), league_state_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9c. Services
@@ -3150,8 +3231,172 @@ enum GamesServiceError: LocalizedError {{
 }}
 """
 
+playoff_service_swift = header() + f"""\
+import BKSCore
+import Foundation
+import OSLog
+
+// MARK: - PlayoffServiceProtocol
+
+protocol PlayoffServiceProtocol {{
+    func fetchLeagueState() async throws -> LeagueState
+    func fetchBracket() async throws -> [PlayoffSeries]
+    func loadCachedLeagueState() throws -> LeagueState?
+    func loadCachedBracket() throws -> [PlayoffSeries]?
+}}
+
+// MARK: - PlayoffService
+
+final class PlayoffService: PlayoffServiceProtocol {{
+
+    private let network: NetworkProtocol
+    private let storage: StorageProtocol
+    private let configuration: ConfigurationProtocol
+    private let logger = os.Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "PlayoffService"
+    )
+
+    private static let leagueStateCacheKey = "{slug}_league_state_v1"
+    private static let bracketCacheKey = "{slug}_playoff_bracket_v1"
+
+    init(
+        network: NetworkProtocol,
+        storage: StorageProtocol,
+        configuration: ConfigurationProtocol
+    ) {{
+        self.network = network
+        self.storage = storage
+        self.configuration = configuration
+    }}
+
+    // MARK: - Public
+
+    func fetchLeagueState() async throws -> LeagueState {{
+        let url = configuration.value(for: .getLeagueStateURL)
+        let response: LeagueStateResponse = try await network.get(url, parameters: nil)
+        let state = LeagueState(
+            mode: SeasonMode(rawValue: response.mode) ?? .regularSeason,
+            playoffRound: response.playoffRound,
+            playoffStartDate: response.playoffStartDate,
+            regularSeasonEndDate: response.regularSeasonEndDate,
+            season: response.season
+        )
+        do {{
+            try storage.save(state, forKey: Self.leagueStateCacheKey, in: .file)
+        }} catch {{
+            logger.warning("Failed to cache league state: \\\\(error.diagnosticDescription)")
+        }}
+        logger.info("Fetched league state: \\\\(response.mode, privacy: .public)")
+        return state
+    }}
+
+    func fetchBracket() async throws -> [PlayoffSeries] {{
+        let url = configuration.value(for: .getPlayoffBracketURL)
+        let response: BracketResponse = try await network.get(url, parameters: nil)
+        let series = response.series.map(mapSeries)
+        do {{
+            try storage.save(series, forKey: Self.bracketCacheKey, in: .file)
+        }} catch {{
+            logger.warning("Failed to cache playoff bracket: \\\\(error.diagnosticDescription)")
+        }}
+        logger.info("Fetched playoff bracket: \\\\(series.count, privacy: .public) series")
+        return series
+    }}
+
+    func loadCachedLeagueState() throws -> LeagueState? {{
+        try storage.load(forKey: Self.leagueStateCacheKey, from: .file)
+    }}
+
+    func loadCachedBracket() throws -> [PlayoffSeries]? {{
+        try storage.load(forKey: Self.bracketCacheKey, from: .file)
+    }}
+
+    // MARK: - Mapping
+
+    private func mapSeries(_ dto: SeriesDTO) -> PlayoffSeries {{
+        PlayoffSeries(
+            seriesID: dto.seriesID,
+            roundNumber: dto.roundNumber,
+            roundName: dto.roundName,
+            conference: dto.conference,
+            higherSeedTeam: dto.higherSeedTeam,
+            lowerSeedTeam: dto.lowerSeedTeam,
+            higherSeed: dto.higherSeed,
+            lowerSeed: dto.lowerSeed,
+            winsHigherSeed: dto.winsHigherSeed,
+            winsLowerSeed: dto.winsLowerSeed,
+            status: SeriesStatus(rawValue: dto.status) ?? .scheduled,
+            winner: dto.winner,
+            gamesPlayed: dto.gamesPlayed,
+            eliminationGameNext: dto.eliminationGameNext,
+            homeCourt: dto.homeCourtPattern
+        )
+    }}
+}}
+
+// MARK: - DTOs
+
+private struct LeagueStateResponse: Decodable {{
+    let mode: String
+    let playoffRound: Int?
+    let playoffStartDate: String?
+    let regularSeasonEndDate: String?
+    let season: Int?
+
+    enum CodingKeys: String, CodingKey {{
+        case mode
+        case playoffRound = "playoff_round"
+        case playoffStartDate = "playoff_start_date"
+        case regularSeasonEndDate = "regular_season_end_date"
+        case season
+    }}
+}}
+
+private struct BracketResponse: Decodable {{
+    let series: [SeriesDTO]
+}}
+
+private struct SeriesDTO: Decodable {{
+    let seriesID: String
+    let roundNumber: Int
+    let roundName: String
+    let conference: String
+    let higherSeedTeam: String
+    let lowerSeedTeam: String
+    let higherSeed: Int
+    let lowerSeed: Int
+    let winsHigherSeed: Int
+    let winsLowerSeed: Int
+    let status: String
+    let winner: String?
+    let gamesPlayed: Int
+    let eliminationGameNext: Bool
+    let homeCourtPattern: [String: Bool]
+
+    enum CodingKeys: String, CodingKey {{
+        case seriesID = "series_id"
+        case roundNumber = "round_number"
+        case roundName = "round_name"
+        case conference
+        case higherSeedTeam = "higher_seed_team"
+        case lowerSeedTeam = "lower_seed_team"
+        case higherSeed = "higher_seed"
+        case lowerSeed = "lower_seed"
+        case winsHigherSeed = "wins_higher_seed"
+        case winsLowerSeed = "wins_lower_seed"
+        case status
+        case winner
+        case gamesPlayed = "games_played"
+        case eliminationGameNext = "elimination_game_next"
+        case homeCourtPattern = "home_court_pattern"
+    }}
+}}
+"""
+
 write(os.path.join(services_dir, "ProjectionsService.swift"), projections_service_swift)
 write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
+write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9d. Core UI files
@@ -4934,10 +5179,360 @@ enum OpportunityDetailIntent {
 }
 """
 
+playoff_state_swift = header() + f"""\
+import BKSCore
+import OSLog
+
+// MARK: - PlayoffIntent
+
+enum PlayoffIntent {{
+    case onAppear
+    case refreshRequested
+    case bracketLoaded([PlayoffSeries])
+    case bracketFailed(Error)
+}}
+
+// MARK: - PlayoffState
+
+struct PlayoffState {{
+    var bracket: ViewState<[PlayoffSeries]> = .idle
+    var leagueState: LeagueState?
+    var lastUpdated: Date?
+
+    private static let stalenessThreshold = CacheFreshness.defaultThreshold
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "PlayoffState"
+    )
+
+    static func makeReduce(
+        playoffService: PlayoffServiceProtocol
+    ) -> Reduce<Self, PlayoffIntent> {{
+        {{ state, intent in
+            switch intent {{
+            case .onAppear:
+                if CacheFreshness.isFresh(lastUpdated: state.lastUpdated, threshold: stalenessThreshold),
+                   case .loaded = state.bracket
+                {{
+                    logger.debug("Bracket cache is fresh, skipping fetch")
+                    return nil
+                }}
+                state.bracket = .loading
+                return await fetchBracket(playoffService: playoffService)
+
+            case .refreshRequested:
+                state.bracket = .loading
+                return await fetchBracket(playoffService: playoffService, forceNetwork: true)
+
+            case let .bracketLoaded(series):
+                state.bracket = .loaded(series)
+                state.lastUpdated = Date.now
+                return nil
+
+            case let .bracketFailed(error):
+                if case .loaded = state.bracket {{
+                    logger.warning("Bracket refresh failed, keeping existing data: \\\\(error.diagnosticDescription)")
+                    return nil
+                }}
+                state.bracket = .failed(error)
+                return nil
+            }}
+        }}
+    }}
+
+    private static func fetchBracket(
+        playoffService: PlayoffServiceProtocol,
+        forceNetwork: Bool = false
+    ) async -> PlayoffIntent {{
+        if !forceNetwork, let cached = try? playoffService.loadCachedBracket(), !cached.isEmpty {{
+            logger.debug("Using cached bracket (\\\\(cached.count) series)")
+            return .bracketLoaded(cached)
+        }}
+        do {{
+            let series = try await playoffService.fetchBracket()
+            return .bracketLoaded(series)
+        }} catch {{
+            if let cached = try? playoffService.loadCachedBracket(), !cached.isEmpty {{
+                logger.warning("Network fetch failed, falling back to cache: \\\\(error.diagnosticDescription)")
+                return .bracketLoaded(cached)
+            }}
+            return .bracketFailed(error)
+        }}
+    }}
+}}
+"""
+
+bracket_subviews_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - ConferenceSection
+
+struct ConferenceSection: View {
+    let title: String
+    let series: [PlayoffSeries]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                .padding(.horizontal, 4)
+
+            let grouped = Dictionary(grouping: series) { $0.roundNumber }
+            ForEach(grouped.keys.sorted(), id: \\.self) { round in
+                let roundSeries = grouped[round] ?? []
+                if let roundName = roundSeries.first?.roundName {
+                    Text(roundName)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(AppOpacity.dim))
+                        .padding(.horizontal, 4)
+                }
+                ForEach(roundSeries) { series in
+                    SeriesCard(series: series)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - SeriesCard
+
+struct SeriesCard: View {
+    let series: PlayoffSeries
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            matchupRow
+            statusRow
+            if series.eliminationGameNext {
+                eliminationBadge
+            }
+        }
+        .padding(12)
+        .appCard()
+        .accessibilityElement(children: .combine)
+    }
+
+    private var matchupRow: some View {
+        HStack(spacing: 0) {
+            teamColumn(
+                name: series.higherSeedTeam,
+                seed: series.higherSeed,
+                wins: series.winsHigherSeed,
+                isWinner: series.winner == series.higherSeedTeam
+            )
+            scoreCenter
+            teamColumn(
+                name: series.lowerSeedTeam,
+                seed: series.lowerSeed,
+                wins: series.winsLowerSeed,
+                isWinner: series.winner == series.lowerSeedTeam
+            )
+        }
+    }
+
+    private func teamColumn(name: String, seed: Int, wins: Int, isWinner: Bool) -> some View {
+        VStack(spacing: 4) {
+            Text(name)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(isWinner ? Color.orange : .white)
+                .lineLimit(1)
+            Text("#\\(seed)")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            winDots(count: wins)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var scoreCenter: some View {
+        VStack(spacing: 4) {
+            Text("\\(series.winsHigherSeed)-\\(series.winsLowerSeed)")
+                .font(.title3.weight(.bold).monospacedDigit())
+                .foregroundStyle(.white)
+            if let homeTeam = nextGameHomeTeam {
+                HStack(spacing: 3) {
+                    Image(systemName: "house.fill")
+                        .font(.system(size: 9))
+                    Text(homeTeam)
+                        .font(.caption2)
+                }
+                .foregroundStyle(.white.opacity(AppOpacity.secondary))
+            }
+        }
+        .frame(minWidth: 60)
+    }
+
+    private var nextGameHomeTeam: String? {
+        guard series.status != .completed else { return nil }
+        guard let isHigherSeedHome = series.isHigherSeedHomeNext else { return nil }
+        return isHigherSeedHome ? series.higherSeedTeam : series.lowerSeedTeam
+    }
+
+    private func winDots(count: Int) -> some View {
+        HStack(spacing: 3) {
+            ForEach(0..<4, id: \\.self) { index in
+                Circle()
+                    .fill(index < count ? Color.orange : Color.white.opacity(AppOpacity.hairline))
+                    .frame(width: 6, height: 6)
+            }
+        }
+    }
+
+    private var statusRow: some View {
+        HStack {
+            Text(series.status.localizedLabel)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(series.status.color)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(series.status.color.opacity(0.15))
+                .clipShape(Capsule())
+            Spacer(minLength: 0)
+            if series.status == .active {
+                Text(
+                    String(
+                        format: String(localized: "bracket.series.game", defaultValue: "Game %@"),
+                        "\\(series.gamesPlayed + 1)"
+                    )
+                )
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            }
+        }
+    }
+
+    private var eliminationBadge: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "bolt.fill")
+                .font(.caption2)
+            Text(String(localized: "bracket.series.eliminationGame", defaultValue: "Elimination Game"))
+                .font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(.red)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.red.opacity(0.12))
+        .clipShape(Capsule())
+    }
+}
+
+// MARK: - SeriesStatus + UI
+
+extension SeriesStatus {
+    var localizedLabel: String {
+        switch self {
+        case .scheduled:
+            String(localized: "bracket.series.scheduled", defaultValue: "Scheduled")
+        case .active:
+            String(localized: "bracket.series.active", defaultValue: "Active")
+        case .completed:
+            String(localized: "bracket.series.completed", defaultValue: "Completed")
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .scheduled: .white.opacity(0.5)
+        case .active: .green
+        case .completed: .orange
+        }
+    }
+}
+"""
+
+bracket_view_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct BracketView: View {
+    @StateObject var store: Store<PlayoffState, PlayoffIntent>
+
+    var body: some View {
+        NavigationStack {
+            content
+                .appBackground()
+                .appNavigationBar(
+                    title: String(localized: "bracket.title", defaultValue: "Bracket")
+                )
+        }
+        .task { store.send(.onAppear) }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        LoadableContentView(
+            state: store.state.bracket,
+            isEmpty: seriesIsEmpty,
+            emptyIcon: "trophy",
+            errorKey: "bracket.error",
+            retryKey: "bracket.retry",
+            emptyKey: "bracket.empty",
+            onRetry: { store.send(.refreshRequested) },
+            content: { bracketList }
+        )
+    }
+
+    private var seriesIsEmpty: Bool {
+        if case let .loaded(series) = store.state.bracket { return series.isEmpty }
+        return true
+    }
+
+    private var bracketList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: AppSpacing.xl) {
+                if let series = loadedSeries {
+                    let east = series.filter { $0.conference == "east" }
+                        .sorted { ($0.roundNumber, $0.higherSeed) < ($1.roundNumber, $1.higherSeed) }
+                    let west = series.filter { $0.conference == "west" }
+                        .sorted { ($0.roundNumber, $0.higherSeed) < ($1.roundNumber, $1.higherSeed) }
+                    let finals = series.filter { $0.conference == "nba" }
+
+                    if !east.isEmpty {
+                        ConferenceSection(
+                            title: String(localized: "bracket.east", defaultValue: "Eastern Conference"),
+                            series: east
+                        )
+                    }
+                    if !west.isEmpty {
+                        ConferenceSection(
+                            title: String(localized: "bracket.west", defaultValue: "Western Conference"),
+                            series: west
+                        )
+                    }
+                    if !finals.isEmpty {
+                        ConferenceSection(
+                            title: String(localized: "bracket.finals", defaultValue: "NBA Finals"),
+                            series: finals
+                        )
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.top, 10)
+            .padding(.bottom, 20)
+        }
+        .refreshable {
+            await store.sendAsync(.refreshRequested)
+        }
+    }
+
+    private var loadedSeries: [PlayoffSeries]? {
+        if case let .loaded(series) = store.state.bracket { return series }
+        return nil
+    }
+}
+"""
+
 write(os.path.join(prospecting_store_dir, "ProspectingState.swift"), prospecting_state_swift)
 write(os.path.join(prospecting_store_dir, "ProspectingIntent.swift"), prospecting_intent_swift)
 write(os.path.join(prospecting_store_dir, "OpportunityDetailState.swift"), opportunity_detail_state_swift)
 write(os.path.join(prospecting_store_dir, "OpportunityDetailIntent.swift"), opportunity_detail_intent_swift)
+write(os.path.join(prospecting_store_dir, "PlayoffState.swift"), playoff_state_swift)
 
 prospecting_view_swift = header() + f"""\
 import SwiftUI
@@ -4950,7 +5545,9 @@ struct ProspectingView: View {{
     @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
     let trendingsService: TrendingsServiceProtocol
     let gamesService: GamesServiceProtocol
+    let playoffService: PlayoffServiceProtocol
     @State private var showProfile = false
+    @State private var showBracket = false
     @State private var selectedTab = ProspectingTab.gems
     @State private var toastTier: FeatureTier?
     @Environment(\\.accessibilityReduceMotion) private var reduceMotion
@@ -5033,6 +5630,10 @@ struct ProspectingView: View {{
         VStack(spacing: 0) {{
             SeasonModeBanner(mode: store.state.seasonMode)
 
+            if store.state.seasonMode == .playoffs {{
+                playoffBracketButton
+            }}
+
             if store.state.seasonMode == .offseason {{
                 offseasonView
             }} else {{
@@ -5066,6 +5667,30 @@ struct ProspectingView: View {{
             return LocalizedStringResource(
                 "prospecting.empty",
                 defaultValue: "No opportunities available"
+            )
+        }}
+    }}
+
+    private var playoffBracketButton: some View {{
+        Button {{
+            showBracket = true
+        }} label: {{
+            HStack(spacing: 6) {{
+                Text(String(localized: "bracket.viewBracket", defaultValue: "View Bracket"))
+                    .font(.caption.weight(.semibold))
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+            }}
+            .foregroundStyle(.orange)
+        }}
+        .padding(.vertical, 6)
+        .accessibilityLabel(String(localized: "bracket.viewBracket", defaultValue: "View Bracket"))
+        .sheet(isPresented: $showBracket) {{
+            BracketView(
+                store: Store(
+                    initial: PlayoffState(),
+                    reduce: PlayoffState.makeReduce(playoffService: playoffService)
+                )
             )
         }}
     }}
@@ -5249,6 +5874,7 @@ struct OpportunityRowView: View {
             let hasBadges = opportunity.injuryStatus != nil
                 || opportunity.isSurging
                 || opportunity.isHome
+                || opportunity.rotationTier != nil
             if hasBadges {
                 badgeRow
             }
@@ -5315,6 +5941,15 @@ struct OpportunityRowView: View {
                     .padding(.horizontal, 3)
                     .padding(.vertical, 1)
                     .background(Color.purple.opacity(0.15))
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            }
+            if let tier = opportunity.rotationTier {
+                Text(tier.displayLabel)
+                    .font(AppFonts.rankingBadgeIcon)
+                    .foregroundStyle(tier.color)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(tier.color.opacity(0.15))
                     .clipShape(RoundedRectangle(cornerRadius: 3))
             }
         }
@@ -5390,6 +6025,9 @@ struct OpportunityDetailView: View {
                 )
                 OpportunityFantasyBar(player: player, isHome: opportunity.isHome)
                 OpportunityDetailScoreCard(opportunity: opportunity)
+                if let trust = opportunity.playoffTrendTrust, trust < 0.5 {
+                    coldStartBanner
+                }
                 tabBar
                 tabContent
             }
@@ -5410,6 +6048,26 @@ struct OpportunityDetailView: View {
         .animation(reduceMotion ? nil : .spring(duration: 0.3), value: showTierToast)
         .appNavigationBar(title: "")
         .task { store.send(.onAppear) }
+    }
+
+    // MARK: - Cold-Start Banner
+
+    private var coldStartBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption)
+            Text(String(localized: "playoff.coldStart.warning",
+                        defaultValue: "Early playoff sample — projections anchored to regular-season form"))
+                .font(.caption)
+                .multilineTextAlignment(.leading)
+        }
+        .foregroundStyle(.orange)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.sm))
+        .accessibilityLabel(String(localized: "playoff.coldStart.warning",
+                                   defaultValue: "Early playoff sample — projections anchored to regular-season form"))
     }
 
     private var tabBar: some View {
@@ -5915,6 +6573,8 @@ struct OpportunityEdgeCard: View {
 """
 
 write(os.path.join(prospecting_views_dir, "OpportunityDetailSubviews.swift"), opportunity_detail_subviews_swift)
+write(os.path.join(prospecting_views_dir, "BracketView.swift"), bracket_view_swift)
+write(os.path.join(prospecting_views_dir, "BracketSubviews.swift"), bracket_subviews_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9i. Projecting Store + Views
@@ -7875,12 +8535,15 @@ print(f"  App/Sources/Core/Models/Opportunity.swift")
 print(f"  App/Sources/Core/Models/Projection.swift")
 print(f"  App/Sources/Core/Models/TodaySchedule.swift")
 print(f"  App/Sources/Core/Models/GameEntry.swift")
+print(f"  App/Sources/Core/Models/PlayoffSeries.swift")
+print(f"  App/Sources/Core/Models/LeagueState.swift")
 print()
 print("Services:")
 print(f"  App/Sources/Core/Services/TrendingsService.swift")
 print(f"  App/Sources/Core/Services/OpportunitiesService.swift")
 print(f"  App/Sources/Core/Services/ProjectionsService.swift")
 print(f"  App/Sources/Core/Services/GamesService.swift")
+print(f"  App/Sources/Core/Services/PlayoffService.swift")
 print()
 print("Sport configuration:")
 print(f"  App/Sources/Core/Sport/ScoringCalculator.swift")
@@ -7918,11 +8581,14 @@ print(f"  App/Sources/Features/Prospecting/Store/ProspectingState.swift")
 print(f"  App/Sources/Features/Prospecting/Store/ProspectingIntent.swift")
 print(f"  App/Sources/Features/Prospecting/Store/OpportunityDetailState.swift")
 print(f"  App/Sources/Features/Prospecting/Store/OpportunityDetailIntent.swift")
+print(f"  App/Sources/Features/Prospecting/Store/PlayoffState.swift")
 print(f"  App/Sources/Features/Prospecting/Views/ProspectingView.swift")
 print(f"  App/Sources/Features/Prospecting/Views/ProspectingSubviews.swift")
 print(f"  App/Sources/Features/Prospecting/Views/OpportunityRowView.swift")
 print(f"  App/Sources/Features/Prospecting/Views/OpportunityDetailView.swift")
 print(f"  App/Sources/Features/Prospecting/Views/OpportunityDetailSubviews.swift")
+print(f"  App/Sources/Features/Prospecting/Views/BracketView.swift")
+print(f"  App/Sources/Features/Prospecting/Views/BracketSubviews.swift")
 print()
 print("Projecting feature:")
 print(f"  App/Sources/Features/Projecting/Store/ProjectingState.swift")
