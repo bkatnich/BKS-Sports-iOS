@@ -5271,13 +5271,13 @@
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Edición Baloncesto"
+            "value" : "Edición Béisbol"
           }
         },
         "fr-CA" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Édition Basketball"
+            "value" : "Édition Baseball"
           }
         }
       }
@@ -5610,19 +5610,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "e.g. \"Jokic\", \"LeBron\""
+            "value" : "e.g. \"Ohtani\", \"Judge\""
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ej. \"Jokic\", \"LeBron\""
+            "value" : "ej. \"Ohtani\", \"Judge\""
           }
         },
         "fr-CA" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ex. « Jokic », « LeBron »"
+            "value" : "ex. « Ohtani », « Judge »"
           }
         }
       }
@@ -5702,19 +5702,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "e.g. \"DEN\", \"LAC\""
+            "value" : "e.g. \"NYY\", \"LAD\""
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ej. \"DEN\", \"LAC\""
+            "value" : "ej. \"NYY\", \"LAD\""
           }
         },
         "fr-CA" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ex. « DEN », « LAC »"
+            "value" : "ex. « NYY », « LAD »"
           }
         }
       }
@@ -5748,19 +5748,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "e.g. \"Denver Nuggets\""
+            "value" : "e.g. \"New York Yankees\""
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ej. \"Denver Nuggets\""
+            "value" : "ej. \"New York Yankees\""
           }
         },
         "fr-CA" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ex. « Denver Nuggets »"
+            "value" : "ex. « New York Yankees »"
           }
         }
       }

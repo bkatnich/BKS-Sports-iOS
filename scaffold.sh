@@ -350,13 +350,15 @@ enum GameResult: Codable, Equatable {{
         return false
     }}
 
-    var displayScore: String {{
+    private var scores: (team: Int, opponent: Int) {{
         switch self {{
-        case let .win(team, opponent):
-            "\\\\(team)-\\\\(opponent)"
-        case let .loss(team, opponent):
-            "\\\\(team)-\\\\(opponent)"
+        case let .win(team, opponent): (team, opponent)
+        case let .loss(team, opponent): (team, opponent)
         }}
+    }}
+
+    var displayScore: String {{
+        "\\\\(scores.team)-\\\\(scores.opponent)"
     }}
 }}
 
@@ -729,11 +731,11 @@ struct GameLogTableView: View {{
     // MARK: - Helpers
 
     private func resultText(for entry: GameEntry) -> some View {{
-        let prefix = entry.result.isWin
+        let color: Color = entry.result.isWin ? .green : .red
+        let winLoss: String = entry.result.isWin
             ? String(localized: "W", defaultValue: "W")
             : String(localized: "L", defaultValue: "L")
-        let color: Color = entry.result.isWin ? .green : .red
-        return Text("\\\\(prefix) \\\\(entry.result.displayScore)")
+        return Text(winLoss + " " + entry.result.displayScore)
             .foregroundStyle(color.opacity(0.9))
     }}
 
@@ -922,8 +924,7 @@ write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportConfiguration+Envir
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8d. Bootstrap files  (App/Sources/App/Bootstrap/)
-#     Minimal entry point + DI container + Firebase wiring.
-#     Feature views/services are ported manually as development continues.
+#     Fully-wired entry point + DI container + Firebase wiring.
 # ─────────────────────────────────────────────────────────────────────────────
 
 bootstrap_app = header() + f"""\
@@ -948,37 +949,107 @@ struct {type_prefix}App: App {{
     )
 
     @ObservedObject private var authStore: Store<AuthState, AuthIntent>
+    @ObservedObject private var profileStore: Store<ProfileState, ProfileIntent>
+    @ObservedObject private var signInStore: Store<SignInState, SignInIntent>
+    @ObservedObject private var trendingStore: Store<TrendingState, TrendingIntent>
+    @ObservedObject private var prospectingStore: Store<ProspectingState, ProspectingIntent>
+    @ObservedObject private var projectingStore: Store<ProjectingState, ProjectingIntent>
     @StateObject private var networkMonitor = NetworkMonitor()
 
     private let configuration: ConfigurationProtocol
     private let auth: AuthenticationProtocol
+    private let trendingsService: TrendingsServiceProtocol
+    private let opportunitiesService: OpportunitiesServiceProtocol
+    private let projectionsService: ProjectionsServiceProtocol
+    private let gamesService: GamesServiceProtocol
     private let analyticsAdapter = FirebaseAnalyticsAdapter()
 
     init() {{
         Self.logLaunchDiagnostics()
         let container = Container.defaultContainer()
-        authStore = container.require(Store<AuthState, AuthIntent>.self)
-        auth = container.require(AuthenticationProtocol.self)
+        let resolvedAuth = container.require(Store<AuthState, AuthIntent>.self)
+        let resolvedAuthService = container.require(AuthenticationProtocol.self)
+        authStore = resolvedAuth
+        auth = resolvedAuthService
         configuration = container.require(ConfigurationProtocol.self)
+        profileStore = Self.makeProfileStore(container: container, authStore: resolvedAuth, auth: resolvedAuthService)
+        signInStore = Self.makeSignInStore(container: container, authStore: resolvedAuth)
+
+        let resolvedTrendingsService = container.require(TrendingsServiceProtocol.self)
+        let resolvedOpportunitiesService = container.require(OpportunitiesServiceProtocol.self)
+        let resolvedProjectionsService = container.require(ProjectionsServiceProtocol.self)
+        let resolvedGamesService = container.require(GamesServiceProtocol.self)
+
+        trendingsService = resolvedTrendingsService
+        opportunitiesService = resolvedOpportunitiesService
+        projectionsService = resolvedProjectionsService
+        gamesService = resolvedGamesService
+
+        trendingStore = container.require(Store<TrendingState, TrendingIntent>.self)
+        prospectingStore = container.require(Store<ProspectingState, ProspectingIntent>.self)
+        projectingStore = container.require(Store<ProjectingState, ProjectingIntent>.self)
+
         TrendRefreshTask.register()
     }}
 
     private static func logLaunchDiagnostics() {{
         let bundle = Bundle.main
-        let appName = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Unknown"
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
-        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        let bundleID = bundle.bundleIdentifier ?? "Unknown"
-        let device = UIDevice.current
-        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
         #if DEBUG
             let configuration = "DEBUG"
         #else
             let configuration = "RELEASE"
         #endif
-        logger.info("App Launch — \\\\(appName) v\\\\(version) (\\\\(build)) [\\\\(configuration)]")
-        logger.info("Device — \\\\(device.model) · \\\\(device.systemName) \\\\(osVersion)")
-        logger.debug("Bundle ID — \\\\(bundleID)")
+        let appName = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Unknown"
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let bundleID = bundle.bundleIdentifier ?? "Unknown"
+        let model = UIDevice.current.model
+        let systemName = UIDevice.current.systemName
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
+        let launchMsg = "App Launch — \\(appName) v\\(version) (\\(build)) [\\(configuration)]"
+        let deviceMsg = "Device — \\(model) · \\(systemName) \\(osVersion)"
+        logger.info("\\(launchMsg, privacy: .public)")
+        logger.info("\\(deviceMsg, privacy: .public)")
+        logger.debug("Bundle ID — \\(bundleID, privacy: .public)")
+    }}
+
+    @MainActor
+    private static func makeProfileStore(
+        container: Container,
+        authStore: Store<AuthState, AuthIntent>,
+        auth: AuthenticationProtocol
+    ) -> Store<ProfileState, ProfileIntent> {{
+        let storage = container.require(StorageProtocol.self)
+        let signOut: @MainActor @Sendable () -> Void = {{ authStore.send(.signOutRequested) }}
+        let eraseDeviceData: @MainActor @Sendable () -> Void = {{
+            try? storage.deleteAll(from: .file)
+            try? storage.deleteAll(from: .userDefaults)
+            try? storage.deleteAll(from: .keychain)
+            authStore.send(.signOutRequested)
+        }}
+        let removeAccount: @MainActor @Sendable () async throws -> Void = {{ try await auth.deleteAccount() }}
+        let reduce = ProfileState.makeReduce(
+            storage: storage,
+            analytics: FirebaseAnalyticsAdapter(),
+            onSignOutRequested: signOut,
+            onEraseDeviceData: eraseDeviceData,
+            onRemoveAccount: removeAccount
+        )
+        return Store(initial: ProfileState(), reduce: reduce)
+    }}
+
+    @MainActor
+    private static func makeSignInStore(
+        container: Container,
+        authStore: Store<AuthState, AuthIntent>
+    ) -> Store<SignInState, SignInIntent> {{
+        let auth = container.require(AuthenticationProtocol.self)
+        let storage = container.require(StorageProtocol.self)
+        let reduce = SignInState.makeReduce(auth: auth, storage: storage) {{ result in
+            FirebaseAnalyticsAdapter().logEvent(AnalyticsEvent.signInCompleted, parameters: nil)
+            authStore.send(.signInSucceeded(result))
+        }}
+        return Store(initial: SignInState(), reduce: reduce)
     }}
 
     @State private var splashDismissed = false
@@ -995,7 +1066,10 @@ struct {type_prefix}App: App {{
                 .appConfiguration(configuration)
                 .sportConfiguration(.{slug})
                 .analytics(analyticsAdapter)
-                .task {{ authStore.send(.checkStoredCredential) }}
+                .task {{
+                    authStore.send(.checkStoredCredential)
+                    profileStore.send(.onAppear)
+                }}
                 .onReceive(
                     NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
                 ) {{ _ in
@@ -1011,21 +1085,43 @@ struct {type_prefix}App: App {{
         }}
     }}
 
+    private var signInView: some View {{
+        SignInView(store: signInStore, animateIn: splashDismissed, auth: auth) {{ result in
+            analyticsAdapter.logEvent(AnalyticsEvent.signUpCompleted, parameters: nil)
+            authStore.send(.signInSucceeded(result))
+        }}
+    }}
+
     private var rootView: some View {{
         ZStack {{
             switch authStore.state.session {{
             case .undetermined:
                 Color.clear
+
             case .unauthenticated:
-                // TODO: Add SignInView once feature views are ported
-                Color.clear
-            case .authenticated:
-                // TODO: Add AppShell once feature views are ported
-                Color.clear
+                signInView
+                    .compositingGroup()
+                    .transition(.opacity)
+
+            case let .authenticated(credential):
+                AppShell(
+                    trendingStore: trendingStore,
+                    prospectingStore: prospectingStore,
+                    projectingStore: projectingStore,
+                    profileStore: profileStore,
+                    credential: credential,
+                    trendingsService: trendingsService,
+                    gamesService: gamesService
+                )
+                .compositingGroup()
+                .transition(.opacity)
             }}
+
             if !splashDismissed {{
-                SplashView(onDismiss: {{ splashDismissed = true }},
-                           authSessionResolved: authSessionResolved)
+                SplashView(
+                    onDismiss: {{ splashDismissed = true }},
+                    authSessionResolved: authSessionResolved
+                )
             }}
         }}
         .animation(.easeInOut(duration: 0.4), value: {{
@@ -1056,8 +1152,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {{
     ) -> Bool {{
         #if DEBUG
             AppCheck.setAppCheckProviderFactory(AppCheckDebugProviderFactory())
-            let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
-            logger.debug("Bundle identifier: \\\\(bundleID)")
+            logger.debug("Bundle identifier: \\(Bundle.main.bundleIdentifier ?? "unknown", privacy: .public)")
         #else
             AppCheck.setAppCheckProviderFactory(AppAttestProviderFactory())
         #endif
@@ -1102,6 +1197,7 @@ extension Container {{
         let container = Container()
         container.registerSportConfiguration()
         container.registerCoreServices()
+        container.registerDomainServices()
         container.registerFeatureStores()
         return container
     }}
@@ -1141,7 +1237,47 @@ extension Container {{
         }}
     }}
 
+    private func registerDomainServices() {{
+        register(TrendingsServiceProtocol.self) {{ resolver in
+            TrendingsService(
+                network: resolver.require(NetworkProtocol.self, name: "firebase"),
+                storage: resolver.require(StorageProtocol.self),
+                configuration: resolver.require(ConfigurationProtocol.self),
+                sportConfiguration: resolver.require(SportConfiguration.self)
+            )
+        }}.inObjectScope(.container)
+
+        register(OpportunitiesServiceProtocol.self) {{ resolver in
+            OpportunitiesService(
+                network: resolver.require(NetworkProtocol.self, name: "firebase"),
+                storage: resolver.require(StorageProtocol.self),
+                configuration: resolver.require(ConfigurationProtocol.self),
+                sportConfiguration: resolver.require(SportConfiguration.self)
+            )
+        }}.inObjectScope(.container)
+
+        register(ProjectionsServiceProtocol.self) {{ resolver in
+            ProjectionsService(
+                network: resolver.require(NetworkProtocol.self, name: "firebase"),
+                storage: resolver.require(StorageProtocol.self),
+                configuration: resolver.require(ConfigurationProtocol.self),
+                sportConfiguration: resolver.require(SportConfiguration.self)
+            )
+        }}.inObjectScope(.container)
+
+        register(GamesServiceProtocol.self) {{ resolver in
+            GamesService(
+                network: resolver.require(NetworkProtocol.self, name: "apiKey"),
+                firebaseNetwork: resolver.require(NetworkProtocol.self, name: "firebase"),
+                storage: resolver.require(StorageProtocol.self),
+                configuration: resolver.require(ConfigurationProtocol.self),
+                sportConfiguration: resolver.require(SportConfiguration.self)
+            )
+        }}.inObjectScope(.container)
+    }}
+
     @MainActor
+    // swiftlint:disable:next function_body_length
     private func registerFeatureStores() {{
         register(Store<AuthState, AuthIntent>.self) {{ resolver in
             let storage = resolver.require(StorageProtocol.self)
@@ -1150,6 +1286,50 @@ extension Container {{
                 Store(initial: AuthState(), reduce: AuthState.makeReduce(storage: storage, auth: auth))
             }}
         }}
+
+        register(Store<TrendingState, TrendingIntent>.self) {{ resolver in
+            let trendingsService = resolver.require(TrendingsServiceProtocol.self)
+            let sportConfig = resolver.require(SportConfiguration.self)
+            return MainActor.assumeIsolated {{
+                Store(
+                    initial: TrendingState(),
+                    reduce: TrendingState.makeReduce(
+                        trendingsService: trendingsService,
+                        positionMap: sportConfig.positionMap
+                    )
+                )
+            }}
+        }}.inObjectScope(.container)
+
+        register(Store<ProspectingState, ProspectingIntent>.self) {{ resolver in
+            let opportunitiesService = resolver.require(OpportunitiesServiceProtocol.self)
+            let gamesService = resolver.require(GamesServiceProtocol.self)
+            let sportConfig = resolver.require(SportConfiguration.self)
+            return MainActor.assumeIsolated {{
+                Store(
+                    initial: ProspectingState(),
+                    reduce: ProspectingState.makeReduce(
+                        opportunityService: opportunitiesService,
+                        gamesService: gamesService,
+                        positionMap: sportConfig.positionMap
+                    )
+                )
+            }}
+        }}.inObjectScope(.container)
+
+        register(Store<ProjectingState, ProjectingIntent>.self) {{ resolver in
+            let projectionsService = resolver.require(ProjectionsServiceProtocol.self)
+            let sportConfig = resolver.require(SportConfiguration.self)
+            return MainActor.assumeIsolated {{
+                Store(
+                    initial: ProjectingState(),
+                    reduce: ProjectingState.makeReduce(
+                        projectionService: projectionsService,
+                        positionMap: sportConfig.positionMap
+                    )
+                )
+            }}
+        }}.inObjectScope(.container)
     }}
 }}
 """
@@ -1170,14 +1350,22 @@ final class Authentication: AuthenticationProtocol {{
 
     func createUser(withEmail email: String, password: String) async throws -> AuthResult {{
         let result = try await Auth.auth().createUser(withEmail: email, password: password)
-        return AuthResult(provider: .email, userID: result.user.uid,
-                         email: result.user.email, displayName: result.user.displayName)
+        return AuthResult(
+            provider: .email,
+            userID: result.user.uid,
+            email: result.user.email,
+            displayName: result.user.displayName
+        )
     }}
 
     func signIn(withEmail email: String, password: String) async throws -> AuthResult {{
         let result = try await Auth.auth().signIn(withEmail: email, password: password)
-        return AuthResult(provider: .email, userID: result.user.uid,
-                         email: result.user.email, displayName: result.user.displayName)
+        return AuthResult(
+            provider: .email,
+            userID: result.user.uid,
+            email: result.user.email,
+            displayName: result.user.displayName
+        )
     }}
 
     func sendPasswordReset(toEmail email: String) async throws {{
@@ -1237,7 +1425,6 @@ enum TrendRefreshTask {{
         BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) {{ task in
             guard let processingTask = task as? BGProcessingTask else {{ return }}
             scheduleIfNeeded()
-            // TODO: wire up services once they are ported
             processingTask.setTaskCompleted(success: true)
         }}
     }}
@@ -1269,6 +1456,5640 @@ write(os.path.join(bootstrap_dir, "DependencyContainer.swift"), bootstrap_contai
 write(os.path.join(bootstrap_dir, "Authentication.swift"), bootstrap_auth)
 write(os.path.join(bootstrap_dir, "FirebaseAnalyticsAdapter.swift"), bootstrap_analytics)
 write(os.path.join(bootstrap_dir, "TrendRefreshTask.swift"), bootstrap_trend)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9a. AppShell.swift
+# ─────────────────────────────────────────────────────────────────────────────
+
+app_shell = header() + """\
+// UI infrastructure — no MVI. Tab selection is pure local UI state.
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct AppShell: View {
+    @ObservedObject var trendingStore: Store<TrendingState, TrendingIntent>
+    @ObservedObject var prospectingStore: Store<ProspectingState, ProspectingIntent>
+    @ObservedObject var projectingStore: Store<ProjectingState, ProjectingIntent>
+    @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    let credential: StoredCredential
+    let trendingsService: TrendingsServiceProtocol
+    let gamesService: GamesServiceProtocol
+    @EnvironmentObject var networkMonitor: NetworkMonitor
+    @Environment(\\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\\.analytics) private var analytics
+
+    var body: some View {
+        TabView {
+            TrendingView(
+                store: trendingStore,
+                gamesService: gamesService,
+                credential: credential,
+                profileStore: profileStore
+            )
+            .tabItem {
+                Label(
+                    String(localized: "tab.trending", defaultValue: "Trending"),
+                    systemImage: "chart.line.uptrend.xyaxis"
+                )
+            }
+
+            ProspectingView(
+                store: prospectingStore,
+                credential: credential,
+                profileStore: profileStore,
+                trendingsService: trendingsService,
+                gamesService: gamesService
+            )
+            .tabItem {
+                Label(
+                    String(localized: "tab.prospecting", defaultValue: "Prospecting"),
+                    systemImage: "sparkle.magnifyingglass"
+                )
+            }
+
+            ProjectingView(
+                store: projectingStore,
+                credential: credential,
+                profileStore: profileStore,
+                trendingsService: trendingsService,
+                gamesService: gamesService
+            )
+            .tabItem {
+                Label(
+                    String(localized: "tab.projecting", defaultValue: "Projecting"),
+                    systemImage: "chart.bar.xaxis.ascending"
+                )
+            }
+
+            ProfilePanelView(credential: credential, profileStore: profileStore)
+                .tabItem {
+                    Label(
+                        String(localized: "Settings", defaultValue: "Settings"),
+                        systemImage: "person.circle"
+                    )
+                }
+        }
+        .toolbarBackground(.visible, for: .tabBar)
+        .toolbarBackground(.ultraThinMaterial, for: .tabBar)
+        .toolbarColorScheme(.dark, for: .tabBar)
+        .overlay(alignment: .top) {
+            if !networkMonitor.isConnected {
+                OfflineBanner()
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: networkMonitor.isConnected)
+    }
+}
+"""
+
+write(os.path.join(bootstrap_dir, "AppShell.swift"), app_shell)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9b. Models
+# ─────────────────────────────────────────────────────────────────────────────
+
+models_dir = os.path.join(out_dir, "App/Sources/Core/Models")
+
+player_swift = header() + """\
+import Foundation
+import BKSCore
+
+struct Player: Codable, Equatable, Hashable, Identifiable, Filterable {
+    let id: String
+    let displayName: String
+    let team: String
+    let position: String?
+    let headshotURL: URL?
+    let externalPersonID: Int?
+
+    // Tier
+    let playerTier: PlayerTier?
+
+    // Fantasy scoring
+    let avgFantasyScore: Double?
+    let avgFantasyScoreHome: Double?
+    let avgFantasyScoreAway: Double?
+    let avgMinutes: Double?
+
+    // Recent game data
+    let recentGameScores: [Double]?
+
+    // Trend signals
+    let trendScore: Double?
+    let trendDirection: TrendDirection?
+    let trendAcceleration: Double?
+
+    // Streak & surge
+    let hotStreak: Int?
+    let isSurging: Bool?
+    let surgingCategoryCount: Int?
+
+    // Confidence & consistency
+    let confidenceScore: Double?
+    let consistencyScore: Double?
+
+    // Injury & status
+    let injuryStatus: InjuryStatus?
+    let previousInjuryStatus: InjuryStatus?
+    let injuryStatusChangedAt: Date?
+    let isReturnGameWindow: Bool?
+    let daysSinceReturn: Int?
+    let isRoleChange: Bool?
+    let usageEfficiencySignal: UsageEfficiencySignal?
+
+    // swiftlint:disable:next function_default_parameter_at_end
+    init(
+        id: String,
+        displayName: String,
+        team: String,
+        position: String?,
+        headshotURL: URL?,
+        externalPersonID: Int?,
+        playerTier: PlayerTier?,
+        avgFantasyScore: Double? = nil,
+        avgFantasyScoreHome: Double? = nil,
+        avgFantasyScoreAway: Double? = nil,
+        avgMinutes: Double? = nil,
+        recentGameScores: [Double]? = nil,
+        trendScore: Double? = nil,
+        trendDirection: TrendDirection? = nil,
+        trendAcceleration: Double? = nil,
+        hotStreak: Int? = nil,
+        isSurging: Bool? = nil,
+        surgingCategoryCount: Int? = nil,
+        confidenceScore: Double? = nil,
+        consistencyScore: Double? = nil,
+        injuryStatus: InjuryStatus? = nil,
+        previousInjuryStatus: InjuryStatus? = nil,
+        injuryStatusChangedAt: Date? = nil,
+        isReturnGameWindow: Bool? = nil,
+        daysSinceReturn: Int? = nil,
+        isRoleChange: Bool? = nil,
+        usageEfficiencySignal: UsageEfficiencySignal? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.team = team
+        self.position = position
+        self.headshotURL = headshotURL
+        self.externalPersonID = externalPersonID
+        self.playerTier = playerTier
+        self.avgFantasyScore = avgFantasyScore
+        self.avgFantasyScoreHome = avgFantasyScoreHome
+        self.avgFantasyScoreAway = avgFantasyScoreAway
+        self.avgMinutes = avgMinutes
+        self.recentGameScores = recentGameScores
+        self.trendScore = trendScore
+        self.trendDirection = trendDirection
+        self.trendAcceleration = trendAcceleration
+        self.hotStreak = hotStreak
+        self.isSurging = isSurging
+        self.surgingCategoryCount = surgingCategoryCount
+        self.confidenceScore = confidenceScore
+        self.consistencyScore = consistencyScore
+        self.injuryStatus = injuryStatus
+        self.previousInjuryStatus = previousInjuryStatus
+        self.injuryStatusChangedAt = injuryStatusChangedAt
+        self.isReturnGameWindow = isReturnGameWindow
+        self.daysSinceReturn = daysSinceReturn
+        self.isRoleChange = isRoleChange
+        self.usageEfficiencySignal = usageEfficiencySignal
+    }
+}
+
+enum UsageEfficiencySignal: String, Codable, Equatable, Hashable {
+    case expanding
+    case expandingEfficiently = "expanding_efficiently"
+    case volumeInflation = "volume_inflation"
+    case efficientUsage = "efficient_usage"
+    case neutral
+}
+
+enum PlayerTier: String, Codable, Equatable, Hashable, CaseIterable, TierDisplayable {
+    case elite
+    case good
+    case solid
+    case bottomFeeder = "bottom_feeder"
+
+    var tierLevel: TierLevel {
+        switch self {
+        case .elite: .elite
+        case .good: .good
+        case .solid: .solid
+        case .bottomFeeder: .bottom
+        }
+    }
+
+    var sortOrder: Int { tierSortOrder }
+}
+"""
+
+opportunity_swift = header() + """\
+import Foundation
+import BKSCore
+
+struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable {
+    let id: String
+    let displayName: String
+    let team: String
+    let position: String?
+    let opponentAbbr: String
+    let headshotURL: URL?
+    let externalPersonID: Int?
+
+    // Core Scoring
+    let opportunityScore: Double
+    let opportunityTier: FeatureTier
+    let playerTier: PlayerTier?
+    let mode: String
+    let platform: String
+
+    // Key Signals
+    let injuryStatus: InjuryStatus?
+    let isSurging: Bool
+    let isHome: Bool
+
+    // Playoff fields (null during regular season)
+    let playoffRotationMultiplier: Double?
+    let rotationTier: RotationTier?
+    let playoffTrendTrust: Double?
+    let playoffGamesPlayed: Int?
+
+    var additionalSearchFields: [String] { [opponentAbbr] }
+
+    // swiftlint:disable:next function_default_parameter_at_end
+    init(
+        id: String,
+        displayName: String,
+        team: String,
+        position: String?,
+        opponentAbbr: String,
+        headshotURL: URL?,
+        externalPersonID: Int?,
+        opportunityScore: Double,
+        opportunityTier: FeatureTier,
+        playerTier: PlayerTier?,
+        mode: String,
+        platform: String,
+        injuryStatus: InjuryStatus?,
+        isSurging: Bool,
+        isHome: Bool,
+        playoffRotationMultiplier: Double? = nil,
+        rotationTier: RotationTier? = nil,
+        playoffTrendTrust: Double? = nil,
+        playoffGamesPlayed: Int? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.team = team
+        self.position = position
+        self.opponentAbbr = opponentAbbr
+        self.headshotURL = headshotURL
+        self.externalPersonID = externalPersonID
+        self.opportunityScore = opportunityScore
+        self.opportunityTier = opportunityTier
+        self.playerTier = playerTier
+        self.mode = mode
+        self.platform = platform
+        self.injuryStatus = injuryStatus
+        self.isSurging = isSurging
+        self.isHome = isHome
+        self.playoffRotationMultiplier = playoffRotationMultiplier
+        self.rotationTier = rotationTier
+        self.playoffTrendTrust = playoffTrendTrust
+        self.playoffGamesPlayed = playoffGamesPlayed
+    }
+}
+
+// MARK: - FeatureTier
+
+/// Unified tier for feature-specific scores (opportunities and projections).
+/// Raw values match the Opportunities API contract; ProjectionsService maps
+/// its string responses to cases manually.
+enum FeatureTier: String, Codable, Equatable, Hashable, CaseIterable, TierDisplayable {
+    case elite = "elite_opp"
+    case good = "good_opp"
+    case solid = "solid_opp"
+    case low = "low_opp"
+
+    var tierLevel: TierLevel {
+        switch self {
+        case .elite: .elite
+        case .good: .good
+        case .solid: .solid
+        case .low: .bottom
+        }
+    }
+
+    var sortOrder: Int { tierSortOrder }
+}
+
+// MARK: - SeasonMode
+
+enum SeasonMode: String, Codable, Equatable, Hashable {
+    case regularSeason = "regular_season"
+    case playoffs
+    case offseason
+}
+
+// MARK: - RotationTier
+
+enum RotationTier: String, Codable, Equatable, Hashable {
+    case star
+    case starter
+    case rotation
+    case fringe
+    case bench
+}
+"""
+
+projection_swift = header() + """\
+import Foundation
+import BKSCore
+
+struct Projection: Codable, Equatable, Hashable, Identifiable, Filterable {
+    let id: String
+    let displayName: String
+    let team: String
+    let position: String?
+    let headshotURL: URL?
+    let externalPersonID: Int?
+
+    // Core Scoring
+    let projectionScore: Double
+    let projectionTier: FeatureTier
+    let playerTier: PlayerTier?
+    let mode: String
+    let platform: String
+
+    // Key Signals
+    let injuryStatus: InjuryStatus?
+    let isSurging: Bool
+
+    // Schedule (future-ready — nil until backend provides)
+    let upcomingGames: [ProjectedGame]?
+    let homeGameCount: Int?
+    let awayGameCount: Int?
+    let avgOpponentStrength: Double?
+
+    // Trend Context (future-ready)
+    let trendDirection: TrendDirection?
+    let confidenceScore: Double?
+    let consistencyScore: Double?
+
+    // swiftlint:disable:next function_default_parameter_at_end
+    init(
+        id: String,
+        displayName: String,
+        team: String,
+        position: String?,
+        headshotURL: URL?,
+        externalPersonID: Int?,
+        projectionScore: Double,
+        projectionTier: FeatureTier,
+        playerTier: PlayerTier?,
+        mode: String,
+        platform: String,
+        injuryStatus: InjuryStatus?,
+        isSurging: Bool,
+        upcomingGames: [ProjectedGame]? = nil,
+        homeGameCount: Int? = nil,
+        awayGameCount: Int? = nil,
+        avgOpponentStrength: Double? = nil,
+        trendDirection: TrendDirection? = nil,
+        confidenceScore: Double? = nil,
+        consistencyScore: Double? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.team = team
+        self.position = position
+        self.headshotURL = headshotURL
+        self.externalPersonID = externalPersonID
+        self.projectionScore = projectionScore
+        self.projectionTier = projectionTier
+        self.playerTier = playerTier
+        self.mode = mode
+        self.platform = platform
+        self.injuryStatus = injuryStatus
+        self.isSurging = isSurging
+        self.upcomingGames = upcomingGames
+        self.homeGameCount = homeGameCount
+        self.awayGameCount = awayGameCount
+        self.avgOpponentStrength = avgOpponentStrength
+        self.trendDirection = trendDirection
+        self.confidenceScore = confidenceScore
+        self.consistencyScore = consistencyScore
+    }
+}
+
+// MARK: - ProjectedGame
+
+struct ProjectedGame: Codable, Equatable, Hashable, Identifiable {
+    let id: String
+    let gameDate: Date
+    let opponentAbbr: String
+    let isHome: Bool
+    let opponentStrength: Double?
+    let projectedScore: Double?
+
+    init(
+        id: String,
+        gameDate: Date,
+        opponentAbbr: String,
+        isHome: Bool,
+        opponentStrength: Double? = nil,
+        projectedScore: Double? = nil
+    ) {
+        self.id = id
+        self.gameDate = gameDate
+        self.opponentAbbr = opponentAbbr
+        self.isHome = isHome
+        self.opponentStrength = opponentStrength
+        self.projectedScore = projectedScore
+    }
+}
+"""
+
+today_schedule_swift = header() + """\
+import Foundation
+
+// MARK: - TodaySchedule
+
+struct TodaySchedule: Codable, Equatable {
+    /// Date string in "yyyy-MM-dd" format, determined in Eastern Time by the server.
+    let date: String
+    let gameCount: Int
+    let games: [ScheduledGame]
+
+    /// `true` when the server reports at least one game scheduled today.
+    /// `false` means either no games today or the sync hasn't run yet — both treated the same.
+    var hasGames: Bool { gameCount > 0 }
+}
+
+// MARK: - ScheduledGame
+
+struct ScheduledGame: Codable, Equatable, Identifiable {
+    let id: Int
+    let homeTeamAbbr: String
+    let visitorTeamAbbr: String
+    let status: String
+    let gameType: String
+    let gameDatetime: Date
+}
+"""
+
+write(os.path.join(models_dir, "Player.swift"), player_swift)
+write(os.path.join(models_dir, "Opportunity.swift"), opportunity_swift)
+write(os.path.join(models_dir, "Projection.swift"), projection_swift)
+write(os.path.join(models_dir, "TodaySchedule.swift"), today_schedule_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9c. Services
+# ─────────────────────────────────────────────────────────────────────────────
+
+services_dir = os.path.join(out_dir, "App/Sources/Core/Services")
+
+trendings_service_swift = header() + f"""\
+import Alamofire
+import BKSCore
+import Foundation
+import OSLog
+
+// MARK: - TrendingsServiceProtocol
+
+protocol TrendingsServiceProtocol {{
+    func fetchPlayers(fields: [String]?) async throws -> [Player]
+    func loadCachedPlayers() throws -> [Player]?
+    func loadCachedFetchDate() throws -> Date?
+}}
+
+extension TrendingsServiceProtocol {{
+    func fetchPlayers() async throws -> [Player] {{
+        try await fetchPlayers(fields: nil)
+    }}
+}}
+
+// MARK: - TrendingsService
+
+final class TrendingsService: TrendingsServiceProtocol {{
+    private let network: NetworkProtocol
+    private let storage: StorageProtocol
+    private let configuration: ConfigurationProtocol
+    private let sportConfiguration: SportConfiguration
+    private let logger = os.Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "TrendingsService"
+    )
+    private let signposter = OSSignposter(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "TrendingsService"
+    )
+
+    private var cacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)trending_v1" }}
+    private var cacheDateKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)trending_v1_date" }}
+
+    init(
+        network: NetworkProtocol,
+        storage: StorageProtocol,
+        configuration: ConfigurationProtocol,
+        sportConfiguration: SportConfiguration = .{slug}
+    ) {{
+        self.network = network
+        self.storage = storage
+        self.configuration = configuration
+        self.sportConfiguration = sportConfiguration
+    }}
+
+    func fetchPlayers(fields: [String]? = nil) async throws -> [Player] {{
+        let url = configuration.value(for: .getPlayersURL)
+
+        let requestFields = fields ?? sportConfiguration.trendingFields
+        var parameters: Parameters?
+        if !requestFields.isEmpty {{
+            parameters = ["fields": requestFields.joined(separator: ",")]
+        }}
+
+        let fetchStart = Date.now
+        let fetchInterval = signposter.beginInterval("fetchPlayers")
+        defer {{ signposter.endInterval("fetchPlayers", fetchInterval) }}
+
+        try Task.checkCancellation()
+        let response: PlayersResponse = try await network.get(url, parameters: parameters)
+
+        let sorted = response.data.compactMap(mapPlayer).sorted {{ $0.displayName < $1.displayName }}
+        let elapsed = Date.now.timeIntervalSince(fetchStart)
+        logger
+            .info(
+                "Fetched \\\\(sorted.count, privacy: .public) players in 1 call (\\\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
+            )
+
+        do {{
+            try storage.save(sorted, forKey: cacheKey, in: .file)
+            try storage.save(Date.now, forKey: cacheDateKey, in: .file)
+        }} catch {{
+            logger.warning("Failed to cache players: \\\\(error.diagnosticDescription)")
+        }}
+
+        return sorted
+    }}
+
+    func loadCachedPlayers() throws -> [Player]? {{
+        try storage.load(forKey: cacheKey, from: .file)
+    }}
+
+    func loadCachedFetchDate() throws -> Date? {{
+        try storage.load(forKey: cacheDateKey, from: .file)
+    }}
+
+    // MARK: - Mapping
+
+    private func mapPlayer(_ dto: PlayerDTO) -> Player? {{
+        Player(
+            id: String(dto.id),
+            displayName: "\\\\(dto.firstName) \\\\(dto.lastName)",
+            team: dto.team,
+            position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
+            headshotURL: dto.headshotURL,
+            externalPersonID: dto.externalPersonID,
+            playerTier: dto.playerTier,
+            avgFantasyScore: dto.avgFantasyScore,
+            avgFantasyScoreHome: dto.avgFantasyScoreHome,
+            avgFantasyScoreAway: dto.avgFantasyScoreAway,
+            avgMinutes: dto.avgMinutes,
+            recentGameScores: dto.recentGameScores,
+            trendScore: dto.trendScore,
+            trendDirection: dto.trendDirection,
+            trendAcceleration: dto.trendAcceleration,
+            hotStreak: dto.hotStreak,
+            isSurging: dto.isSurging,
+            surgingCategoryCount: dto.surgingCategoryCount,
+            confidenceScore: dto.confidenceScore,
+            consistencyScore: dto.consistencyScore,
+            injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
+            previousInjuryStatus: dto.previousInjuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
+            injuryStatusChangedAt: dto.injuryStatusChangedAt.flatMap {{ Self.parseISODate($0) }},
+            isReturnGameWindow: dto.isReturnGameWindow,
+            daysSinceReturn: dto.daysSinceReturn,
+            isRoleChange: dto.isRoleChange,
+            usageEfficiencySignal: dto.usageEfficiencySignal.flatMap {{ UsageEfficiencySignal(rawValue: $0) }}
+        )
+    }}
+
+    private static func parseISODate(_ string: String) -> Date? {{
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: string) {{ return date }}
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: string)
+    }}
+}}
+
+// MARK: - Player DTOs
+
+private struct PlayersResponse: Decodable {{
+    let data: [PlayerDTO]
+}}
+
+private struct PlayerDTO: Decodable {{
+    let id: Int
+    let firstName: String
+    let lastName: String
+    let team: String
+    let position: String?
+    let headshotURL: URL?
+    let externalPersonID: Int?
+    let playerTier: PlayerTier?
+    let avgFantasyScore: Double?
+    let avgFantasyScoreHome: Double?
+    let avgFantasyScoreAway: Double?
+    let avgMinutes: Double?
+    let recentGameScores: [Double]?
+    let trendScore: Double?
+    let trendDirection: TrendDirection?
+    let trendAcceleration: Double?
+    let hotStreak: Int?
+    let isSurging: Bool?
+    let surgingCategoryCount: Int?
+    let confidenceScore: Double?
+    let consistencyScore: Double?
+    let injuryStatus: String?
+    let previousInjuryStatus: String?
+    let injuryStatusChangedAt: String?
+    let isReturnGameWindow: Bool?
+    let daysSinceReturn: Int?
+    let isRoleChange: Bool?
+    let usageEfficiencySignal: String?
+
+    enum CodingKeys: String, CodingKey {{
+        case id
+        case firstName = "first_name"
+        case lastName = "last_name"
+        case team, position
+        case headshotURL = "headshot_url"
+        case externalPersonID = "nba_person_id"
+        case playerTier = "player_tier"
+        case avgFantasyScore = "avg_fantasy_score"
+        case avgFantasyScoreHome = "avg_fantasy_score_home"
+        case avgFantasyScoreAway = "avg_fantasy_score_away"
+        case avgMinutes = "avg_minutes"
+        case recentGameScores = "recent_game_scores"
+        case trendScore = "trend_score"
+        case trendDirection = "trend_direction"
+        case trendAcceleration = "trend_acceleration"
+        case hotStreak = "hot_streak"
+        case isSurging = "is_surging"
+        case surgingCategoryCount = "surging_category_count"
+        case confidenceScore = "confidence_score"
+        case consistencyScore = "consistency_score"
+        case injuryStatus = "injury_status"
+        case previousInjuryStatus = "previous_injury_status"
+        case injuryStatusChangedAt = "injury_status_changed_at"
+        case isReturnGameWindow = "is_return_game_window"
+        case daysSinceReturn = "days_since_return"
+        case isRoleChange = "is_role_change"
+        case usageEfficiencySignal = "usage_efficiency_signal"
+    }}
+
+    init(from decoder: Decoder) throws {{
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(Int.self, forKey: .id)
+        firstName = try container.decode(String.self, forKey: .firstName)
+        lastName = try container.decode(String.self, forKey: .lastName)
+        if let teamString = try? container.decode(String.self, forKey: .team) {{
+            team = teamString
+        }} else if let teamDict = try? container.decode([String: AnyCodableValue].self, forKey: .team) {{
+            team = teamDict["abbreviation"]?.stringValue
+                ?? teamDict["abbr"]?.stringValue
+                ?? teamDict["full_name"]?.stringValue
+                ?? teamDict["name"]?.stringValue
+                ?? teamDict["city"]?.stringValue
+                ?? "?"
+        }} else {{
+            team = "?"
+        }}
+        position = try container.decodeIfPresent(String.self, forKey: .position)
+        headshotURL = try container.decodeIfPresent(URL.self, forKey: .headshotURL)
+        externalPersonID = try container.decodeIfPresent(Int.self, forKey: .externalPersonID)
+        playerTier = try container.decodeIfPresent(PlayerTier.self, forKey: .playerTier)
+        avgFantasyScore = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScore)
+        avgFantasyScoreHome = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScoreHome)
+        avgFantasyScoreAway = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScoreAway)
+        avgMinutes = try container.decodeIfPresent(Double.self, forKey: .avgMinutes)
+        recentGameScores = try container.decodeIfPresent([Double].self, forKey: .recentGameScores)
+        trendScore = try container.decodeIfPresent(Double.self, forKey: .trendScore)
+        trendDirection = try container.decodeIfPresent(TrendDirection.self, forKey: .trendDirection)
+        trendAcceleration = try container.decodeIfPresent(Double.self, forKey: .trendAcceleration)
+        hotStreak = try container.decodeIfPresent(Int.self, forKey: .hotStreak)
+        isSurging = try container.decodeIfPresent(Bool.self, forKey: .isSurging)
+        surgingCategoryCount = try container.decodeIfPresent(Int.self, forKey: .surgingCategoryCount)
+        confidenceScore = try container.decodeIfPresent(Double.self, forKey: .confidenceScore)
+        consistencyScore = try container.decodeIfPresent(Double.self, forKey: .consistencyScore)
+        injuryStatus = try container.decodeIfPresent(String.self, forKey: .injuryStatus)
+        previousInjuryStatus = try container.decodeIfPresent(String.self, forKey: .previousInjuryStatus)
+        injuryStatusChangedAt = try container.decodeIfPresent(String.self, forKey: .injuryStatusChangedAt)
+        isReturnGameWindow = try container.decodeIfPresent(Bool.self, forKey: .isReturnGameWindow)
+        daysSinceReturn = try container.decodeIfPresent(Int.self, forKey: .daysSinceReturn)
+        isRoleChange = try container.decodeIfPresent(Bool.self, forKey: .isRoleChange)
+        usageEfficiencySignal = try container.decodeIfPresent(String.self, forKey: .usageEfficiencySignal)
+    }}
+}}
+
+// MARK: - AnyCodableValue
+
+/// Lightweight wrapper for decoding JSON values of mixed types (String, Int,
+/// Double, Bool) when the exact schema is unknown — used for the polymorphic
+/// `team` field which may arrive as a dictionary with heterogeneous values.
+private enum AnyCodableValue: Decodable {{
+    case string(String)
+    case int(Int)
+    case double(Double)
+    case bool(Bool)
+
+    init(from decoder: Decoder) throws {{
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(String.self) {{
+            self = .string(value)
+        }} else if let value = try? container.decode(Int.self) {{
+            self = .int(value)
+        }} else if let value = try? container.decode(Double.self) {{
+            self = .double(value)
+        }} else if let value = try? container.decode(Bool.self) {{
+            self = .bool(value)
+        }} else {{
+            self = .string("")
+        }}
+    }}
+
+    var stringValue: String? {{
+        switch self {{
+        case let .string(value): value.isEmpty ? nil : value
+        case let .int(value): String(value)
+        case let .double(value): String(value)
+        case .bool: nil
+        }}
+    }}
+}}
+
+// MARK: - TrendingsServiceError
+
+enum TrendingsServiceError: LocalizedError {{
+    case noTeamsFound
+    case unauthenticated
+
+    var errorDescription: String? {{
+        switch self {{
+        case .noTeamsFound:
+            "No {league} teams were found in the response."
+        case .unauthenticated:
+            "You must be signed in to load player data."
+        }}
+    }}
+}}
+"""
+
+opportunities_service_swift = header() + f"""\
+import Alamofire
+import BKSCore
+import Foundation
+import OSLog
+
+// MARK: - OpportunitiesServiceProtocol
+
+protocol OpportunitiesServiceProtocol {{
+    func fetchOpportunities(
+        limit: Int?, platform: String?, mode: String?, fields: [String]?
+    ) async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode)
+    func loadCachedOpportunities() throws -> [Opportunity]?
+    func loadCachedOpportunitiesFetchDate() throws -> Date?
+    func loadCachedSeasonMode() throws -> SeasonMode?
+}}
+
+extension OpportunitiesServiceProtocol {{
+    func fetchOpportunities() async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode) {{
+        try await fetchOpportunities(limit: nil, platform: nil, mode: nil, fields: nil)
+    }}
+}}
+
+// MARK: - OpportunitiesService
+
+final class OpportunitiesService: OpportunitiesServiceProtocol {{
+    private let network: NetworkProtocol
+    private let storage: StorageProtocol
+    private let configuration: ConfigurationProtocol
+    private let sportConfiguration: SportConfiguration
+    private let logger = os.Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "OpportunitiesService"
+    )
+    private let signposter = OSSignposter(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "OpportunitiesService"
+    )
+
+    private var cacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)opportunities_v1" }}
+    private var cacheDateKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)opportunities_v1_date" }}
+    private var seasonModeCacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)season_mode_v1" }}
+
+    init(
+        network: NetworkProtocol,
+        storage: StorageProtocol,
+        configuration: ConfigurationProtocol,
+        sportConfiguration: SportConfiguration = .{slug}
+    ) {{
+        self.network = network
+        self.storage = storage
+        self.configuration = configuration
+        self.sportConfiguration = sportConfiguration
+    }}
+
+    func fetchOpportunities(
+        limit: Int? = nil,
+        platform: String? = nil,
+        mode: String? = nil,
+        fields: [String]? = nil
+    ) async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode) {{
+        let url = configuration.value(for: .getOpportunitiesURL)
+        let params = sportConfiguration.opportunityParams
+
+        let requestFields = fields ?? sportConfiguration.opportunityFields
+        var parameters: Parameters = [
+            "limit": limit ?? params.limit,
+            "platform": platform ?? params.platform,
+            "mode": mode ?? params.mode,
+        ]
+        if !requestFields.isEmpty {{
+            parameters["fields"] = requestFields.joined(separator: ",")
+        }}
+
+        let fetchStart = Date.now
+        let fetchInterval = signposter.beginInterval("fetchOpportunities")
+        defer {{ signposter.endInterval("fetchOpportunities", fetchInterval) }}
+
+        try Task.checkCancellation()
+        let response: OpportunitiesResponse = try await network.get(url, parameters: parameters)
+
+        let mapped = response.data.compactMap(mapOpportunity)
+        let seasonMode = response.seasonMode ?? .regularSeason
+        let elapsed = Date.now.timeIntervalSince(fetchStart)
+        logger
+            .info(
+                "Fetched \\\\(mapped.count, privacy: .public) opportunities in 1 call (\\\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
+            )
+
+        do {{
+            try storage.save(mapped, forKey: cacheKey, in: .file)
+            try storage.save(Date.now, forKey: cacheDateKey, in: .file)
+            try storage.save(seasonMode, forKey: seasonModeCacheKey, in: .file)
+        }} catch {{
+            logger.warning("Failed to cache opportunities: \\\\(error.diagnosticDescription)")
+        }}
+
+        return (mapped, seasonMode)
+    }}
+
+    func loadCachedOpportunities() throws -> [Opportunity]? {{
+        try storage.load(forKey: cacheKey, from: .file)
+    }}
+
+    func loadCachedOpportunitiesFetchDate() throws -> Date? {{
+        try storage.load(forKey: cacheDateKey, from: .file)
+    }}
+
+    func loadCachedSeasonMode() throws -> SeasonMode? {{
+        try storage.load(forKey: seasonModeCacheKey, from: .file)
+    }}
+
+    // MARK: - Mapping
+
+    private func mapOpportunity(_ dto: OpportunityDTO) -> Opportunity? {{
+        guard let tier = FeatureTier(rawValue: dto.opportunityTier) else {{ return nil }}
+        return Opportunity(
+            id: String(dto.id),
+            displayName: "\\\\(dto.firstName) \\\\(dto.lastName)",
+            team: dto.team,
+            position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
+            opponentAbbr: dto.opponentAbbr,
+            headshotURL: dto.headshotURL,
+            externalPersonID: dto.externalPersonID,
+            opportunityScore: dto.opportunityScore,
+            opportunityTier: tier,
+            playerTier: dto.playerTier,
+            mode: dto.mode,
+            platform: dto.platform,
+            injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
+            isSurging: dto.isSurging ?? false,
+            isHome: dto.isHome ?? false,
+            playoffRotationMultiplier: dto.playoffRotationMultiplier,
+            rotationTier: dto.rotationTier.flatMap {{ RotationTier(rawValue: $0) }},
+            playoffTrendTrust: dto.playoffTrendTrust,
+            playoffGamesPlayed: dto.playoffGamesPlayed
+        )
+    }}
+}}
+
+// MARK: - Opportunity DTOs
+
+private struct OpportunitiesResponse: Decodable {{
+    let data: [OpportunityDTO]
+    let seasonMode: SeasonMode?
+
+    enum CodingKeys: String, CodingKey {{
+        case data
+        case seasonMode = "season_mode"
+    }}
+}}
+
+private struct OpportunityDTO: Decodable {{
+    let id: Int
+    let firstName: String
+    let lastName: String
+    let team: String
+    let position: String?
+    let opponentAbbr: String
+    let headshotURL: URL?
+    let externalPersonID: Int?
+
+    let opportunityScore: Double
+    let opportunityTier: String
+    let playerTier: PlayerTier?
+    let mode: String
+    let platform: String
+
+    let injuryStatus: String?
+    let isSurging: Bool?
+    let isHome: Bool?
+
+    let playoffRotationMultiplier: Double?
+    let rotationTier: String?
+    let playoffTrendTrust: Double?
+    let playoffGamesPlayed: Int?
+
+    enum CodingKeys: String, CodingKey {{
+        case id
+        case firstName = "first_name"
+        case lastName = "last_name"
+        case team
+        case position
+        case opponentAbbr = "opponent_abbr"
+        case headshotURL = "headshot_url"
+        case externalPersonID = "nba_person_id"
+        case opportunityScore = "opportunity_score"
+        case opportunityTier = "opportunity_tier"
+        case playerTier = "player_tier"
+        case mode
+        case platform
+        case injuryStatus = "injury_status"
+        case isSurging = "is_surging"
+        case isHome = "is_home"
+        case playoffRotationMultiplier = "playoff_rotation_multiplier"
+        case rotationTier = "rotation_tier"
+        case playoffTrendTrust = "playoff_trend_trust"
+        case playoffGamesPlayed = "playoff_games_played"
+    }}
+}}
+"""
+
+write(os.path.join(services_dir, "TrendingsService.swift"), trendings_service_swift)
+write(os.path.join(services_dir, "OpportunitiesService.swift"), opportunities_service_swift)
+
+projections_service_swift = header() + f"""\
+import Alamofire
+import BKSCore
+import Foundation
+import OSLog
+
+// MARK: - ProjectionsServiceProtocol
+
+protocol ProjectionsServiceProtocol {{
+    func fetchProjections(fields: [String]?) async throws -> [Projection]
+    func loadCachedProjections() throws -> [Projection]?
+    func loadCachedProjectionsFetchDate() throws -> Date?
+}}
+
+extension ProjectionsServiceProtocol {{
+    func fetchProjections() async throws -> [Projection] {{
+        try await fetchProjections(fields: nil)
+    }}
+}}
+
+// MARK: - ProjectionsService
+
+final class ProjectionsService: ProjectionsServiceProtocol {{
+    private let network: NetworkProtocol
+    private let storage: StorageProtocol
+    private let configuration: ConfigurationProtocol
+    private let sportConfiguration: SportConfiguration
+    private let logger = os.Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "ProjectionsService"
+    )
+    private let signposter = OSSignposter(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "ProjectionsService"
+    )
+
+    private var cacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)projections_v1" }}
+    private var cacheDateKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)projections_v1_date" }}
+
+    init(
+        network: NetworkProtocol,
+        storage: StorageProtocol,
+        configuration: ConfigurationProtocol,
+        sportConfiguration: SportConfiguration = .{slug}
+    ) {{
+        self.network = network
+        self.storage = storage
+        self.configuration = configuration
+        self.sportConfiguration = sportConfiguration
+    }}
+
+    func fetchProjections(fields: [String]? = nil) async throws -> [Projection] {{
+        let url = configuration.value(for: .getProjectionsURL)
+
+        let params = sportConfiguration.projectionParams
+        var parameters: Parameters = [
+            "lookahead": params.lookahead,
+            "platform": params.platform,
+            "mode": params.mode,
+        ]
+        if let fields, !fields.isEmpty {{
+            parameters["fields"] = fields.joined(separator: ",")
+        }}
+
+        let fetchStart = Date.now
+        let fetchInterval = signposter.beginInterval("fetchProjections")
+        defer {{ signposter.endInterval("fetchProjections", fetchInterval) }}
+
+        try Task.checkCancellation()
+        let response: ProjectionsResponse = try await network.get(url, parameters: parameters)
+
+        let mapped = response.players.compactMap(mapProjection)
+        let elapsed = Date.now.timeIntervalSince(fetchStart)
+        logger.info(
+            "Fetched \\\\(mapped.count, privacy: .public) projections in 1 call (\\\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
+        )
+
+        do {{
+            try storage.save(mapped, forKey: cacheKey, in: .file)
+            try storage.save(Date.now, forKey: cacheDateKey, in: .file)
+        }} catch {{
+            logger.warning("Failed to cache projections: \\\\(error.diagnosticDescription)")
+        }}
+
+        return mapped
+    }}
+
+    func loadCachedProjections() throws -> [Projection]? {{
+        try storage.load(forKey: cacheKey, from: .file)
+    }}
+
+    func loadCachedProjectionsFetchDate() throws -> Date? {{
+        try storage.load(forKey: cacheDateKey, from: .file)
+    }}
+
+    // MARK: - Mapping
+
+    private func mapProjection(_ dto: ProjectionPlayerDTO) -> Projection? {{
+        guard let tier = bestTier(from: dto.games) else {{ return nil }}
+        let projectionScore = dto.games.compactMap(\\.projectionScore).max() ?? dto.avgFantasyScore ?? 0
+
+        let upcomingGames: [ProjectedGame] = dto.games.enumerated().compactMap {{ index, game in
+            ProjectedGame(
+                id: "\\\\(dto.id)-game-\\\\(index)",
+                gameDate: parseDate(game.date),
+                opponentAbbr: game.opponent,
+                isHome: game.isHome,
+                opponentStrength: game.opportunityScore,
+                projectedScore: game.predictedFP
+            )
+        }}
+
+        return Projection(
+            id: String(dto.id),
+            displayName: "\\\\(dto.firstName) \\\\(dto.lastName)",
+            team: dto.team,
+            position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
+            headshotURL: dto.headshotURL,
+            externalPersonID: dto.externalPersonID,
+            projectionScore: projectionScore,
+            projectionTier: tier,
+            playerTier: dto.playerTier,
+            mode: sportConfiguration.projectionParams.mode,
+            platform: sportConfiguration.projectionParams.platform,
+            injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
+            isSurging: (dto.hotStreak ?? 0) > 0,
+            upcomingGames: upcomingGames.isEmpty ? nil : upcomingGames,
+            homeGameCount: upcomingGames.filter(\\.isHome).count,
+            awayGameCount: upcomingGames.filter {{ !$0.isHome }}.count,
+            avgOpponentStrength: upcomingGames.compactMap(\\.opponentStrength).average,
+            trendDirection: dto.trendDirection,
+            confidenceScore: dto.confidenceScore,
+            consistencyScore: nil
+        )
+    }}
+
+    private func bestTier(from games: [ProjectedGameDTO]) -> FeatureTier? {{
+        let tiers = games.compactMap {{ mapFeatureTier($0.projectionTier) }}
+        return tiers.min {{ $0.sortOrder < $1.sortOrder }}
+    }}
+
+    private func mapFeatureTier(_ raw: String?) -> FeatureTier? {{
+        switch raw?.lowercased() {{
+        case "elite": return .elite
+        case "good": return .good
+        case "solid": return .solid
+        case "low": return .low
+        default: return nil
+        }}
+    }}
+
+    private func parseDate(_ string: String) -> Date {{
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.date(from: string) ?? Date.now
+    }}
+}}
+
+// MARK: - DTOs
+
+private struct ProjectionsResponse: Decodable {{
+    let platform: String
+    let mode: String
+    let lookahead: Int
+    let dates: [String]
+    let players: [ProjectionPlayerDTO]
+}}
+
+private struct ProjectionPlayerDTO: Decodable {{
+    let id: Int
+    let firstName: String
+    let lastName: String
+    let position: String?
+    let team: String
+    let externalPersonID: Int?
+    let headshotURL: URL?
+    let avgFantasyScore: Double?
+    let trendDirection: TrendDirection?
+    let trendScore: Double?
+    let confidenceScore: Double?
+    let hotStreak: Int?
+    let coldStreak: Int?
+    let injuryStatus: String?
+    let playerTier: PlayerTier?
+    let games: [ProjectedGameDTO]
+
+    enum CodingKeys: String, CodingKey {{
+        case id
+        case firstName = "first_name"
+        case lastName = "last_name"
+        case position
+        case team
+        case externalPersonID = "nba_person_id"
+        case headshotURL = "headshot_url"
+        case avgFantasyScore = "avg_fantasy_score"
+        case trendDirection = "trend_direction"
+        case trendScore = "trend_score"
+        case confidenceScore = "confidence_score"
+        case hotStreak = "hot_streak"
+        case coldStreak = "cold_streak"
+        case injuryStatus = "injury_status"
+        case playerTier = "player_tier"
+        case games
+    }}
+}}
+
+private struct ProjectedGameDTO: Decodable {{
+    let date: String
+    let opponent: String
+    let isHome: Bool
+    let predictedFP: Double?
+    let fpFloor: Double?
+    let fpCeiling: Double?
+    let confidenceBand: Double?
+    let projectionScore: Double?
+    let projectionTier: String?
+    let opportunityScore: Double?
+    let opportunityTier: String?
+    let opportunityPercentile: Double?
+    let isBackToBack: Bool?
+    let teamRestDays: Int?
+    let blowoutProb: Double?
+    let vegasImpliedTeamTotal: Double?
+    let vegasOverUnder: Double?
+    let vegasSpread: Double?
+    let matchupMultiplier: Double?
+
+    enum CodingKeys: String, CodingKey {{
+        case date
+        case opponent
+        case isHome = "is_home"
+        case predictedFP = "predicted_fp"
+        case fpFloor = "fp_floor"
+        case fpCeiling = "fp_ceiling"
+        case confidenceBand = "confidence_band"
+        case projectionScore = "projection_score"
+        case projectionTier = "projection_tier"
+        case opportunityScore = "opportunity_score"
+        case opportunityTier = "opportunity_tier"
+        case opportunityPercentile = "opportunity_percentile"
+        case isBackToBack = "is_back_to_back"
+        case teamRestDays = "team_rest_days"
+        case blowoutProb = "blowout_prob"
+        case vegasImpliedTeamTotal = "vegas_implied_team_total"
+        case vegasOverUnder = "vegas_over_under"
+        case vegasSpread = "vegas_spread"
+        case matchupMultiplier = "matchup_multiplier"
+    }}
+}}
+
+// MARK: - Helpers
+
+private extension Array where Element == Double {{
+    var average: Double? {{
+        isEmpty ? nil : reduce(0, +) / Double(count)
+    }}
+}}
+"""
+
+games_service_swift = header() + f"""\
+import Alamofire
+import BKSCore
+import Foundation
+import OSLog
+
+// MARK: - GamesServiceProtocol
+
+protocol GamesServiceProtocol {{
+    func fetchGameLog(playerID: String, teamID: String) async throws -> PlayerGameLog
+    func fetchGameLogs(playerIDs: [String], startDate: Date) async throws -> [PlayerGameLog]
+    func loadCachedGameLog(playerID: String) throws -> PlayerGameLog?
+    func fetchTodaySchedule() async throws -> TodaySchedule
+    func loadCachedTodaySchedule() throws -> TodaySchedule?
+}}
+
+// MARK: - GamesService
+
+final class GamesService: GamesServiceProtocol {{
+
+    private let network: NetworkProtocol
+    private let firebaseNetwork: NetworkProtocol
+    private let storage: StorageProtocol
+    private let configuration: ConfigurationProtocol
+    private let sportConfiguration: SportConfiguration
+    private let logger = os.Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "GamesService"
+    )
+
+    private static let gameLogCachePrefix = "game_log_"
+    private var todayScheduleCacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1" }}
+    private var todayScheduleCacheDateKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1_date" }}
+    private static let dateFormatter: DateFormatter = {{
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }}()
+
+    init(
+        network: NetworkProtocol,
+        firebaseNetwork: NetworkProtocol,
+        storage: StorageProtocol,
+        configuration: ConfigurationProtocol,
+        sportConfiguration: SportConfiguration = .{slug}
+    ) {{
+        self.network = network
+        self.firebaseNetwork = firebaseNetwork
+        self.storage = storage
+        self.configuration = configuration
+        self.sportConfiguration = sportConfiguration
+    }}
+
+    // MARK: - Public
+
+    func fetchGameLog(playerID: String, teamID: String) async throws -> PlayerGameLog {{
+        let baseURL = configuration.value(for: .gameLogBaseURL)
+        let season = currentSeason()
+
+        let response: StatsResponse = try await network.get(
+            "\\\\(baseURL)/stats",
+            parameters: [
+                "player_ids[]": playerID,
+                "seasons[]": season,
+                "per_page": 100,
+            ]
+        )
+
+        let entries = response.data.compactMap {{ mapGameEntry($0, teamID: teamID) }}
+        let sorted = entries.sorted {{ $0.gameDate > $1.gameDate }}
+
+        let gameLog = PlayerGameLog(
+            playerID: playerID,
+            entries: sorted,
+            fetchedAt: Date()
+        )
+
+        cacheGameLog(gameLog)
+        return gameLog
+    }}
+
+    func fetchGameLogs(playerIDs: [String], startDate: Date) async throws -> [PlayerGameLog] {{
+        let baseURL = configuration.value(for: .gameLogBaseURL)
+        let dateString = Self.dateFormatter.string(from: startDate)
+
+        var entriesByPlayerID: [String: [GameEntry]] = [:]
+
+        var cursor: Int?
+        repeat {{
+            try Task.checkCancellation()
+            var params: Parameters = [
+                "player_ids[]": playerIDs,
+                "per_page": 100,
+                "start_date": dateString,
+            ]
+            if let cursor {{
+                params["cursor"] = cursor
+            }}
+
+            let response: StatsResponse = try await network.get(
+                "\\\\(baseURL)/stats",
+                parameters: params
+            )
+
+            for stat in response.data {{
+                guard let team = stat.team, let entry = mapGameEntry(stat, teamID: String(team.id)) else {{
+                    continue
+                }}
+                entriesByPlayerID[String(stat.player.id), default: []].append(entry)
+            }}
+
+            cursor = response.meta.nextCursor
+        }} while cursor != nil
+
+        let now = Date()
+        return playerIDs.compactMap {{ playerID in
+            guard let entries = entriesByPlayerID[playerID], !entries.isEmpty else {{ return nil }}
+            let log = PlayerGameLog(
+                playerID: playerID,
+                entries: entries.sorted {{ $0.gameDate > $1.gameDate }},
+                fetchedAt: now
+            )
+            cacheGameLog(log)
+            return log
+        }}
+    }}
+
+    private func cacheGameLog(_ log: PlayerGameLog) {{
+        do {{
+            try storage.save(log, forKey: Self.gameLogCachePrefix + log.playerID, in: .file)
+        }} catch {{
+            logger.warning("Failed to cache game log for player \\\\(log.playerID): \\\\(error.diagnosticDescription)")
+        }}
+    }}
+
+    func loadCachedGameLog(playerID: String) throws -> PlayerGameLog? {{
+        try storage.load(forKey: Self.gameLogCachePrefix + playerID, from: .file)
+    }}
+
+    func fetchTodaySchedule() async throws -> TodaySchedule {{
+        let url = configuration.value(for: .getTodayGamesURL)
+        try Task.checkCancellation()
+        let response: TodayScheduleResponse = try await firebaseNetwork.get(url, parameters: nil)
+        let schedule = TodaySchedule(
+            date: response.date,
+            gameCount: response.gameCount,
+            games: response.games.map {{ dto in
+                ScheduledGame(
+                    id: dto.gameID,
+                    homeTeamAbbr: dto.homeTeamAbbr,
+                    visitorTeamAbbr: dto.visitorTeamAbbr,
+                    status: dto.status,
+                    gameType: dto.gameType,
+                    gameDatetime: parseDate(dto.gameDatetime)
+                )
+            }}
+        )
+        do {{
+            try storage.save(schedule, forKey: todayScheduleCacheKey, in: .file)
+            try storage.save(Date.now, forKey: todayScheduleCacheDateKey, in: .file)
+        }} catch {{
+            logger.warning("Failed to cache today schedule: \\\\(error.diagnosticDescription)")
+        }}
+        logger.info("Fetched today schedule: \\\\(schedule.gameCount, privacy: .public) game(s) on \\\\(schedule.date, privacy: .public)")
+        return schedule
+    }}
+
+    func loadCachedTodaySchedule() throws -> TodaySchedule? {{
+        try storage.load(forKey: todayScheduleCacheKey, from: .file)
+    }}
+
+    // MARK: - Mapping
+
+    // swiftlint:disable:next function_body_length
+    private func mapGameEntry(_ stat: StatDTO, teamID: String) -> GameEntry? {{
+        guard let game = stat.game else {{ return nil }}
+
+        let gameDate = parseDate(game.date ?? "")
+
+        let isHome: Bool = {{
+            if let homeTeam = game.homeTeam {{
+                return String(homeTeam.id) == teamID
+            }}
+            if let homeID = game.homeTeamID {{
+                return String(homeID) == teamID
+            }}
+            return false
+        }}()
+
+        let opponent = isHome ? game.visitorTeam : game.homeTeam
+        let opponentName = opponent?.fullName ?? ""
+        let opponentAbbr: String = {{
+            if let abbr = opponent?.abbreviation, !abbr.isEmpty {{
+                return abbr
+            }}
+            let oppID = isHome ? game.visitorTeamID : game.homeTeamID
+            if let oppID {{
+                return sportConfiguration.teamAbbreviation(for: oppID)
+            }}
+            return ""
+        }}()
+
+        let teamScore = isHome ? (game.homeTeamScore ?? 0) : (game.visitorTeamScore ?? 0)
+        let opponentScore = isHome ? (game.visitorTeamScore ?? 0) : (game.homeTeamScore ?? 0)
+        let won = teamScore > opponentScore
+
+        let result: GameResult = won
+            ? .win(teamScore: teamScore, opponentScore: opponentScore)
+            : .loss(teamScore: teamScore, opponentScore: opponentScore)
+
+        return GameEntry(
+            gameID: String(game.id),
+            gameDate: gameDate,
+            opponent: opponentName,
+            opponentAbbreviation: opponentAbbr,
+            isHomeGame: isHome,
+            result: result,
+            atBats: stat.atBats ?? 0,
+            single: stat.single ?? 0,
+            double: stat.double ?? 0,
+            triple: stat.triple ?? 0,
+            homeRun: stat.homeRun ?? 0,
+            rbi: stat.rbi ?? 0,
+            run: stat.run ?? 0,
+            walk: stat.walk ?? 0,
+            hitByPitch: stat.hitByPitch ?? 0,
+            stolenBase: stat.stolenBase ?? 0,
+            sacrificeFly: stat.sacrificeFly ?? 0,
+            sacrificeHit: stat.sacrificeHit ?? 0,
+            inningsPitched: stat.inningsPitched ?? 0.0,
+            strikeoutPitching: stat.strikeoutPitching ?? 0,
+            win: stat.win ?? 0,
+            earnedRunAllowed: stat.earnedRunAllowed ?? 0,
+            hitAgainst: stat.hitAgainst ?? 0,
+            walkAgainst: stat.walkAgainst ?? 0,
+            hitBatsmanAgainst: stat.hitBatsmanAgainst ?? 0,
+            completeGame: stat.completeGame ?? 0,
+            completeGameShutout: stat.completeGameShutout ?? 0,
+            noHitter: stat.noHitter ?? 0,
+            plusMinus: String(stat.plusMinus ?? 0)
+        )
+    }}
+
+    private func parseDate(_ string: String) -> Date {{
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: string) {{ return date }}
+        formatter.formatOptions = [.withInternetDateTime]
+        if let date = formatter.date(from: string) {{ return date }}
+
+        let dayFormatter = DateFormatter()
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        return dayFormatter.date(from: String(string.prefix(10))) ?? Date()
+    }}
+
+    private func currentSeason() -> Int {{
+        let calendar = Calendar.current
+        let now = Date()
+        let year = calendar.component(.year, from: now)
+        let month = calendar.component(.month, from: now)
+        return month >= 3 ? year : year - 1
+    }}
+
+}}
+
+// MARK: - DTOs
+
+private struct StatsResponse: Decodable {{
+    let data: [StatDTO]
+    let meta: StatsMetaDTO
+}}
+
+private struct StatDTO: Decodable {{
+    let id: Int
+    let player: StatPlayerDTO
+    let game: GameInfoDTO?
+    let team: StatsTeamDTO?
+
+    let atBats: Int?
+    let single: Int?
+    let double: Int?
+    let triple: Int?
+    let homeRun: Int?
+    let rbi: Int?
+    let run: Int?
+    let walk: Int?
+    let hitByPitch: Int?
+    let stolenBase: Int?
+    let sacrificeFly: Int?
+    let sacrificeHit: Int?
+
+    let inningsPitched: Double?
+    let strikeoutPitching: Int?
+    let win: Int?
+    let earnedRunAllowed: Int?
+    let hitAgainst: Int?
+    let walkAgainst: Int?
+    let hitBatsmanAgainst: Int?
+    let completeGame: Int?
+    let completeGameShutout: Int?
+    let noHitter: Int?
+
+    let plusMinus: Int?
+
+    enum CodingKeys: String, CodingKey {{
+        case id, player, game, team
+        case atBats = "at_bats"
+        case single
+        case double
+        case triple
+        case homeRun = "home_run"
+        case rbi
+        case run
+        case walk
+        case hitByPitch = "hit_by_pitch"
+        case stolenBase = "stolen_base"
+        case sacrificeFly = "sacrifice_fly"
+        case sacrificeHit = "sacrifice_hit"
+        case inningsPitched = "innings_pitched"
+        case strikeoutPitching = "strikeout_pitching"
+        case win
+        case earnedRunAllowed = "earned_run_allowed"
+        case hitAgainst = "hit_against"
+        case walkAgainst = "walk_against"
+        case hitBatsmanAgainst = "hit_batsman_against"
+        case completeGame = "complete_game"
+        case completeGameShutout = "complete_game_shutout"
+        case noHitter = "no_hitter"
+        case plusMinus = "plus_minus"
+    }}
+}}
+
+private struct StatPlayerDTO: Decodable {{
+    let id: Int
+}}
+
+private struct GameInfoDTO: Decodable {{
+    let id: Int
+    let date: String?
+    let season: Int?
+    let status: String?
+    let homeTeamScore: Int?
+    let visitorTeamScore: Int?
+    let homeTeam: StatsTeamDTO?
+    let visitorTeam: StatsTeamDTO?
+    let homeTeamID: Int?
+    let visitorTeamID: Int?
+
+    enum CodingKeys: String, CodingKey {{
+        case id, date, season, status
+        case homeTeamScore = "home_team_score"
+        case visitorTeamScore = "visitor_team_score"
+        case homeTeam = "home_team"
+        case visitorTeam = "visitor_team"
+        case homeTeamID = "home_team_id"
+        case visitorTeamID = "visitor_team_id"
+    }}
+}}
+
+private struct StatsTeamDTO: Decodable {{
+    let id: Int
+    let abbreviation: String
+    let city: String
+    let name: String
+    let fullName: String
+
+    enum CodingKeys: String, CodingKey {{
+        case id, abbreviation, city, name
+        case fullName = "full_name"
+    }}
+}}
+
+private struct StatsMetaDTO: Decodable {{
+    let nextCursor: Int?
+    let perPage: Int
+
+    enum CodingKeys: String, CodingKey {{
+        case nextCursor = "next_cursor"
+        case perPage = "per_page"
+    }}
+}}
+
+// MARK: - Today Schedule DTOs
+
+private struct TodayScheduleResponse: Decodable {{
+    let date: String
+    let gameCount: Int
+    let games: [ScheduledGameDTO]
+
+    enum CodingKeys: String, CodingKey {{
+        case date
+        case gameCount = "game_count"
+        case games
+    }}
+}}
+
+private struct ScheduledGameDTO: Decodable {{
+    let gameID: Int
+    let homeTeamAbbr: String
+    let visitorTeamAbbr: String
+    let status: String
+    let gameType: String
+    let gameDatetime: String
+
+    enum CodingKeys: String, CodingKey {{
+        case gameID = "game_id"
+        case homeTeamAbbr = "home_team_abbr"
+        case visitorTeamAbbr = "visitor_team_abbr"
+        case status
+        case gameType = "game_type"
+        case gameDatetime = "game_datetime"
+    }}
+}}
+
+// MARK: - GamesServiceError
+
+enum GamesServiceError: LocalizedError {{
+    case noScheduleFound
+    case noCompletedGames
+    case playerNotFoundInBoxscore
+
+    var errorDescription: String? {{
+        switch self {{
+        case .noScheduleFound:
+            "Could not load team schedule."
+        case .noCompletedGames:
+            "No completed games found for this team."
+        case .playerNotFoundInBoxscore:
+            "Player stats not found in game boxscore."
+        }}
+    }}
+}}
+"""
+
+write(os.path.join(services_dir, "ProjectionsService.swift"), projections_service_swift)
+write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9d. Core UI files
+# ─────────────────────────────────────────────────────────────────────────────
+
+core_ui_dir = os.path.join(out_dir, "App/Sources/Core/UI")
+
+tier_types_ui_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - PlayerTier + UI
+
+extension PlayerTier {
+    var displayName: String { tierDisplayName + " Tier" }
+    var color: Color { tierColor }
+
+    var systemImage: String {
+        switch self {
+        case .elite: "crown.fill"
+        case .good: "star.fill"
+        case .solid: "checkmark.shield.fill"
+        case .bottomFeeder: "figure.walk"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .elite: "Elite"
+        case .good: "Good"
+        case .solid: "Solid"
+        case .bottomFeeder: "Bottom Feeder"
+        }
+    }
+}
+
+// MARK: - RotationTier + UI
+
+extension RotationTier {
+    /// Localized display label for the rotation tier.
+    var displayLabel: String {
+        switch self {
+        case .star:
+            String(localized: "rotationTier.star", defaultValue: "Star")
+        case .starter:
+            String(localized: "rotationTier.starter", defaultValue: "Starter")
+        case .rotation:
+            String(localized: "rotationTier.rotation", defaultValue: "Rotation")
+        case .fringe:
+            String(localized: "rotationTier.fringe", defaultValue: "Fringe")
+        case .bench:
+            String(localized: "rotationTier.bench", defaultValue: "Bench")
+        }
+    }
+
+    /// Color representing the rotation tier.
+    var color: Color {
+        switch self {
+        case .star: Color(red: 1.0, green: 0.843, blue: 0.0)
+        case .starter: Color(red: 0.290, green: 0.565, blue: 0.851)
+        case .rotation: Color(red: 0.204, green: 0.780, blue: 0.349)
+        case .fringe: .orange
+        case .bench: Color(red: 0.557, green: 0.557, blue: 0.576)
+        }
+    }
+}
+
+// MARK: - FeatureTier + UI
+
+extension FeatureTier {
+    var displayName: String { tierDisplayName }
+    var color: Color { tierColor }
+}
+"""
+
+search_tips_view_swift = header() + """\
+import SwiftUI
+
+/// Sport-specific search tips popover content.
+struct SearchTipsView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(String(localized: "trending.searchTips.title", defaultValue: "Search Tips"))
+                .font(.subheadline.weight(.semibold))
+            VStack(alignment: .leading, spacing: 6) {
+                searchTipRow(
+                    icon: "person.fill",
+                    label: String(localized: "trending.searchTips.playerName", defaultValue: "Player Name"),
+                    example: String(localized: "trending.searchTips.playerName.example", defaultValue: "e.g. Shohei")
+                )
+                searchTipRow(
+                    icon: "tshirt.fill",
+                    label: String(localized: "trending.searchTips.teamAbbr", defaultValue: "Team Abbreviation"),
+                    example: String(localized: "trending.searchTips.teamAbbr.example", defaultValue: "e.g. LAD")
+                )
+                searchTipRow(
+                    icon: "building.2.fill",
+                    label: String(localized: "trending.searchTips.teamName", defaultValue: "Team Name"),
+                    example: String(localized: "trending.searchTips.teamName.example", defaultValue: "e.g. Dodgers")
+                )
+                searchTipRow(
+                    icon: "line.3.horizontal.decrease.circle.fill",
+                    label: String(localized: "trending.searchTips.position", defaultValue: "Position"),
+                    example: String(localized: "trending.searchTips.position.example", defaultValue: "e.g. SP")
+                )
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.primary)
+        .padding()
+        .frame(width: 260)
+    }
+
+    private func searchTipRow(icon: String, label: String, example: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.caption.weight(.medium))
+                Text(example)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+"""
+
+season_mode_banner_swift = header() + """\
+import BKSCore
+import BKSUICore
+import SwiftUI
+
+struct SeasonModeBanner: View {
+    let mode: SeasonMode
+
+    var body: some View {
+        switch mode {
+        case .regularSeason:
+            EmptyView()
+        case .playoffs:
+            bannerCapsule(
+                icon: "trophy.fill",
+                text: String(localized: "seasonMode.playoffs", defaultValue: "Playoffs"),
+                color: .orange
+            )
+        case .offseason:
+            bannerCapsule(
+                icon: "moon.fill",
+                text: String(localized: "seasonMode.offseason", defaultValue: "Offseason"),
+                color: .gray
+            )
+        }
+    }
+
+    private func bannerCapsule(icon: String, text: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+            Text(text)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(color.opacity(0.85))
+        .clipShape(Capsule())
+        .padding(.top, 4)
+        .accessibilityLabel(text)
+    }
+}
+"""
+
+write(os.path.join(core_ui_dir, "TierTypes+UI.swift"), tier_types_ui_swift)
+write(os.path.join(core_ui_dir, "SearchTipsView.swift"), search_tips_view_swift)
+write(os.path.join(core_ui_dir, "SeasonModeBanner.swift"), season_mode_banner_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9e. Core Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+utilities_dir = os.path.join(out_dir, "App/Sources/Core/Utilities")
+
+filterable_swift = header() + """\
+import Foundation
+import BKSCore
+
+// MARK: - Injury availability
+
+extension Filterable where Self: InjuryTracking {
+    /// Returns `true` when the player is out or doubtful and should be
+    /// excluded from active lists.
+    var isUnavailable: Bool {
+        switch injuryStatus {
+        case .out, .doubtful: true
+        default: false
+        }
+    }
+}
+
+/// Domain models that carry an injury status conform to this protocol
+/// so the generic `isUnavailable` logic can apply.
+protocol InjuryTracking {
+    var injuryStatus: InjuryStatus? { get }
+}
+
+extension Player: InjuryTracking {}
+extension Opportunity: InjuryTracking {}
+extension Projection: InjuryTracking {}
+
+// MARK: - Position-aware filtering
+
+extension Array where Element: Filterable {
+    /// Filters the array by search text and position chip.
+    /// Pass the sport's `SportPositionMap` to control which raw position
+    /// strings each chip label matches.
+    func filtered(search: String, chip: String?, positionMap: SportPositionMap) -> [Element] {
+        filter { item in
+            let matchesSearch: Bool = {
+                guard !search.isEmpty else { return true }
+                if item.displayName.localizedCaseInsensitiveContains(search) { return true }
+                if item.team.localizedCaseInsensitiveContains(search) { return true }
+                for field in item.additionalSearchFields
+                    where field.localizedCaseInsensitiveContains(search) { return true }
+                return false
+            }()
+            let matchesPosition = positionMap.matchesChip(chip, position: item.position)
+            return matchesSearch && matchesPosition
+        }
+    }
+}
+"""
+
+player_lookup_swift = header() + """\
+import Foundation
+
+/// Finds a `Player` record from an array by `externalPersonID` (preferred)
+/// or `displayName` + `team` fallback. Sport-agnostic — works for any sport
+/// whose player model carries an optional external data-provider ID.
+enum PlayerLookup {
+    static func find(
+        externalPersonID: Int?,
+        displayName: String,
+        team: String,
+        in players: [Player]
+    ) -> Player? {
+        if let personID = externalPersonID,
+           let match = players.first(where: { $0.externalPersonID == personID }) {
+            return match
+        }
+        return players.first { $0.displayName == displayName && $0.team == team }
+    }
+}
+"""
+
+write(os.path.join(utilities_dir, f"Filterable+{swift_name}.swift"), filterable_swift)
+write(os.path.join(utilities_dir, "PlayerLookup.swift"), player_lookup_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9f. Trending Store
+# ─────────────────────────────────────────────────────────────────────────────
+
+trending_store_dir = os.path.join(out_dir, "App/Sources/Features/Trending/Store")
+
+trending_state_swift = header() + f"""\
+import OSLog
+import BKSCore
+import SwiftUI
+
+struct TrendingState {{
+    var navigationPath = NavigationPath()
+    var trends: ViewState<[Player]> = .idle
+    var hotPlayers: [Player] = []
+    var coldPlayers: [Player] = []
+    var filteredHotPlayers: [Player] = []
+    var filteredColdPlayers: [Player] = []
+    var searchText = ""
+    var selectedPosition: String?
+    var lastUpdated: Date?
+
+    private static let stalenessThreshold = CacheFreshness.defaultThreshold
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "TrendingState"
+    )
+
+    // swiftlint:disable:next function_body_length cyclomatic_complexity
+    static func makeReduce(
+        trendingsService: TrendingsServiceProtocol,
+        positionMap: SportPositionMap
+    ) -> Reduce<Self, TrendingIntent> {{
+        {{ state, intent in
+            switch intent {{
+            case .onAppear:
+                if CacheFreshness.isFresh(lastUpdated: state.lastUpdated, threshold: stalenessThreshold),
+                   case .loaded = state.trends
+                {{
+                    logger.debug("Trends cache is fresh, skipping fetch")
+                    return nil
+                }}
+                state.trends = .loading
+                return await fetchTrends(trendingsService: trendingsService)
+
+            case .refreshRequested:
+                state.trends = .loading
+                return await fetchTrends(trendingsService: trendingsService, forceNetwork: true)
+
+            case let .trendsLoaded(players):
+                let available = players.filter {{ !Self.isUnavailable($0) }}
+                let hot = available
+                    .filter {{ $0.trendDirection == .up }}
+                    .sorted {{
+                        let tierA = $0.playerTier?.sortOrder ?? Int.max
+                        let tierB = $1.playerTier?.sortOrder ?? Int.max
+                        if tierA != tierB {{ return tierA < tierB }}
+                        return Self.weightedScore($0) > Self.weightedScore($1)
+                    }}
+                let cold = available
+                    .filter {{ $0.trendDirection == .down }}
+                    .sorted {{
+                        let tierA = $0.playerTier?.sortOrder ?? Int.max
+                        let tierB = $1.playerTier?.sortOrder ?? Int.max
+                        if tierA != tierB {{ return tierA < tierB }}
+                        return Self.weightedScore($0) < Self.weightedScore($1)
+                    }}
+                state.hotPlayers = hot
+                state.coldPlayers = cold
+                state.trends = .loaded(hot + cold)
+                state.lastUpdated = Date.now
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+
+            case let .trendsFailed(error):
+                if case .loaded = state.trends {{
+                    logger.warning("Trends refresh failed but keeping existing data: \\\\(error.diagnosticDescription)")
+                    return nil
+                }}
+                state.trends = .failed(error)
+                return nil
+
+            case let .navigationPathChanged(path):
+                state.navigationPath = path
+                return nil
+
+            case let .searchTextChanged(text):
+                state.searchText = text
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+
+            case let .positionFilterChanged(position):
+                state.selectedPosition = position
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+            }}
+        }}
+    }}
+
+    private static func applyFilters(_ state: inout Self, positionMap: SportPositionMap) {{
+        let search = state.searchText
+        let chip = state.selectedPosition
+
+        state.filteredHotPlayers = filterPlayers(state.hotPlayers, search: search, chip: chip, positionMap: positionMap)
+        state.filteredColdPlayers = filterPlayers(
+            state.coldPlayers, search: search, chip: chip, positionMap: positionMap
+        )
+    }}
+
+    private static func filterPlayers(
+        _ players: [Player],
+        search: String,
+        chip: String?,
+        positionMap: SportPositionMap
+    ) -> [Player] {{
+        players.filtered(search: search, chip: chip, positionMap: positionMap)
+    }}
+
+    private static func weightedScore(_ player: Player) -> Double {{
+        player.confidenceScore ?? 0
+    }}
+
+    private static func isUnavailable(_ player: Player) -> Bool {{
+        player.isUnavailable
+    }}
+
+    private static func fetchTrends(
+        trendingsService: TrendingsServiceProtocol,
+        forceNetwork: Bool = false
+    ) async -> TrendingIntent {{
+        do {{
+            if !forceNetwork, let cached = try trendingsService.loadCachedPlayers(), !cached.isEmpty {{
+                logger.debug("Using cached players for trends (\\\\(cached.count) players)")
+                return .trendsLoaded(cached)
+            }}
+            if forceNetwork {{
+                logger.debug("Refresh requested — fetching from network")
+            }} else {{
+                logger.debug("No cached players — fetching from network")
+            }}
+            let players = try await trendingsService.fetchPlayers()
+            return .trendsLoaded(players)
+        }} catch {{
+            if forceNetwork, let cached = try? trendingsService.loadCachedPlayers(), !cached.isEmpty {{
+                logger.warning("Network fetch failed, falling back to cache: \\\\(error.diagnosticDescription)")
+                return .trendsLoaded(cached)
+            }}
+            return .trendsFailed(error)
+        }}
+    }}
+}}
+"""
+
+trending_intent_swift = header() + """\
+import SwiftUI
+
+enum TrendingIntent {
+    case onAppear
+    case navigationPathChanged(NavigationPath)
+    case trendsLoaded([Player])
+    case trendsFailed(Error)
+    case refreshRequested
+    case searchTextChanged(String)
+    case positionFilterChanged(String?)
+}
+"""
+
+player_detail_state_swift = header() + f"""\
+import OSLog
+import BKSCore
+
+struct PlayerDetailState {{
+    let player: Player
+    var gameLog: ViewState<PlayerGameLog> = .idle
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "PlayerDetailState"
+    )
+
+    // swiftlint:disable:next function_body_length cyclomatic_complexity
+    static func makeReduce(
+        gamesService: GamesServiceProtocol
+    ) -> Reduce<Self, PlayerDetailIntent> {{
+        {{ state, intent in
+            switch intent {{
+            case .onAppear:
+                return nil
+
+            case .gameLogTabSelected:
+                guard case .idle = state.gameLog else {{ return nil }}
+                do {{
+                    if let cached = try gamesService.loadCachedGameLog(playerID: state.player.id) {{
+                        state.gameLog = .loaded(cached)
+                        return nil
+                    }}
+                }} catch {{
+                    logger.warning("Failed to load cached game log: \\\\(error.diagnosticDescription)")
+                }}
+                state.gameLog = .loading
+                return .fetchGameLog
+
+            case .fetchGameLog:
+                do {{
+                    let gameLog = try await gamesService.fetchGameLog(
+                        playerID: state.player.id,
+                        teamID: state.player.team
+                    )
+                    return .gameLogLoaded(gameLog)
+                }} catch {{
+                    return .gameLogFailed(error)
+                }}
+
+            case let .gameLogLoaded(gameLog):
+                state.gameLog = .loaded(gameLog)
+                return nil
+
+            case let .gameLogFailed(error):
+                if case .loaded = state.gameLog {{
+                    logger.warning("Game log refresh failed but keeping existing data: \\\\(error.diagnosticDescription)")
+                    return nil
+                }}
+                state.gameLog = .failed(error)
+                return nil
+
+            case .refreshRequested:
+                state.gameLog = .loading
+                return .fetchGameLog
+            }}
+        }}
+    }}
+}}
+"""
+
+player_detail_intent_swift = header() + """\
+enum PlayerDetailIntent {
+    case onAppear
+    case gameLogTabSelected
+    case fetchGameLog
+    case gameLogLoaded(PlayerGameLog)
+    case gameLogFailed(Error)
+    case refreshRequested
+}
+"""
+
+write(os.path.join(trending_store_dir, "TrendingState.swift"), trending_state_swift)
+write(os.path.join(trending_store_dir, "TrendingIntent.swift"), trending_intent_swift)
+write(os.path.join(trending_store_dir, "PlayerDetailState.swift"), player_detail_state_swift)
+write(os.path.join(trending_store_dir, "PlayerDetailIntent.swift"), player_detail_intent_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9g. Trending Views
+# ─────────────────────────────────────────────────────────────────────────────
+
+trending_views_dir = os.path.join(out_dir, "App/Sources/Features/Trending/Views")
+
+trending_view_swift = header() + f"""\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct TrendingView: View {{
+    @ObservedObject var store: Store<TrendingState, TrendingIntent>
+    let gamesService: GamesServiceProtocol
+    let credential: StoredCredential
+    @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    @State private var showProfile = false
+    @State private var toastTier: PlayerTier?
+    @State private var selectedTab = TrendingTab.hot
+    @Environment(\\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\\.analytics) private var analytics
+
+    private var searchBinding: Binding<String> {{
+        Binding(
+            get: {{ store.state.searchText }},
+            set: {{ store.send(.searchTextChanged($0)) }}
+        )
+    }}
+
+    var body: some View {{
+        NavigationStack(path: Binding(
+            get: {{ store.state.navigationPath }},
+            set: {{ store.send(.navigationPathChanged($0)) }}
+        )) {{
+            content
+                .appBackground()
+                .analyticsScreen("trending")
+                .appNavigationBar(
+                    title: String(localized: "trending.title", defaultValue: "Trending"),
+                    subtitle: String(localized: "trending.subtitle", defaultValue: "Over the past 5 games")
+                )
+                .navBarTrailingIcon(
+                    "person",
+                    accessibilityID: "nav.profileButton",
+                    accessibilityLabel: String(localized: "a11y.label.profile", defaultValue: "Profile")
+                ) {{ showProfile = true }}
+                .navigationDestination(isPresented: $showProfile) {{
+                    ProfilePanelView(credential: credential, profileStore: profileStore)
+                        .appNavigationBar(title: String(localized: "Profile", defaultValue: "Profile"))
+                }}
+                .navigationDestination(for: Player.self) {{ player in
+                    PlayerDetailView(
+                        store: Store(
+                            initial: PlayerDetailState(player: player),
+                            reduce: PlayerDetailState.makeReduce(gamesService: gamesService)
+                        )
+                    )
+                    .onAppear {{
+                        analytics.logDetailedEvent(AnalyticsEvent.playerTapped, parameters: [
+                            AnalyticsParam.playerId: player.id,
+                            AnalyticsParam.playerTier: player.playerTier.map(String.init(describing:)) ?? "unknown",
+                            AnalyticsParam.trendDirection:
+                                player.trendDirection.map(String.init(describing:)) ?? "unknown",
+                            AnalyticsParam.isSurging: String(player.isSurging ?? false),
+                            AnalyticsParam.subTab: String(describing: selectedTab)
+                        ])
+                    }}
+                }}
+        }}
+        .task {{
+            store.send(.onAppear)
+        }}
+        .onChange(of: selectedTab) {{
+            analytics.logEvent(AnalyticsEvent.subTabSelected, parameters: [
+                AnalyticsParam.tabName: String(describing: selectedTab),
+                AnalyticsParam.feature: "trending"
+            ])
+        }}
+        .onChange(of: store.state.searchText.isEmpty) {{
+            if !store.state.searchText.isEmpty {{
+                analytics.logEvent(AnalyticsEvent.searchUsed, parameters: [
+                    AnalyticsParam.feature: "trending"
+                ])
+            }}
+        }}
+        .onChange(of: store.state.selectedPosition) {{
+            analytics.logEvent(AnalyticsEvent.filterChanged, parameters: [
+                AnalyticsParam.feature: "trending"
+            ])
+        }}
+    }}
+
+    private var content: some View {{
+        LoadableContentView(
+            state: store.state.trends,
+            isEmpty: store.state.hotPlayers.isEmpty && store.state.coldPlayers.isEmpty,
+            emptyIcon: "chart.line.flattrend.xyaxis",
+            errorKey: "trending.error",
+            retryKey: "trending.retry",
+            emptyKey: "trending.empty",
+            onRetry: {{ store.send(.refreshRequested) }},
+            content: {{ trendList }}
+        )
+    }}
+
+    private var trendList: some View {{
+        let activePlayers = selectedTab == .hot
+            ? store.state.filteredHotPlayers
+            : store.state.filteredColdPlayers
+        let activeGrouped = Dictionary(grouping: activePlayers) {{ $0.playerTier ?? .bottomFeeder }}
+        let tiers: [PlayerTier] = [.elite, .good, .solid, .bottomFeeder]
+        let filtersActive = !store.state.searchText.isEmpty || store.state.selectedPosition != nil
+        let filteredEmpty = activePlayers.isEmpty
+
+        return VStack(spacing: 0) {{
+            SearchFilterHeader(
+                searchText: searchBinding,
+                selectedPosition: store.state.selectedPosition,
+                filterChips: ["All"] + SportPositionMap.{slug}.filterChips,
+                accessibilityPrefix: "trending",
+                onPositionChanged: {{ store.send(.positionFilterChanged($0)) }},
+                tipsContent: {{ SearchTipsView() }}
+            )
+
+            FeatureTabBar(
+                selectedTab: $selectedTab,
+                reduceMotion: reduceMotion,
+                accessibilityPrefix: "trending"
+            )
+            .padding(.horizontal)
+            .padding(.bottom, 8)
+
+            if filtersActive, filteredEmpty {{
+                FilteredEmptyView(messageKey: "trending.filter.empty")
+            }} else {{
+                ScrollView {{
+                    VStack(spacing: AppSpacing.xl) {{
+                        ForEach(tiers, id: \\.self) {{ tier in
+                            let players = (activeGrouped[tier] ?? [])
+                                .sorted {{ ($0.confidenceScore ?? 0) > ($1.confidenceScore ?? 0) }}
+                            TrendingTierSection(
+                                tier: tier,
+                                players: players,
+                                color: selectedTab.accentColor,
+                                toastTier: $toastTier
+                            )
+                        }}
+                    }}
+                    .padding(.horizontal)
+                    .padding(.top, 10)
+                    .padding(.bottom, 16)
+                }}
+                .id(selectedTab)
+                .refreshable {{
+                    analytics.logEvent(AnalyticsEvent.pullToRefresh, parameters: [
+                        AnalyticsParam.feature: "trending"
+                    ])
+                    await store.sendAsync(.refreshRequested)
+                }}
+                .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+                .overlay(alignment: .bottom) {{
+                    if let tier = toastTier {{
+                        TierToastView(tier: tier)
+                            .padding(.bottom, 16)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }}
+                }}
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: toastTier)
+            }}
+        }}
+    }}
+
+}}
+"""
+
+trending_subviews_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - TrendingTab
+
+enum TrendingTab: CaseIterable, FeatureTab {
+    case hot
+    case cold
+
+    var title: String {
+        switch self {
+        case .hot: String(localized: "trending.tab.hot", defaultValue: "Hot")
+        case .cold: String(localized: "trending.tab.cold", defaultValue: "Cold")
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .hot: "🔥"
+        case .cold: "❄️"
+        }
+    }
+
+    var accentColor: Color {
+        switch self {
+        case .hot: .orange
+        case .cold: .cyan
+        }
+    }
+}
+
+// MARK: - TrendingTierSection — thin wrapper around shared TierSection
+
+/// Trending-specific tier section that wraps each row in a NavigationLink.
+struct TrendingTierSection: View {
+    let tier: PlayerTier
+    let players: [Player]
+    let color: Color
+    @Binding var toastTier: PlayerTier?
+
+    var body: some View {
+        TierSection(
+            tier: tier,
+            isEmpty: players.isEmpty,
+            emptyKey: "trending.tier.none",
+            toastTier: $toastTier
+        ) {
+            ForEach(Array(players.enumerated()), id: \\.element.id) { index, player in
+                NavigationLink(value: player) {
+                    RankingRow(player: player, color: color)
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .accessibilityIdentifier("player.row.\\(player.id)")
+                if index < players.count - 1 {
+                    Divider()
+                        .overlay(Color.white.opacity(AppOpacity.cardOverlay))
+                }
+            }
+        }
+    }
+}
+
+// MARK: - RankingRow
+
+struct RankingRow: View {
+    let player: Player
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            // Row 1: Player name
+            HStack(spacing: 4) {
+                Text(player.displayName)
+                    .font(AppFonts.rankingName)
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(AppFonts.rankingInfo)
+                    .foregroundStyle(.white.opacity(AppOpacity.dim))
+            }
+
+            // Row 2: Team · Position · Trend score
+            HStack(spacing: 4) {
+                Text(player.team)
+                    .font(AppFonts.rankingInfo)
+                    .foregroundStyle(.white.opacity(AppOpacity.muted))
+                if let position = player.position {
+                    Text("·")
+                        .font(AppFonts.rankingInfo)
+                        .foregroundStyle(.white.opacity(AppOpacity.muted))
+                    Text(position)
+                        .font(AppFonts.rankingInfo)
+                        .foregroundStyle(.white.opacity(AppOpacity.muted))
+                }
+                Spacer(minLength: 0)
+                Text(Self.formattedScore(player))
+                    .font(AppFonts.rankingScore)
+                    .foregroundStyle(Self.scoreColor(player))
+            }
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+
+            // Row 3: Badges (injury, surging)
+            let hasBadges = player.injuryStatus != nil
+                || (player.isSurging == true && player.trendDirection == .up)
+            if hasBadges {
+                HStack(spacing: 3) {
+                    if let status = player.injuryStatus {
+                        InjuryBadge(status: status, compact: true)
+                    }
+                    if player.isSurging == true, player.trendDirection == .up {
+                        Text("🚀")
+                            .font(AppFonts.rankingBadgeIcon)
+                            .padding(.horizontal, 3)
+                            .padding(.vertical, 1)
+                            .background(Color.purple.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                }
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+    }
+
+    private static func formattedScore(_ player: Player) -> String {
+        let score = player.confidenceScore ?? 0
+        let prefix = player.trendDirection == .down ? "-" : ""
+        return prefix + String(format: "%.2f", score)
+    }
+
+    private static func scoreColor(_ player: Player) -> Color {
+        player.trendDirection == .down ? .red : .green
+    }
+}
+"""
+
+player_row_view_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct PlayerRowView: View {
+    let player: Player
+
+    var body: some View {
+        HStack(spacing: 8) {
+            headshot
+            playerInfo
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var headshot: some View {
+        CachedAsyncImage(url: player.headshotURL) { phase in
+            switch phase {
+            case let .success(image):
+                image
+                    .resizable()
+                    .scaledToFill()
+                    .accessibilityIgnoresInvertColors(true)
+            default:
+                Image(systemName: "person.fill")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(AppOpacity.muted))
+            }
+        }
+        .frame(width: 60, height: 60)
+        .clipShape(Circle())
+        .overlay(Circle().stroke(
+            player.injuryStatus.map(\\.color) ?? .white.opacity(AppOpacity.faint),
+            lineWidth: player.injuryStatus != nil ? 2 : 1
+        ))
+        .overlay(alignment: .topLeading) {
+            if let status = player.injuryStatus {
+                InjuryBadge(status: status)
+                    .offset(x: -8, y: -8)
+            }
+        }
+    }
+
+    private var playerInfo: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(player.displayName)
+                .font(AppFonts.playerName)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .layoutPriority(1)
+            playerSubtitleRow
+            playerTrendRow
+        }
+        .frame(height: 60)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var playerSubtitleRow: some View {
+        HStack(spacing: 6) {
+            Text(player.team).fontWeight(.semibold)
+            if let position = player.position {
+                rowPipe
+                Text(position)
+            }
+        }
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+        .lineLimit(1)
+    }
+
+    private var playerTrendRow: some View {
+        HStack(spacing: 6) {
+            trendArrow.frame(width: 14, alignment: .center)
+            rowPipe
+            trendScore.frame(width: 44, alignment: .center)
+            if let tier = player.playerTier {
+                rowPipe
+                Image(systemName: tier.systemImage)
+                    .foregroundStyle(tier.color)
+                    .frame(width: 14, alignment: .center)
+            }
+        }
+        .lineLimit(1)
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+    }
+
+    private var rowPipe: some View {
+        Text(String(localized: "|", defaultValue: "|")).foregroundStyle(.white.opacity(AppOpacity.separator))
+    }
+
+    @ViewBuilder private var trendArrow: some View {
+        if let direction = player.trendDirection {
+            let (name, color): (String, Color) = switch direction {
+            case .up: ("arrow.up", .green)
+            case .down: ("arrow.down", .red)
+            case .flat, .neutral: ("minus", .white.opacity(AppOpacity.separator))
+            }
+            Image(systemName: name).font(AppFonts.playerTrendArrow).foregroundStyle(color)
+        } else {
+            Image(systemName: "minus").foregroundStyle(.white.opacity(AppOpacity.separator))
+        }
+    }
+
+    private var trendScore: some View {
+        let formatted = player.confidenceScore.map { score -> String in
+            let prefix = player.trendDirection == .down ? "-" : ""
+            return prefix + String(format: "%.2f", score)
+        } ?? "-"
+        let color: Color = player.confidenceScore == nil
+            ? .white.opacity(AppOpacity.separator)
+            : (player.trendDirection == .down ? .red : .green)
+        return Text(formatted).monospacedDigit().multilineTextAlignment(.center)
+            .foregroundStyle(color)
+    }
+}
+"""
+
+write(os.path.join(trending_views_dir, "TrendingView.swift"), trending_view_swift)
+write(os.path.join(trending_views_dir, "TrendingSubviews.swift"), trending_subviews_swift)
+write(os.path.join(trending_views_dir, "PlayerRowView.swift"), player_row_view_swift)
+
+player_detail_view_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct PlayerDetailView: View {
+    @StateObject var store: Store<PlayerDetailState, PlayerDetailIntent>
+
+    @State private var selectedTab = DetailTab.stats
+    @State private var showTierToast = false
+    @Environment(\\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\\.analytics) private var analytics
+    @State private var hasLoggedGameLog = false
+
+    private var player: Player {
+        store.state.player
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                PlayerDetailHeaderCard(player: player, showTierToast: $showTierToast)
+                PlayerDetailFantasyBar(player: player)
+                tabBar
+                tabContent
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 6)
+            .padding(.bottom, 20)
+        }
+        .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+        .appBackground()
+        .analyticsScreen("player_detail")
+        .overlay(alignment: .bottom) {
+            if showTierToast, let tier = player.playerTier {
+                PlayerTierToast(tier: tier, player: player)
+            }
+        }
+        .animation(reduceMotion ? nil : .spring(duration: 0.3), value: showTierToast)
+        .appNavigationBar(title: "")
+        .task { store.send(.onAppear) }
+    }
+
+    // MARK: - Tab Bar
+
+    private var tabBar: some View {
+        HStack(spacing: 0) {
+            ForEach(DetailTab.allCases, id: \\.self) { tab in
+                tabButton(tab)
+            }
+        }
+    }
+
+    private func tabButton(_ tab: DetailTab) -> some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                selectedTab = tab
+            }
+            analytics.logDetailedEvent(AnalyticsEvent.detailTabSwitched, parameters: [
+                AnalyticsParam.tabName: String(describing: tab),
+                AnalyticsParam.feature: "trending",
+                AnalyticsParam.playerId: player.id,
+                AnalyticsParam.playerTier: player.playerTier.map(String.init(describing:)) ?? "unknown"
+            ])
+            if tab == .gameLog {
+                store.send(.gameLogTabSelected)
+            }
+        } label: {
+            VStack(spacing: 4) {
+                Text(tab.title)
+                    .font(selectedTab == tab ? AppFonts.filterChip.weight(.semibold) : AppFonts.filterChip)
+                    .foregroundStyle(
+                        selectedTab == tab ? .white : .white.opacity(AppOpacity.muted)
+                    )
+
+                Rectangle()
+                    .fill(selectedTab == tab ? .orange : .clear)
+                    .frame(height: 2)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityAddTraits(selectedTab == tab ? .isSelected : [])
+        .accessibilityIdentifier(tab == .stats ? "detail.tab.trends" : "detail.tab.gameLog")
+    }
+
+    // MARK: - Tab Content
+
+    @ViewBuilder
+    private var tabContent: some View {
+        switch selectedTab {
+        case .stats:
+            statsContent
+        case .gameLog:
+            gameLogContent
+        }
+    }
+
+    // MARK: - Stats
+
+    private var statsContent: some View {
+        PlayerDetailOverviewTrendCard(player: player)
+    }
+
+    // MARK: - Game Log
+
+    @ViewBuilder
+    private var gameLogContent: some View {
+        switch store.state.gameLog {
+        case .idle, .loading:
+            GameLogPlaceholderView(style: .loading)
+        case let .loaded(gameLog):
+            if gameLog.entries.isEmpty {
+                GameLogPlaceholderView(style: .empty)
+            } else {
+                GameLogTableView(entries: gameLog.entries)
+                    .onAppear {
+                        guard !hasLoggedGameLog else { return }
+                        hasLoggedGameLog = true
+                        analytics.logDetailedEvent(AnalyticsEvent.gameLogViewed, parameters: [
+                            AnalyticsParam.playerId: player.id,
+                            AnalyticsParam.feature: "trending",
+                            AnalyticsParam.entryCount: String(gameLog.entries.count)
+                        ])
+                    }
+            }
+        case let .failed(error):
+            GameLogErrorView(error: error) {
+                store.send(.refreshRequested)
+            }
+        }
+    }
+}
+
+// MARK: - DetailTab
+
+private enum DetailTab: CaseIterable {
+    case stats
+    case gameLog
+
+    var title: String {
+        switch self {
+        case .stats: String(localized: "Stat Trends", defaultValue: "Stat Trends")
+        case .gameLog: String(localized: "Game Log", defaultValue: "Game Log")
+        }
+    }
+}
+"""
+
+player_detail_subviews_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - PlayerDetailHeaderCard
+
+struct PlayerDetailHeaderCard: View {
+    let player: Player
+    @Binding var showTierToast: Bool
+    @Environment(\\.analytics) private var analytics
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .bottom, spacing: 12) {
+                headshot
+                headerInfo
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(12)
+        .appCard()
+    }
+
+    private var headshot: some View {
+        CachedAsyncImage(url: player.headshotURL) { phase in
+            switch phase {
+            case let .success(image):
+                image
+                    .resizable()
+                    .scaledToFill()
+                    .accessibilityIgnoresInvertColors(true)
+            default:
+                Image(systemName: "person.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.white.opacity(AppOpacity.separator))
+            }
+        }
+        .frame(width: 90, height: 105)
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.sm))
+        .overlay(
+            RoundedRectangle(cornerRadius: AppRadius.sm)
+                .stroke(.white.opacity(AppOpacity.divider), lineWidth: 1)
+        )
+    }
+
+    private var headerInfo: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(player.displayName)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+
+            teamPositionRow
+
+            Spacer(minLength: 0)
+
+            trendRow
+        }
+        .frame(height: 105, alignment: .leading)
+    }
+
+    private var teamPositionRow: some View {
+        HStack(spacing: 6) {
+            Text(player.team).fontWeight(.semibold)
+            if let position = player.position {
+                headerPipe
+                Text(position)
+            }
+            if let status = player.injuryStatus {
+                headerPipe
+                Text(status.rawValue).foregroundStyle(status.color)
+            }
+        }
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+    }
+
+    private var trendRow: some View {
+        HStack(spacing: 6) {
+            headerTrendArrow.frame(width: 14, alignment: .center)
+            headerPipe
+            headerTrendScore.frame(width: 44, alignment: .center)
+            if let tier = player.playerTier {
+                headerPipe
+                Button {
+                    showTierToast = true
+                    analytics.logDetailedEvent(AnalyticsEvent.tierBadgeTapped, parameters: [
+                        AnalyticsParam.tier: String(describing: tier),
+                        AnalyticsParam.feature: "trending"
+                    ])
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                        showTierToast = false
+                    }
+                } label: {
+                    Image(systemName: tier.systemImage)
+                        .foregroundStyle(tier.color)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(String(localized: "a11y.label.showTierDetails", defaultValue: "Show tier details"))
+            }
+        }
+        .lineLimit(1)
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var headerPipe: some View {
+        Text(String(localized: "|", defaultValue: "|")).foregroundStyle(.white.opacity(AppOpacity.separator))
+    }
+
+    @ViewBuilder private var headerTrendArrow: some View {
+        if let direction = player.trendDirection {
+            let (name, color): (String, Color) = switch direction {
+            case .up: ("arrow.up", .green)
+            case .down: ("arrow.down", .red)
+            case .flat, .neutral: ("minus", .white.opacity(AppOpacity.separator))
+            }
+            Image(systemName: name).font(AppFonts.playerTrendArrow).foregroundStyle(color)
+        } else {
+            Image(systemName: "minus").foregroundStyle(.white.opacity(AppOpacity.separator))
+        }
+    }
+
+    private var headerTrendScore: some View {
+        let value = player.confidenceScore.map { String(format: "%.2f", $0) } ?? "-"
+        let opacity = player.confidenceScore == nil ? AppOpacity.separator : AppOpacity.primary
+        return Text(value).monospacedDigit().multilineTextAlignment(.center)
+            .foregroundStyle(.white.opacity(opacity))
+    }
+}
+
+// MARK: - PlayerDetailFantasyBar
+
+struct PlayerDetailFantasyBar: View {
+    let player: Player
+
+    var body: some View {
+        HStack(spacing: 0) {
+            statColumn(
+                label: String(localized: "detail.stats.dkAvg", defaultValue: "DK AVG"),
+                value: playerValue(player.avgFantasyScore, format: "%.1f")
+            )
+            statDivider
+            statColumn(
+                label: String(localized: "detail.stats.homeAvg", defaultValue: "Home Avg"),
+                value: playerValue(player.avgFantasyScoreHome, format: "%.1f")
+            )
+            statDivider
+            statColumn(
+                label: String(localized: "detail.stats.awayAvg", defaultValue: "Away Avg"),
+                value: playerValue(player.avgFantasyScoreAway, format: "%.1f")
+            )
+        }
+        .padding(.vertical, 10)
+        .appCard()
+        .accessibilityElement(children: .combine)
+    }
+
+    private func statColumn(label: String, value: String) -> some View {
+        VStack(spacing: 2) {
+            Text(label)
+                .font(AppFonts.statLabel)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            Text(value)
+                .font(AppFonts.statValue)
+                .foregroundStyle(.white)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var statDivider: some View {
+        Rectangle()
+            .fill(.white.opacity(AppOpacity.divider))
+            .frame(width: 1, height: 20)
+    }
+
+    private func playerValue(_ value: Double?, format: String) -> String {
+        guard let value else { return "—" }
+        return String(format: format, value)
+    }
+}
+
+// MARK: - PlayerTierToast
+
+struct PlayerTierToast: View {
+    let tier: PlayerTier
+    let player: Player
+    @Environment(\\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: tier.systemImage).foregroundStyle(tier.color)
+                Text("Ranked \\(tier.label)")
+            }
+            .font(.subheadline)
+            VStack(alignment: .leading, spacing: 3) {
+                if let fantasy = player.avgFantasyScore {
+                    Label("\\(fantasy) DK avg", systemImage: "chart.bar.fill")
+                }
+                if let consistency = player.consistencyScore {
+                    Label("\\(consistency * 100)% consistent", systemImage: "waveform.path.ecg")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.white.opacity(AppOpacity.secondary))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(AppPadding.contentInner)
+        .background {
+            if reduceTransparency {
+                Color.black.opacity(0.9)
+            } else {
+                Rectangle().fill(.ultraThinMaterial)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.lg))
+        .padding(.horizontal, AppPadding.contentInner)
+        .padding(.bottom, 24)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+}
+"""
+
+player_detail_overview_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - PlayerDetailOverviewTrendCard
+
+struct PlayerDetailOverviewTrendCard: View {
+    let player: Player
+
+    private var hasAnyData: Bool {
+        player.trendScore != nil
+            || player.confidenceScore != nil
+            || player.consistencyScore != nil
+            || player.trendAcceleration != nil
+            || player.hotStreak != nil
+            || player.recentGameScores != nil
+    }
+
+    var body: some View {
+        if hasAnyData {
+            VStack(spacing: 0) {
+                let rows = buildRows()
+                ForEach(Array(rows.enumerated()), id: \\.offset) { index, item in
+                    if index > 0 { rowDivider }
+                    trendInfoRow(label: item.label, value: item.value, color: item.color)
+                }
+            }
+            .padding(.bottom, 4)
+            .appCard()
+        } else {
+            emptyState
+        }
+    }
+
+    private struct TrendRow {
+        let label: String
+        let value: String
+        let color: Color
+    }
+
+    // swiftlint:disable:next function_body_length
+    private func buildRows() -> [TrendRow] {
+        var rows: [TrendRow] = []
+
+        if let score = player.trendScore {
+            let formatted = String(format: "%+.0f%%", score * 100)
+            rows.append(TrendRow(
+                label: String(localized: "detail.overview.trendScore", defaultValue: "Trend Score"),
+                value: formatted,
+                color: valueColor(score)
+            ))
+        }
+
+        if let confidence = player.confidenceScore {
+            rows.append(TrendRow(
+                label: String(localized: "detail.overview.confidence", defaultValue: "Confidence"),
+                value: String(format: "%.0f%%", confidence * 100),
+                color: .white
+            ))
+        }
+
+        if let consistency = player.consistencyScore {
+            rows.append(TrendRow(
+                label: String(localized: "detail.overview.consistency", defaultValue: "Consistency"),
+                value: String(format: "%.0f%%", consistency * 100),
+                color: .white
+            ))
+        }
+
+        if let acceleration = player.trendAcceleration {
+            let formatted = String(format: "%+.0f%%", acceleration * 100)
+            rows.append(TrendRow(
+                label: String(localized: "detail.overview.acceleration", defaultValue: "Acceleration"),
+                value: formatted,
+                color: valueColor(acceleration)
+            ))
+        }
+
+        if let streak = player.hotStreak, streak > 0 {
+            rows.append(TrendRow(
+                label: String(localized: "detail.overview.hotStreak", defaultValue: "Hot Streak"),
+                value: "\\(streak) games",
+                color: .orange
+            ))
+        }
+
+        if let surging = player.isSurging, surging {
+            let categories = player.surgingCategoryCount.map { String($0) } ?? "-"
+            rows.append(TrendRow(
+                label: String(localized: "detail.overview.surging", defaultValue: "Surging"),
+                value: "\\(categories) categories",
+                color: .green
+            ))
+        }
+
+        return rows
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "chart.line.uptrend.xyaxis")
+                .font(.callout)
+                .foregroundStyle(.white.opacity(AppOpacity.dim))
+            Text(String(localized: "No trend data available", defaultValue: "No trend data available"))
+                .font(.caption)
+                .foregroundStyle(.white.opacity(AppOpacity.separator))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .appCard()
+    }
+
+    private func trendInfoRow(label: String, value: String, color: Color) -> some View {
+        HStack {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(AppOpacity.secondary))
+            Spacer()
+            Text(value)
+                .font(.caption2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(color)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    private func valueColor(_ value: Double) -> Color {
+        if value > 0.02 { return .green }
+        if value < -0.02 { return .red }
+        return .white.opacity(AppOpacity.separator)
+    }
+
+    private var rowDivider: some View {
+        Divider()
+            .background(.white.opacity(AppOpacity.hairline))
+            .padding(.leading, AppPadding.contentInner)
+    }
+}
+"""
+
+write(os.path.join(trending_views_dir, "PlayerDetailView.swift"), player_detail_view_swift)
+write(os.path.join(trending_views_dir, "PlayerDetailSubviews.swift"), player_detail_subviews_swift)
+write(os.path.join(trending_views_dir, "PlayerDetailOverviewView.swift"), player_detail_overview_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9h. Prospecting Store + Views
+# ─────────────────────────────────────────────────────────────────────────────
+
+prospecting_store_dir = os.path.join(out_dir, "App/Sources/Features/Prospecting/Store")
+prospecting_views_dir = os.path.join(out_dir, "App/Sources/Features/Prospecting/Views")
+
+prospecting_state_swift = header() + f"""\
+import OSLog
+import BKSCore
+import SwiftUI
+
+struct ProspectingState {{
+    var navigationPath = NavigationPath()
+    var opportunities: ViewState<[Opportunity]> = .idle
+    var allOpportunities: [Opportunity] = []
+    var gemsOpportunities: [Opportunity] = []
+    var foolsGoldOpportunities: [Opportunity] = []
+    var filteredGemsOpportunities: [Opportunity] = []
+    var filteredFoolsGoldOpportunities: [Opportunity] = []
+    var filteredOpportunities: [Opportunity] = []
+    var searchText = ""
+    var selectedPosition: String?
+    var lastUpdated: Date?
+    var seasonMode: SeasonMode = .regularSeason
+    var todaySchedule: TodaySchedule?
+
+    private static let stalenessThreshold = CacheFreshness.defaultThreshold
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "ProspectingState"
+    )
+
+    // swiftlint:disable:next function_body_length
+    static func makeReduce(
+        opportunityService: OpportunitiesServiceProtocol,
+        gamesService: GamesServiceProtocol,
+        positionMap: SportPositionMap
+    ) -> Reduce<Self, ProspectingIntent> {{
+        {{ state, intent in
+            switch intent {{
+            case .onAppear:
+                if CacheFreshness.isFresh(lastUpdated: state.lastUpdated, threshold: stalenessThreshold),
+                   case .loaded = state.opportunities
+                {{
+                    logger.debug("Opportunities cache is fresh, skipping fetch")
+                    return nil
+                }}
+                state.opportunities = .loading
+                return await fetchOpportunities(
+                    opportunityService: opportunityService,
+                    gamesService: gamesService
+                )
+
+            case .refreshRequested:
+                state.opportunities = .loading
+                return await fetchOpportunities(
+                    opportunityService: opportunityService,
+                    gamesService: gamesService,
+                    forceNetwork: true
+                )
+
+            case let .opportunitiesLoaded(opportunities, seasonMode, todaySchedule):
+                state.seasonMode = seasonMode
+                state.todaySchedule = todaySchedule
+                let available = opportunities.filter {{ !isUnavailable($0) }}
+                state.allOpportunities = available
+                let gemsTiers: Set<FeatureTier> = [.elite, .good]
+                state.gemsOpportunities = available.filter {{ gemsTiers.contains($0.opportunityTier) }}
+                state.foolsGoldOpportunities = available.filter {{ !gemsTiers.contains($0.opportunityTier) }}
+                state.opportunities = .loaded(available)
+                state.lastUpdated = Date.now
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+
+            case let .opportunitiesFailed(error):
+                if case .loaded = state.opportunities {{
+                    logger.warning(
+                        "Opportunities refresh failed but keeping existing data: \\\\(error.diagnosticDescription)"
+                    )
+                    return nil
+                }}
+                state.opportunities = .failed(error)
+                return nil
+
+            case let .navigationPathChanged(path):
+                state.navigationPath = path
+                return nil
+
+            case let .searchTextChanged(text):
+                state.searchText = text
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+
+            case let .positionFilterChanged(position):
+                state.selectedPosition = position
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+            }}
+        }}
+    }}
+
+    private static func applyFilters(_ state: inout Self, positionMap: SportPositionMap) {{
+        let search = state.searchText
+        let chip = state.selectedPosition
+
+        state.filteredGemsOpportunities = filterOpportunities(
+            state.gemsOpportunities, search: search, chip: chip, positionMap: positionMap
+        )
+        state.filteredFoolsGoldOpportunities = filterOpportunities(
+            state.foolsGoldOpportunities, search: search, chip: chip, positionMap: positionMap
+        )
+        state.filteredOpportunities = state.filteredGemsOpportunities + state.filteredFoolsGoldOpportunities
+    }}
+
+    private static func filterOpportunities(
+        _ opportunities: [Opportunity],
+        search: String,
+        chip: String?,
+        positionMap: SportPositionMap
+    ) -> [Opportunity] {{
+        opportunities.filtered(search: search, chip: chip, positionMap: positionMap)
+    }}
+
+    private static func isUnavailable(_ opportunity: Opportunity) -> Bool {{
+        opportunity.isUnavailable
+    }}
+
+    private static func fetchOpportunities(
+        opportunityService: OpportunitiesServiceProtocol,
+        gamesService: GamesServiceProtocol,
+        forceNetwork: Bool = false
+    ) async -> ProspectingIntent {{
+        let cachedSchedule = try? gamesService.loadCachedTodaySchedule()
+        do {{
+            if !forceNetwork, let cached = try opportunityService.loadCachedOpportunities(), !cached.isEmpty {{
+                let cachedMode = (try? opportunityService.loadCachedSeasonMode()) ?? .regularSeason
+                logger.debug("Using cached opportunities (\\\\(cached.count) entries)")
+                return .opportunitiesLoaded(cached, cachedMode, cachedSchedule)
+            }}
+            if forceNetwork {{
+                logger.debug("Refresh requested — fetching opportunities from network")
+            }} else {{
+                logger.debug("No cached opportunities — fetching from network")
+            }}
+            let result = try await opportunityService.fetchOpportunities()
+            return .opportunitiesLoaded(result.opportunities, result.seasonMode, cachedSchedule)
+        }} catch {{
+            if forceNetwork, let cached = try? opportunityService.loadCachedOpportunities(), !cached.isEmpty {{
+                let cachedMode = (try? opportunityService.loadCachedSeasonMode()) ?? .regularSeason
+                logger.warning("Network fetch failed, falling back to cache: \\\\(error.diagnosticDescription)")
+                return .opportunitiesLoaded(cached, cachedMode, cachedSchedule)
+            }}
+            return .opportunitiesFailed(error)
+        }}
+    }}
+}}
+"""
+
+prospecting_intent_swift = header() + """\
+import SwiftUI
+import BKSCore
+
+enum ProspectingIntent: CancellableIntent {
+    case onAppear
+    case navigationPathChanged(NavigationPath)
+    case opportunitiesLoaded([Opportunity], SeasonMode, TodaySchedule?)
+    case opportunitiesFailed(Error)
+    case refreshRequested
+    case searchTextChanged(String)
+    case positionFilterChanged(String?)
+
+    var cancelsInFlightWork: Bool {
+        switch self {
+        case .navigationPathChanged, .searchTextChanged, .positionFilterChanged:
+            false
+        default:
+            true
+        }
+    }
+}
+"""
+
+opportunity_detail_state_swift = header() + f"""\
+import OSLog
+import BKSCore
+
+struct OpportunityDetailState {{
+    let opportunity: Opportunity
+    var player: ViewState<Player> = .idle
+    var gameLog: ViewState<PlayerGameLog> = .idle
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "OpportunityDetailState"
+    )
+
+    // swiftlint:disable:next function_body_length cyclomatic_complexity
+    static func makeReduce(
+        trendingsService: TrendingsServiceProtocol,
+        gamesService: GamesServiceProtocol
+    ) -> Reduce<Self, OpportunityDetailIntent> {{
+        {{ state, intent in
+            switch intent {{
+            case .onAppear:
+                do {{
+                    if let players = try trendingsService.loadCachedPlayers(),
+                       let match = PlayerLookup.find(
+                           externalPersonID: state.opportunity.externalPersonID,
+                           displayName: state.opportunity.displayName,
+                           team: state.opportunity.team,
+                           in: players
+                       ) {{
+                        return .playerLoaded(match)
+                    }}
+                }} catch {{
+                    logger.warning("Failed to load cached players: \\\\(error.diagnosticDescription)")
+                }}
+                return .playerNotFound
+
+            case let .playerLoaded(player):
+                state.player = .loaded(player)
+                return nil
+
+            case .playerNotFound:
+                state.player = .failed(OpportunityDetailError.playerNotFound)
+                return nil
+
+            case .gameLogTabSelected:
+                guard case .idle = state.gameLog else {{ return nil }}
+                guard case let .loaded(player) = state.player else {{
+                    state.gameLog = .failed(OpportunityDetailError.playerNotFound)
+                    return nil
+                }}
+                do {{
+                    if let cached = try gamesService.loadCachedGameLog(playerID: player.id) {{
+                        state.gameLog = .loaded(cached)
+                        return nil
+                    }}
+                }} catch {{
+                    logger.warning("Failed to load cached game log: \\\\(error.diagnosticDescription)")
+                }}
+                state.gameLog = .loading
+                return .fetchGameLog
+
+            case .fetchGameLog:
+                guard case let .loaded(player) = state.player else {{ return nil }}
+                do {{
+                    let gameLog = try await gamesService.fetchGameLog(
+                        playerID: player.id,
+                        teamID: player.team
+                    )
+                    return .gameLogLoaded(gameLog)
+                }} catch {{
+                    return .gameLogFailed(error)
+                }}
+
+            case let .gameLogLoaded(gameLog):
+                state.gameLog = .loaded(gameLog)
+                return nil
+
+            case let .gameLogFailed(error):
+                if case .loaded = state.gameLog {{
+                    logger.warning("Game log refresh failed but keeping existing data: \\\\(error.diagnosticDescription)")
+                    return nil
+                }}
+                state.gameLog = .failed(error)
+                return nil
+
+            case .refreshRequested:
+                guard case .loaded = state.player else {{ return nil }}
+                state.gameLog = .loading
+                return .fetchGameLog
+            }}
+        }}
+    }}
+}}
+
+// MARK: - OpportunityDetailError
+
+enum OpportunityDetailError: LocalizedError {{
+    case playerNotFound
+
+    var errorDescription: String? {{
+        switch self {{
+        case .playerNotFound:
+            String(localized: "opportunityDetail.error.playerNotFound",
+                   defaultValue: "Player data unavailable")
+        }}
+    }}
+}}
+"""
+
+opportunity_detail_intent_swift = header() + """\
+enum OpportunityDetailIntent {
+    case onAppear
+    case playerLoaded(Player)
+    case playerNotFound
+    case gameLogTabSelected
+    case fetchGameLog
+    case gameLogLoaded(PlayerGameLog)
+    case gameLogFailed(Error)
+    case refreshRequested
+}
+"""
+
+write(os.path.join(prospecting_store_dir, "ProspectingState.swift"), prospecting_state_swift)
+write(os.path.join(prospecting_store_dir, "ProspectingIntent.swift"), prospecting_intent_swift)
+write(os.path.join(prospecting_store_dir, "OpportunityDetailState.swift"), opportunity_detail_state_swift)
+write(os.path.join(prospecting_store_dir, "OpportunityDetailIntent.swift"), opportunity_detail_intent_swift)
+
+prospecting_view_swift = header() + f"""\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct ProspectingView: View {{
+    @ObservedObject var store: Store<ProspectingState, ProspectingIntent>
+    let credential: StoredCredential
+    @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    let trendingsService: TrendingsServiceProtocol
+    let gamesService: GamesServiceProtocol
+    @State private var showProfile = false
+    @State private var selectedTab = ProspectingTab.gems
+    @State private var toastTier: FeatureTier?
+    @Environment(\\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\\.analytics) private var analytics
+
+    private var searchBinding: Binding<String> {{
+        Binding(
+            get: {{ store.state.searchText }},
+            set: {{ store.send(.searchTextChanged($0)) }}
+        )
+    }}
+
+    var body: some View {{
+        NavigationStack(path: Binding(
+            get: {{ store.state.navigationPath }},
+            set: {{ store.send(.navigationPathChanged($0)) }}
+        )) {{
+            content
+                .appBackground()
+                .analyticsScreen("prospecting")
+                .appNavigationBar(
+                    title: String(localized: "prospecting.title", defaultValue: "Prospecting"),
+                    subtitle: String(localized: "prospecting.subtitle", defaultValue: "Today's DFS opportunities")
+                )
+                .navBarTrailingIcon(
+                    "person",
+                    accessibilityID: "nav.profileButton",
+                    accessibilityLabel: String(localized: "a11y.label.profile", defaultValue: "Profile")
+                ) {{ showProfile = true }}
+                .navigationDestination(isPresented: $showProfile) {{
+                    ProfilePanelView(credential: credential, profileStore: profileStore)
+                        .appNavigationBar(title: String(localized: "Profile", defaultValue: "Profile"))
+                }}
+                .navigationDestination(for: Opportunity.self) {{ opportunity in
+                    OpportunityDetailView(
+                        store: Store(
+                            initial: OpportunityDetailState(opportunity: opportunity),
+                            reduce: OpportunityDetailState.makeReduce(
+                                trendingsService: trendingsService,
+                                gamesService: gamesService
+                            )
+                        )
+                    )
+                    .onAppear {{
+                        analytics.logDetailedEvent(AnalyticsEvent.opportunityTapped, parameters: [
+                            AnalyticsParam.opportunityId: opportunity.id,
+                            AnalyticsParam.opportunityTier: String(describing: opportunity.opportunityTier),
+                            AnalyticsParam.playerTier:
+                                opportunity.playerTier.map(String.init(describing:)) ?? "unknown",
+                            AnalyticsParam.isSurging: String(opportunity.isSurging),
+                            AnalyticsParam.subTab: String(describing: selectedTab)
+                        ])
+                    }}
+                }}
+        }}
+        .task {{
+            store.send(.onAppear)
+        }}
+        .onChange(of: selectedTab) {{
+            analytics.logEvent(AnalyticsEvent.subTabSelected, parameters: [
+                AnalyticsParam.tabName: String(describing: selectedTab),
+                AnalyticsParam.feature: "prospecting"
+            ])
+        }}
+        .onChange(of: store.state.searchText.isEmpty) {{
+            if !store.state.searchText.isEmpty {{
+                analytics.logEvent(AnalyticsEvent.searchUsed, parameters: [
+                    AnalyticsParam.feature: "prospecting"
+                ])
+            }}
+        }}
+        .onChange(of: store.state.selectedPosition) {{
+            analytics.logEvent(AnalyticsEvent.filterChanged, parameters: [
+                AnalyticsParam.feature: "prospecting"
+            ])
+        }}
+    }}
+
+    private var content: some View {{
+        VStack(spacing: 0) {{
+            SeasonModeBanner(mode: store.state.seasonMode)
+
+            if store.state.seasonMode == .offseason {{
+                offseasonView
+            }} else {{
+                LoadableContentView(
+                    state: store.state.opportunities,
+                    isEmpty: store.state.allOpportunities.isEmpty,
+                    emptyIcon: "sparkle.magnifyingglass",
+                    errorKey: "prospecting.error",
+                    retryKey: "prospecting.retry",
+                    emptyKey: emptyMessageKey,
+                    onRetry: {{ store.send(.refreshRequested) }},
+                    content: {{ opportunityList }}
+                )
+            }}
+        }}
+    }}
+
+    private var emptyMessageKey: LocalizedStringResource {{
+        switch store.state.todaySchedule?.hasGames {{
+        case false:
+            return LocalizedStringResource(
+                "prospecting.empty.noGames",
+                defaultValue: "No games scheduled for today"
+            )
+        case true:
+            return LocalizedStringResource(
+                "prospecting.empty.noOpportunities",
+                defaultValue: "There are games today but no opportunities available"
+            )
+        default:
+            return LocalizedStringResource(
+                "prospecting.empty",
+                defaultValue: "No opportunities available"
+            )
+        }}
+    }}
+
+    private var offseasonView: some View {{
+        VStack(spacing: 12) {{
+            Spacer()
+            Image(systemName: "moon.fill")
+                .font(.system(size: 40))
+                .foregroundStyle(.white.opacity(AppOpacity.dim))
+            Text(String(localized: "offseason.message",
+                        defaultValue: "The season is over. Check back when games resume."))
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(AppOpacity.secondary))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            Spacer()
+        }}
+    }}
+
+    private var opportunityList: some View {{
+        let activeOpportunities: [Opportunity] = switch selectedTab {{
+        case .gems: store.state.filteredGemsOpportunities
+        case .foolsGold: store.state.filteredFoolsGoldOpportunities
+        }}
+        let allGrouped = Dictionary(grouping: store.state.allOpportunities) {{ $0.opportunityTier }}
+        let grouped = Dictionary(grouping: activeOpportunities) {{ $0.opportunityTier }}
+        let filtersActive = !store.state.searchText.isEmpty || store.state.selectedPosition != nil
+        let filteredEmpty = activeOpportunities.isEmpty
+
+        return VStack(spacing: 0) {{
+            SearchFilterHeader(
+                searchText: searchBinding,
+                selectedPosition: store.state.selectedPosition,
+                filterChips: ["All"] + SportPositionMap.{slug}.filterChips,
+                accessibilityPrefix: "prospecting",
+                onPositionChanged: {{ store.send(.positionFilterChanged($0)) }},
+                tipsContent: {{ SearchTipsView() }}
+            )
+
+            FeatureTabBar(
+                selectedTab: $selectedTab,
+                reduceMotion: reduceMotion,
+                accessibilityPrefix: "prospecting"
+            )
+
+            if filtersActive, filteredEmpty {{
+                FilteredEmptyView(messageKey: "prospecting.filter.empty")
+            }} else {{
+                ScrollView {{
+                    VStack(spacing: AppSpacing.xl) {{
+                        ForEach(selectedTab.tiers, id: \\.self) {{ tier in
+                            ProspectingTierSection(
+                                tier: tier,
+                                opportunities: grouped[tier] ?? [],
+                                toastTier: $toastTier
+                            )
+                        }}
+                    }}
+                    .padding(.horizontal)
+                    .padding(.top, 10)
+                    .padding(.bottom, 16)
+                }}
+                .id(selectedTab)
+                .refreshable {{
+                    analytics.logEvent(AnalyticsEvent.pullToRefresh, parameters: [
+                        AnalyticsParam.feature: "prospecting"
+                    ])
+                    await store.sendAsync(.refreshRequested)
+                }}
+                .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+                .overlay(alignment: .bottom) {{
+                    if let tier = toastTier {{
+                        let tierOpps = allGrouped[tier] ?? []
+                        let scores = tierOpps.map(\\.opportunityScore)
+                        TierToastView(
+                            tier: tier,
+                            scoreRange: scoreRange(from: scores),
+                            playerCount: tierOpps.count
+                        )
+                        .padding(.bottom, 16)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }}
+                }}
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: toastTier)
+            }}
+        }}
+    }}
+
+    private func scoreRange(from scores: [Double]) -> ClosedRange<Double>? {{
+        guard let min = scores.min(), let max = scores.max() else {{ return nil }}
+        return min ... max
+    }}
+
+}}
+"""
+
+prospecting_subviews_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - ProspectingTab
+
+enum ProspectingTab: CaseIterable, FeatureTab {
+    case gems
+    case foolsGold
+
+    var title: String {
+        switch self {
+        case .gems: String(localized: "prospecting.tab.gems", defaultValue: "Gems")
+        case .foolsGold: String(localized: "prospecting.tab.foolsGold", defaultValue: "Fool's Gold")
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .gems: "💎"
+        case .foolsGold: "🪨"
+        }
+    }
+
+    var accentColor: Color {
+        switch self {
+        case .gems: .yellow
+        case .foolsGold: .gray
+        }
+    }
+
+    var tiers: [FeatureTier] {
+        switch self {
+        case .gems: [.elite, .good]
+        case .foolsGold: [.solid, .low]
+        }
+    }
+}
+
+// MARK: - ProspectingTierSection — thin wrapper around shared TierSection
+
+struct ProspectingTierSection: View {
+    let tier: FeatureTier
+    let opportunities: [Opportunity]
+    @Binding var toastTier: FeatureTier?
+
+    var body: some View {
+        TierSection(
+            tier: tier,
+            isEmpty: opportunities.isEmpty,
+            emptyKey: "prospecting.tier.none",
+            toastTier: $toastTier
+        ) {
+            ForEach(Array(opportunities.enumerated()), id: \\.element.id) { index, opportunity in
+                NavigationLink(value: opportunity) {
+                    OpportunityRowView(opportunity: opportunity)
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .accessibilityIdentifier("opportunity.row.\\(opportunity.id)")
+                if index < opportunities.count - 1 {
+                    Divider()
+                        .overlay(Color.white.opacity(AppOpacity.cardOverlay))
+                }
+            }
+        }
+    }
+}
+"""
+
+opportunity_row_view_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct OpportunityRowView: View {
+    let opportunity: Opportunity
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            nameRow
+            infoRow
+            let hasBadges = opportunity.injuryStatus != nil
+                || opportunity.isSurging
+                || opportunity.isHome
+            if hasBadges {
+                badgeRow
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var nameRow: some View {
+        HStack(spacing: 4) {
+            Text(opportunity.displayName)
+                .font(AppFonts.rankingName)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .layoutPriority(1)
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(AppFonts.rankingInfo)
+                .foregroundStyle(.white.opacity(AppOpacity.dim))
+        }
+    }
+
+    private var infoRow: some View {
+        HStack(spacing: 4) {
+            Text(opportunity.team)
+                .font(AppFonts.rankingInfo)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            if let position = opportunity.position {
+                infoDot
+                Text(position)
+                    .font(AppFonts.rankingInfo)
+                    .foregroundStyle(.white.opacity(AppOpacity.muted))
+            }
+            infoDot
+            Text(matchupLabel)
+                .font(AppFonts.rankingInfo)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            Spacer(minLength: 0)
+            Text(formattedScore)
+                .font(AppFonts.rankingScore)
+                .foregroundStyle(scoreColor)
+        }
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
+    }
+
+    private var badgeRow: some View {
+        HStack(spacing: 3) {
+            if let status = opportunity.injuryStatus {
+                InjuryBadge(status: status, compact: true)
+            }
+            if opportunity.isHome {
+                Text("🏠")
+                    .font(AppFonts.rankingBadgeIcon)
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1)
+                    .background(Color.green.opacity(0.15))
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            }
+            if opportunity.isSurging {
+                Text("🚀")
+                    .font(AppFonts.rankingBadgeIcon)
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1)
+                    .background(Color.purple.opacity(0.15))
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            }
+        }
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
+    }
+
+    private var formattedScore: String {
+        let isFoolsGold: Bool = switch opportunity.opportunityTier {
+        case .solid, .low: true
+        case .elite, .good: false
+        }
+        let prefix = isFoolsGold ? "-" : ""
+        return prefix + String(format: "%.0f", opportunity.opportunityScore)
+    }
+
+    private var matchupLabel: String {
+        let prefix = opportunity.isHome
+            ? String(localized: "opportunity.matchup.home", defaultValue: "Home")
+            : String(localized: "opportunity.matchup.away", defaultValue: "Away")
+        return "\\(prefix) \\(opportunity.opponentAbbr)"
+    }
+
+    private var scoreColor: Color {
+        switch opportunity.opportunityTier {
+        case .elite, .good: .green
+        case .solid, .low: .red
+        }
+    }
+
+    private var infoDot: some View {
+        Text("·")
+            .font(AppFonts.rankingInfo)
+            .foregroundStyle(.white.opacity(AppOpacity.muted))
+    }
+}
+"""
+
+write(os.path.join(prospecting_views_dir, "ProspectingView.swift"), prospecting_view_swift)
+write(os.path.join(prospecting_views_dir, "ProspectingSubviews.swift"), prospecting_subviews_swift)
+write(os.path.join(prospecting_views_dir, "OpportunityRowView.swift"), opportunity_row_view_swift)
+
+# OpportunityDetailView and OpportunityDetailSubviews are large — write as plain strings
+opportunity_detail_view_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct OpportunityDetailView: View {
+    @StateObject var store: Store<OpportunityDetailState, OpportunityDetailIntent>
+
+    @State private var selectedTab = OpportunityDetailTab.edge
+    @State private var showTierToast = false
+    @Environment(\\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\\.analytics) private var analytics
+    @State private var hasLoggedGameLog = false
+
+    private var opportunity: Opportunity {
+        store.state.opportunity
+    }
+
+    private var player: Player? {
+        if case let .loaded(player) = store.state.player { return player }
+        return nil
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                OpportunityDetailHeaderCard(
+                    opportunity: opportunity,
+                    showTierToast: $showTierToast
+                )
+                OpportunityFantasyBar(player: player, isHome: opportunity.isHome)
+                OpportunityDetailScoreCard(opportunity: opportunity)
+                tabBar
+                tabContent
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 6)
+            .padding(.bottom, 20)
+        }
+        .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+        .appBackground()
+        .analyticsScreen("opportunity_detail")
+        .overlay(alignment: .bottom) {
+            if showTierToast, let tier = opportunity.playerTier {
+                TierToastView(tier: tier)
+                    .padding(.bottom, 16)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(reduceMotion ? nil : .spring(duration: 0.3), value: showTierToast)
+        .appNavigationBar(title: "")
+        .task { store.send(.onAppear) }
+    }
+
+    private var tabBar: some View {
+        HStack(spacing: 0) {
+            ForEach(OpportunityDetailTab.allCases, id: \\.self) { tab in
+                tabButton(tab)
+            }
+        }
+    }
+
+    private func tabButton(_ tab: OpportunityDetailTab) -> some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                selectedTab = tab
+            }
+            analytics.logDetailedEvent(AnalyticsEvent.detailTabSwitched, parameters: [
+                AnalyticsParam.tabName: String(describing: tab),
+                AnalyticsParam.feature: "prospecting",
+                AnalyticsParam.playerId: opportunity.id,
+                AnalyticsParam.playerTier: opportunity.playerTier.map(String.init(describing:)) ?? "unknown"
+            ])
+            if tab == .gameLog {
+                store.send(.gameLogTabSelected)
+            }
+        } label: {
+            VStack(spacing: 4) {
+                Text(tab.title)
+                    .font(selectedTab == tab ? AppFonts.filterChip.weight(.semibold) : AppFonts.filterChip)
+                    .foregroundStyle(
+                        selectedTab == tab ? .white : .white.opacity(AppOpacity.muted)
+                    )
+                Rectangle()
+                    .fill(selectedTab == tab ? .orange : .clear)
+                    .frame(height: 2)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityAddTraits(selectedTab == tab ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private var tabContent: some View {
+        switch selectedTab {
+        case .edge:
+            OpportunityEdgeCard(opportunity: opportunity, player: player)
+        case .gameLog:
+            gameLogContent
+        }
+    }
+
+    @ViewBuilder
+    private var gameLogContent: some View {
+        switch store.state.gameLog {
+        case .idle, .loading:
+            GameLogPlaceholderView(style: .loading)
+        case let .loaded(gameLog):
+            if gameLog.entries.isEmpty {
+                GameLogPlaceholderView(style: .empty)
+            } else {
+                GameLogTableView(entries: gameLog.entries)
+                    .onAppear {
+                        guard !hasLoggedGameLog else { return }
+                        hasLoggedGameLog = true
+                        analytics.logDetailedEvent(AnalyticsEvent.gameLogViewed, parameters: [
+                            AnalyticsParam.playerId: opportunity.id,
+                            AnalyticsParam.feature: "prospecting",
+                            AnalyticsParam.entryCount: String(gameLog.entries.count)
+                        ])
+                    }
+            }
+        case let .failed(error):
+            GameLogErrorView(error: error) {
+                store.send(.refreshRequested)
+            }
+        }
+    }
+}
+
+private enum OpportunityDetailTab: CaseIterable {
+    case edge
+    case gameLog
+
+    var title: String {
+        switch self {
+        case .edge: String(localized: "opportunityDetail.tab.edge", defaultValue: "Today's Edge")
+        case .gameLog: String(localized: "opportunityDetail.tab.gameLog", defaultValue: "Game Log")
+        }
+    }
+}
+"""
+
+write(os.path.join(prospecting_views_dir, "OpportunityDetailView.swift"), opportunity_detail_view_swift)
+
+# OpportunityDetailSubviews — large file, write as plain string (no substitution needed)
+opportunity_detail_subviews_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - OpportunityDetailHeaderCard
+
+struct OpportunityDetailHeaderCard: View {
+    let opportunity: Opportunity
+    @Binding var showTierToast: Bool
+    @Environment(\\.analytics) private var analytics
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .bottom, spacing: 12) {
+                headshot
+                headerInfo
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(12)
+        .appCard()
+    }
+
+    private var headshot: some View {
+        CachedAsyncImage(url: opportunity.headshotURL) { phase in
+            switch phase {
+            case let .success(image):
+                image
+                    .resizable()
+                    .scaledToFill()
+                    .accessibilityIgnoresInvertColors(true)
+            default:
+                Image(systemName: "person.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.white.opacity(AppOpacity.separator))
+            }
+        }
+        .frame(width: 90, height: 105)
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.sm))
+        .overlay(
+            RoundedRectangle(cornerRadius: AppRadius.sm)
+                .stroke(.white.opacity(AppOpacity.divider), lineWidth: 1)
+        )
+    }
+
+    private var headerInfo: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(opportunity.displayName)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+            teamPositionRow
+            Spacer(minLength: 0)
+            matchupRow
+            Spacer(minLength: 0)
+            tierRow
+        }
+        .frame(height: 105, alignment: .leading)
+    }
+
+    private var teamPositionRow: some View {
+        HStack(spacing: 6) {
+            Text(opportunity.team).fontWeight(.semibold)
+            if let position = opportunity.position {
+                headerPipe
+                Text(position)
+            }
+            if let status = opportunity.injuryStatus {
+                headerPipe
+                Text(status.rawValue).foregroundStyle(status.color)
+            }
+        }
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+    }
+
+    private var matchupRow: some View {
+        HStack(spacing: 6) {
+            let prefix = opportunity.isHome
+                ? String(localized: "opportunity.detail.home", defaultValue: "Home")
+                : String(localized: "opportunity.detail.away", defaultValue: "Away")
+            Text("\\(prefix) \\(opportunity.opponentAbbr)")
+        }
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+    }
+
+    private var tierRow: some View {
+        HStack(spacing: 6) {
+            Text(String(format: "%.0f", opportunity.opportunityScore))
+                .monospacedDigit()
+                .frame(width: 44, alignment: .center)
+            if let tier = opportunity.playerTier {
+                headerPipe
+                Button {
+                    showTierToast = true
+                    analytics.logDetailedEvent(AnalyticsEvent.tierBadgeTapped, parameters: [
+                        AnalyticsParam.tier: String(describing: tier),
+                        AnalyticsParam.feature: "prospecting"
+                    ])
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                        showTierToast = false
+                    }
+                } label: {
+                    Image(systemName: tier.systemImage)
+                        .foregroundStyle(tier.color)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(String(localized: "a11y.label.showTierDetails", defaultValue: "Show tier details"))
+            }
+        }
+        .lineLimit(1)
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var headerPipe: some View {
+        Text(String(localized: "|", defaultValue: "|")).foregroundStyle(.white.opacity(AppOpacity.separator))
+    }
+}
+
+// MARK: - OpportunityFantasyBar
+
+struct OpportunityFantasyBar: View {
+    let player: Player?
+    let isHome: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            statColumn(
+                label: String(localized: "opportunityDetail.stats.dkAvg", defaultValue: "DK Avg"),
+                value: playerValue(player?.avgFantasyScore, format: "%.1f")
+            )
+            statDivider
+            statColumn(
+                label: isHome
+                    ? String(localized: "opportunityDetail.stats.homeAvg", defaultValue: "Home Avg")
+                    : String(localized: "opportunityDetail.stats.awayAvg", defaultValue: "Away Avg"),
+                value: playerValue(
+                    isHome ? player?.avgFantasyScoreHome : player?.avgFantasyScoreAway,
+                    format: "%.1f"
+                ),
+                isHighlighted: true
+            )
+            statDivider
+            statColumn(
+                label: isHome
+                    ? String(localized: "opportunityDetail.stats.awayAvg", defaultValue: "Away Avg")
+                    : String(localized: "opportunityDetail.stats.homeAvg", defaultValue: "Home Avg"),
+                value: playerValue(
+                    isHome ? player?.avgFantasyScoreAway : player?.avgFantasyScoreHome,
+                    format: "%.1f"
+                )
+            )
+        }
+        .padding(.vertical, 10)
+        .appCard()
+        .accessibilityElement(children: .combine)
+    }
+
+    private func statColumn(label: String, value: String, isHighlighted: Bool = false) -> some View {
+        VStack(spacing: 2) {
+            Text(label)
+                .font(AppFonts.statLabel)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            Text(value)
+                .font(AppFonts.statValue)
+                .foregroundStyle(isHighlighted ? .green : .white)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var statDivider: some View {
+        Rectangle()
+            .fill(.white.opacity(AppOpacity.divider))
+            .frame(width: 1, height: 20)
+    }
+
+    private func playerValue(_ value: Double?, format: String) -> String {
+        guard let value else { return "—" }
+        return String(format: format, value)
+    }
+}
+
+// MARK: - OpportunityDetailScoreCard
+
+struct OpportunityDetailScoreCard: View {
+    let opportunity: Opportunity
+
+    var body: some View {
+        HStack(spacing: 0) {
+            statColumn(
+                label: String(localized: "opportunity.detail.score", defaultValue: "Score"),
+                value: String(format: "%.0f", opportunity.opportunityScore),
+                color: opportunity.opportunityTier.color
+            )
+            statDivider
+            statColumn(
+                label: String(localized: "opportunity.detail.playerTier", defaultValue: "Player Tier"),
+                value: opportunity.playerTier?.label ?? "—",
+                color: opportunity.playerTier?.color ?? .white.opacity(AppOpacity.separator)
+            )
+            statDivider
+            statColumn(
+                label: String(localized: "opportunity.detail.matchup", defaultValue: "Matchup"),
+                value: opportunity.opponentAbbr,
+                color: .white
+            )
+        }
+        .padding(.vertical, 10)
+        .appCard()
+        .accessibilityElement(children: .combine)
+    }
+
+    private func statColumn(label: String, value: String, color: Color) -> some View {
+        VStack(spacing: 2) {
+            Text(label)
+                .font(AppFonts.statLabel)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            Text(value)
+                .font(AppFonts.statValue)
+                .foregroundStyle(color)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var statDivider: some View {
+        Rectangle()
+            .fill(.white.opacity(AppOpacity.divider))
+            .frame(width: 1, height: 20)
+    }
+}
+
+// MARK: - OpportunityEdgeCard
+
+struct OpportunityEdgeCard: View {
+    let opportunity: Opportunity
+    let player: Player?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            let rows = buildRows()
+            ForEach(Array(rows.enumerated()), id: \\.offset) { index, item in
+                if index > 0 { rowDivider }
+                signalRow(label: item.label, value: item.value, color: item.color)
+            }
+        }
+        .padding(.bottom, 4)
+        .appCard()
+    }
+
+    private struct SignalRow {
+        let label: String
+        let value: String
+        let color: Color
+    }
+
+    // swiftlint:disable:next function_body_length cyclomatic_complexity
+    private func buildRows() -> [SignalRow] {
+        var rows: [SignalRow] = []
+
+        rows.append(SignalRow(
+            label: String(localized: "opportunity.detail.homeAdvantage", defaultValue: "Home Advantage"),
+            value: opportunity.isHome
+                ? String(localized: "opportunity.detail.yes", defaultValue: "Yes")
+                : String(localized: "opportunity.detail.no", defaultValue: "No"),
+            color: opportunity.isHome ? .green : .white.opacity(AppOpacity.separator)
+        ))
+
+        rows.append(SignalRow(
+            label: String(localized: "opportunity.detail.surging", defaultValue: "Surging"),
+            value: opportunity.isSurging
+                ? String(localized: "opportunity.detail.yes", defaultValue: "Yes")
+                : String(localized: "opportunity.detail.no", defaultValue: "No"),
+            color: opportunity.isSurging ? .green : .white.opacity(AppOpacity.separator)
+        ))
+
+        if let player {
+            if let direction = player.trendDirection {
+                let (label, color): (String, Color) = switch direction {
+                case .up:
+                    (String(localized: "opportunityDetail.edge.trendUp", defaultValue: "Trending Up"), .green)
+                case .down:
+                    (String(localized: "opportunityDetail.edge.trendDown", defaultValue: "Trending Down"), .red)
+                case .flat, .neutral:
+                    (String(localized: "opportunityDetail.edge.trendFlat", defaultValue: "Flat"),
+                     .white.opacity(AppOpacity.separator))
+                }
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.trend", defaultValue: "Trend"),
+                    value: label,
+                    color: color
+                ))
+            }
+
+            if let streak = player.hotStreak, streak > 0 {
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.hotStreak", defaultValue: "Hot Streak"),
+                    value: "\\(streak) games",
+                    color: .orange
+                ))
+            }
+
+            if let consistency = player.consistencyScore {
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.consistency", defaultValue: "Consistency"),
+                    value: String(format: "%.0f%%", consistency * 100),
+                    color: .white
+                ))
+            }
+
+            if let signal = player.usageEfficiencySignal, signal != .neutral {
+                let display = switch signal {
+                case .expanding:
+                    String(localized: "opportunityDetail.edge.usageExpanding", defaultValue: "Expanding")
+                case .expandingEfficiently:
+                    String(localized: "opportunityDetail.edge.usageExpandingEfficiently",
+                           defaultValue: "Expanding Efficiently")
+                case .volumeInflation:
+                    String(localized: "opportunityDetail.edge.usageVolumeInflation", defaultValue: "Volume Inflation")
+                case .efficientUsage:
+                    String(localized: "opportunityDetail.edge.usageEfficient", defaultValue: "Efficient Usage")
+                case .neutral:
+                    String(localized: "opportunityDetail.edge.usageNeutral", defaultValue: "Neutral")
+                }
+                let color: Color = switch signal {
+                case .expandingEfficiently, .efficientUsage: .green
+                case .volumeInflation: .red
+                default: .white
+                }
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.usageSignal", defaultValue: "Usage Signal"),
+                    value: display,
+                    color: color
+                ))
+            }
+
+            if let tier = opportunity.rotationTier {
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.rotationTier", defaultValue: "Rotation Tier"),
+                    value: tier.displayLabel,
+                    color: tier.color
+                ))
+            }
+
+            if let games = opportunity.playoffGamesPlayed {
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.playoffGames", defaultValue: "Playoff Games"),
+                    value: "\\(games)",
+                    color: .white
+                ))
+            }
+
+            if let trust = opportunity.playoffTrendTrust {
+                let percentage = String(format: "%.0f%%", trust * 100)
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.trendTrust", defaultValue: "Trend Trust"),
+                    value: percentage,
+                    color: trust >= 0.8 ? .green : trust >= 0.5 ? .yellow : .orange
+                ))
+            }
+
+            if let multiplier = opportunity.playoffRotationMultiplier {
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.rotationBoost",
+                                  defaultValue: "Rotation Boost"),
+                    value: String(format: "%.2fx", multiplier),
+                    color: multiplier > 1.0 ? .green : .white.opacity(AppOpacity.separator)
+                ))
+            }
+
+            if let homeAvg = player.avgFantasyScoreHome, let awayAvg = player.avgFantasyScoreAway {
+                let diff = homeAvg - awayAvg
+                let formatted = String(format: "%+.1f", diff)
+                rows.append(SignalRow(
+                    label: String(localized: "opportunityDetail.edge.venueSplit", defaultValue: "Home vs Away"),
+                    value: "\\(formatted) pts",
+                    color: diff > 1 ? .green : diff < -1 ? .red : .white.opacity(AppOpacity.separator)
+                ))
+            }
+        }
+
+        return rows
+    }
+
+    private func signalRow(label: String, value: String, color: Color) -> some View {
+        HStack {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(AppOpacity.secondary))
+            Spacer()
+            Text(value)
+                .font(.caption2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(color)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    private var rowDivider: some View {
+        Divider()
+            .background(.white.opacity(AppOpacity.hairline))
+            .padding(.leading, AppPadding.contentInner)
+    }
+}
+"""
+
+write(os.path.join(prospecting_views_dir, "OpportunityDetailSubviews.swift"), opportunity_detail_subviews_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9i. Projecting Store + Views
+# ─────────────────────────────────────────────────────────────────────────────
+
+projecting_store_dir = os.path.join(out_dir, "App/Sources/Features/Projecting/Store")
+projecting_views_dir = os.path.join(out_dir, "App/Sources/Features/Projecting/Views")
+
+projecting_state_swift = header() + f"""\
+import OSLog
+import BKSCore
+import SwiftUI
+
+struct ProjectingState {{
+    var navigationPath = NavigationPath()
+    var projections: ViewState<[Projection]> = .idle
+    var allProjections: [Projection] = []
+    var boomProjections: [Projection] = []
+    var bustProjections: [Projection] = []
+    var filteredBoomProjections: [Projection] = []
+    var filteredBustProjections: [Projection] = []
+    var filteredProjections: [Projection] = []
+    var searchText = ""
+    var selectedPosition: String?
+    var lastUpdated: Date?
+
+    private static let stalenessThreshold = CacheFreshness.defaultThreshold
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "ProjectingState"
+    )
+
+    // swiftlint:disable:next function_body_length
+    static func makeReduce(
+        projectionService: ProjectionsServiceProtocol,
+        positionMap: SportPositionMap
+    ) -> Reduce<Self, ProjectingIntent> {{
+        {{ state, intent in
+            switch intent {{
+            case .onAppear:
+                if CacheFreshness.isFresh(lastUpdated: state.lastUpdated, threshold: stalenessThreshold),
+                   case .loaded = state.projections
+                {{
+                    logger.debug("Projections cache is fresh, skipping fetch")
+                    return nil
+                }}
+                state.projections = .loading
+                return await fetchProjections(projectionService: projectionService)
+
+            case .refreshRequested:
+                state.projections = .loading
+                return await fetchProjections(projectionService: projectionService, forceNetwork: true)
+
+            case let .projectionsLoaded(projections):
+                let available = projections.filter {{ !isUnavailable($0) }}
+                state.allProjections = available
+                let boomTiers: Set<FeatureTier> = [.elite, .good]
+                state.boomProjections = available.filter {{ boomTiers.contains($0.projectionTier) }}
+                state.bustProjections = available.filter {{ !boomTiers.contains($0.projectionTier) }}
+                state.projections = .loaded(available)
+                state.lastUpdated = Date.now
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+
+            case let .projectionsFailed(error):
+                if case .loaded = state.projections {{
+                    logger.warning(
+                        "Projections refresh failed but keeping existing data: \\\\(error.diagnosticDescription)"
+                    )
+                    return nil
+                }}
+                state.projections = .failed(error)
+                return nil
+
+            case let .navigationPathChanged(path):
+                state.navigationPath = path
+                return nil
+
+            case let .searchTextChanged(text):
+                state.searchText = text
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+
+            case let .positionFilterChanged(position):
+                state.selectedPosition = position
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+            }}
+        }}
+    }}
+
+    private static func applyFilters(_ state: inout Self, positionMap: SportPositionMap) {{
+        let search = state.searchText
+        let chip = state.selectedPosition
+
+        state.filteredBoomProjections = filterProjections(
+            state.boomProjections, search: search, chip: chip, positionMap: positionMap
+        )
+        state.filteredBustProjections = filterProjections(
+            state.bustProjections, search: search, chip: chip, positionMap: positionMap
+        )
+        state.filteredProjections = state.filteredBoomProjections + state.filteredBustProjections
+    }}
+
+    private static func filterProjections(
+        _ projections: [Projection],
+        search: String,
+        chip: String?,
+        positionMap: SportPositionMap
+    ) -> [Projection] {{
+        projections.filtered(search: search, chip: chip, positionMap: positionMap)
+    }}
+
+    private static func isUnavailable(_ projection: Projection) -> Bool {{
+        projection.isUnavailable
+    }}
+
+    private static func fetchProjections(
+        projectionService: ProjectionsServiceProtocol,
+        forceNetwork: Bool = false
+    ) async -> ProjectingIntent {{
+        do {{
+            if !forceNetwork, let cached = try projectionService.loadCachedProjections(), !cached.isEmpty {{
+                logger.debug("Using cached projections (\\\\(cached.count) entries)")
+                return .projectionsLoaded(cached)
+            }}
+            if forceNetwork {{
+                logger.debug("Refresh requested — fetching projections from network")
+            }} else {{
+                logger.debug("No cached projections — fetching from network")
+            }}
+            let projections = try await projectionService.fetchProjections()
+            return .projectionsLoaded(projections)
+        }} catch {{
+            if forceNetwork, let cached = try? projectionService.loadCachedProjections(), !cached.isEmpty {{
+                logger.warning("Network fetch failed, falling back to cache: \\\\(error.diagnosticDescription)")
+                return .projectionsLoaded(cached)
+            }}
+            return .projectionsFailed(error)
+        }}
+    }}
+}}
+"""
+
+projecting_intent_swift = header() + """\
+import SwiftUI
+import BKSCore
+
+enum ProjectingIntent: CancellableIntent {
+    case onAppear
+    case navigationPathChanged(NavigationPath)
+    case projectionsLoaded([Projection])
+    case projectionsFailed(Error)
+    case refreshRequested
+    case searchTextChanged(String)
+    case positionFilterChanged(String?)
+
+    var cancelsInFlightWork: Bool {
+        switch self {
+        case .navigationPathChanged, .searchTextChanged, .positionFilterChanged:
+            false
+        default:
+            true
+        }
+    }
+}
+"""
+
+projection_detail_state_swift = header() + f"""\
+import OSLog
+import BKSCore
+
+struct ProjectionDetailState {{
+    let projection: Projection
+    var player: ViewState<Player> = .idle
+    var gameLog: ViewState<PlayerGameLog> = .idle
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "ProjectionDetailState"
+    )
+
+    // swiftlint:disable:next function_body_length cyclomatic_complexity
+    static func makeReduce(
+        trendingsService: TrendingsServiceProtocol,
+        gamesService: GamesServiceProtocol
+    ) -> Reduce<Self, ProjectionDetailIntent> {{
+        {{ state, intent in
+            switch intent {{
+            case .onAppear:
+                do {{
+                    if let players = try trendingsService.loadCachedPlayers(),
+                       let match = PlayerLookup.find(
+                           externalPersonID: state.projection.externalPersonID,
+                           displayName: state.projection.displayName,
+                           team: state.projection.team,
+                           in: players
+                       ) {{
+                        return .playerLoaded(match)
+                    }}
+                }} catch {{
+                    logger.warning("Failed to load cached players: \\\\(error.diagnosticDescription)")
+                }}
+                return .playerNotFound
+
+            case let .playerLoaded(player):
+                state.player = .loaded(player)
+                return nil
+
+            case .playerNotFound:
+                state.player = .failed(ProjectionDetailError.playerNotFound)
+                return nil
+
+            case .gameLogTabSelected:
+                guard case .idle = state.gameLog else {{ return nil }}
+                guard case let .loaded(player) = state.player else {{
+                    state.gameLog = .failed(ProjectionDetailError.playerNotFound)
+                    return nil
+                }}
+                do {{
+                    if let cached = try gamesService.loadCachedGameLog(playerID: player.id) {{
+                        state.gameLog = .loaded(cached)
+                        return nil
+                    }}
+                }} catch {{
+                    logger.warning("Failed to load cached game log: \\\\(error.diagnosticDescription)")
+                }}
+                state.gameLog = .loading
+                return .fetchGameLog
+
+            case .fetchGameLog:
+                guard case let .loaded(player) = state.player else {{ return nil }}
+                do {{
+                    let gameLog = try await gamesService.fetchGameLog(
+                        playerID: player.id,
+                        teamID: player.team
+                    )
+                    return .gameLogLoaded(gameLog)
+                }} catch {{
+                    return .gameLogFailed(error)
+                }}
+
+            case let .gameLogLoaded(gameLog):
+                state.gameLog = .loaded(gameLog)
+                return nil
+
+            case let .gameLogFailed(error):
+                if case .loaded = state.gameLog {{
+                    logger.warning("Game log refresh failed but keeping existing data: \\\\(error.diagnosticDescription)")
+                    return nil
+                }}
+                state.gameLog = .failed(error)
+                return nil
+
+            case .refreshRequested:
+                guard case .loaded = state.player else {{ return nil }}
+                state.gameLog = .loading
+                return .fetchGameLog
+            }}
+        }}
+    }}
+}}
+
+// MARK: - ProjectionDetailError
+
+enum ProjectionDetailError: LocalizedError {{
+    case playerNotFound
+
+    var errorDescription: String? {{
+        switch self {{
+        case .playerNotFound:
+            String(localized: "projectionDetail.error.playerNotFound",
+                   defaultValue: "Player data unavailable")
+        }}
+    }}
+}}
+"""
+
+projection_detail_intent_swift = header() + """\
+enum ProjectionDetailIntent {
+    case onAppear
+    case playerLoaded(Player)
+    case playerNotFound
+    case gameLogTabSelected
+    case fetchGameLog
+    case gameLogLoaded(PlayerGameLog)
+    case gameLogFailed(Error)
+    case refreshRequested
+}
+"""
+
+write(os.path.join(projecting_store_dir, "ProjectingState.swift"), projecting_state_swift)
+write(os.path.join(projecting_store_dir, "ProjectingIntent.swift"), projecting_intent_swift)
+write(os.path.join(projecting_store_dir, "ProjectionDetailState.swift"), projection_detail_state_swift)
+write(os.path.join(projecting_store_dir, "ProjectionDetailIntent.swift"), projection_detail_intent_swift)
+
+projecting_view_swift = header() + f"""\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct ProjectingView: View {{
+    @ObservedObject var store: Store<ProjectingState, ProjectingIntent>
+    let credential: StoredCredential
+    @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    let trendingsService: TrendingsServiceProtocol
+    let gamesService: GamesServiceProtocol
+    @State private var showProfile = false
+    @State private var selectedTab = ProjectingTab.boom
+    @State private var toastTier: FeatureTier?
+    @Environment(\\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\\.analytics) private var analytics
+
+    private var searchBinding: Binding<String> {{
+        Binding(
+            get: {{ store.state.searchText }},
+            set: {{ store.send(.searchTextChanged($0)) }}
+        )
+    }}
+
+    var body: some View {{
+        NavigationStack(path: Binding(
+            get: {{ store.state.navigationPath }},
+            set: {{ store.send(.navigationPathChanged($0)) }}
+        )) {{
+            content
+                .appBackground()
+                .analyticsScreen("projecting")
+                .appNavigationBar(
+                    title: String(localized: "projecting.title", defaultValue: "Projecting"),
+                    subtitle: String(localized: "projecting.subtitle", defaultValue: "Tonight's ceiling plays")
+                )
+                .navBarTrailingIcon(
+                    "person",
+                    accessibilityID: "nav.profileButton",
+                    accessibilityLabel: String(localized: "a11y.label.profile", defaultValue: "Profile")
+                ) {{ showProfile = true }}
+                .navigationDestination(isPresented: $showProfile) {{
+                    ProfilePanelView(credential: credential, profileStore: profileStore)
+                        .appNavigationBar(title: String(localized: "Profile", defaultValue: "Profile"))
+                }}
+                .navigationDestination(for: Projection.self) {{ projection in
+                    ProjectionDetailView(
+                        store: Store(
+                            initial: ProjectionDetailState(projection: projection),
+                            reduce: ProjectionDetailState.makeReduce(
+                                trendingsService: trendingsService,
+                                gamesService: gamesService
+                            )
+                        )
+                    )
+                    .onAppear {{
+                        analytics.logDetailedEvent(AnalyticsEvent.projectionTapped, parameters: [
+                            AnalyticsParam.projectionId: projection.id,
+                            AnalyticsParam.projectionTier: String(describing: projection.projectionTier),
+                            AnalyticsParam.playerTier: projection.playerTier.map(String.init(describing:)) ?? "unknown",
+                            AnalyticsParam.isSurging: String(projection.isSurging),
+                            AnalyticsParam.subTab: String(describing: selectedTab)
+                        ])
+                    }}
+                }}
+        }}
+        .task {{
+            store.send(.onAppear)
+        }}
+        .onChange(of: selectedTab) {{
+            analytics.logEvent(AnalyticsEvent.subTabSelected, parameters: [
+                AnalyticsParam.tabName: String(describing: selectedTab),
+                AnalyticsParam.feature: "projecting"
+            ])
+        }}
+    }}
+
+    private var content: some View {{
+        LoadableContentView(
+            state: store.state.projections,
+            isEmpty: store.state.allProjections.isEmpty,
+            emptyIcon: "chart.bar.xaxis.ascending",
+            errorKey: "projecting.error",
+            retryKey: "projecting.retry",
+            emptyKey: "projecting.empty",
+            onRetry: {{ store.send(.refreshRequested) }},
+            content: {{ projectionList }}
+        )
+    }}
+
+    private var projectionList: some View {{
+        let activeProjections: [Projection] = switch selectedTab {{
+        case .boom: store.state.filteredBoomProjections
+        case .bust: store.state.filteredBustProjections
+        }}
+        let allGrouped = Dictionary(grouping: store.state.allProjections) {{ $0.projectionTier }}
+        let grouped = Dictionary(grouping: activeProjections) {{ $0.projectionTier }}
+        let filtersActive = !store.state.searchText.isEmpty || store.state.selectedPosition != nil
+        let filteredEmpty = activeProjections.isEmpty
+
+        return VStack(spacing: 0) {{
+            SearchFilterHeader(
+                searchText: searchBinding,
+                selectedPosition: store.state.selectedPosition,
+                filterChips: ["All"] + SportPositionMap.{slug}.filterChips,
+                accessibilityPrefix: "projecting",
+                onPositionChanged: {{ store.send(.positionFilterChanged($0)) }},
+                tipsContent: {{ SearchTipsView() }}
+            )
+
+            FeatureTabBar(
+                selectedTab: $selectedTab,
+                reduceMotion: reduceMotion,
+                accessibilityPrefix: "projecting"
+            )
+
+            if filtersActive, filteredEmpty {{
+                FilteredEmptyView(messageKey: "projecting.filter.empty")
+            }} else {{
+                ScrollView {{
+                    VStack(spacing: AppSpacing.xl) {{
+                        ForEach(selectedTab.tiers, id: \\.self) {{ tier in
+                            ProjectingTierSection(
+                                tier: tier,
+                                projections: grouped[tier] ?? [],
+                                toastTier: $toastTier
+                            )
+                        }}
+                    }}
+                    .padding(.horizontal)
+                    .padding(.top, 10)
+                    .padding(.bottom, 16)
+                }}
+                .id(selectedTab)
+                .refreshable {{
+                    analytics.logEvent(AnalyticsEvent.pullToRefresh, parameters: [
+                        AnalyticsParam.feature: "projecting"
+                    ])
+                    await store.sendAsync(.refreshRequested)
+                }}
+                .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+                .overlay(alignment: .bottom) {{
+                    if let tier = toastTier {{
+                        let tierProjs = allGrouped[tier] ?? []
+                        let scores = tierProjs.map(\\.projectionScore)
+                        TierToastView(
+                            tier: tier,
+                            scoreRange: scoreRange(from: scores),
+                            playerCount: tierProjs.count
+                        )
+                        .padding(.bottom, 16)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }}
+                }}
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: toastTier)
+            }}
+        }}
+    }}
+
+    private func scoreRange(from scores: [Double]) -> ClosedRange<Double>? {{
+        guard let min = scores.min(), let max = scores.max() else {{ return nil }}
+        return min ... max
+    }}
+
+}}
+"""
+
+projecting_subviews_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - ProjectingTab
+
+enum ProjectingTab: CaseIterable, FeatureTab {
+    case boom
+    case bust
+
+    var title: String {
+        switch self {
+        case .boom: String(localized: "projecting.tab.boom", defaultValue: "Boom")
+        case .bust: String(localized: "projecting.tab.bust", defaultValue: "Bust")
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .boom: "📈"
+        case .bust: "📉"
+        }
+    }
+
+    var accentColor: Color {
+        switch self {
+        case .boom: .green
+        case .bust: .red
+        }
+    }
+
+    var tiers: [FeatureTier] {
+        switch self {
+        case .boom: [.elite, .good]
+        case .bust: [.solid, .low]
+        }
+    }
+}
+
+// MARK: - ProjectingTierSection — thin wrapper around shared TierSection
+
+struct ProjectingTierSection: View {
+    let tier: FeatureTier
+    let projections: [Projection]
+    @Binding var toastTier: FeatureTier?
+
+    var body: some View {
+        TierSection(
+            tier: tier,
+            isEmpty: projections.isEmpty,
+            emptyKey: "projecting.tier.none",
+            toastTier: $toastTier
+        ) {
+            ForEach(Array(projections.enumerated()), id: \\.element.id) { index, projection in
+                NavigationLink(value: projection) {
+                    ProjectionRowView(projection: projection)
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .accessibilityIdentifier("projection.row.\\(projection.id)")
+                if index < projections.count - 1 {
+                    Divider()
+                        .overlay(Color.white.opacity(AppOpacity.cardOverlay))
+                }
+            }
+        }
+    }
+}
+
+// MARK: - ProjectionRowView
+
+struct ProjectionRowView: View {
+    let projection: Projection
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            nameRow
+            infoRow
+            let hasBadges = projection.injuryStatus != nil || projection.isSurging
+            if hasBadges {
+                badgeRow
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var nameRow: some View {
+        HStack(spacing: 4) {
+            Text(projection.displayName)
+                .font(AppFonts.rankingName)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .layoutPriority(1)
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(AppFonts.rankingInfo)
+                .foregroundStyle(.white.opacity(AppOpacity.dim))
+        }
+    }
+
+    private var infoRow: some View {
+        HStack(spacing: 4) {
+            Text(projection.team)
+                .font(AppFonts.rankingInfo)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            if let position = projection.position {
+                infoDot
+                Text(position)
+                    .font(AppFonts.rankingInfo)
+                    .foregroundStyle(.white.opacity(AppOpacity.muted))
+            }
+            Spacer(minLength: 0)
+            Text(formattedScore)
+                .font(AppFonts.rankingScore)
+                .foregroundStyle(scoreColor)
+        }
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
+    }
+
+    private var badgeRow: some View {
+        HStack(spacing: 3) {
+            if let status = projection.injuryStatus {
+                InjuryBadge(status: status, compact: true)
+            }
+            if projection.isSurging {
+                Text("🚀")
+                    .font(AppFonts.rankingBadgeIcon)
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1)
+                    .background(Color.purple.opacity(0.15))
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            }
+        }
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
+    }
+
+    private var formattedScore: String {
+        let isBust: Bool = switch projection.projectionTier {
+        case .solid, .low: true
+        case .elite, .good: false
+        }
+        let prefix = isBust ? "-" : ""
+        return prefix + String(format: "%.0f", projection.projectionScore)
+    }
+
+    private var scoreColor: Color {
+        switch projection.projectionTier {
+        case .elite, .good: .green
+        case .solid, .low: .red
+        }
+    }
+
+    private var infoDot: some View {
+        Text("·")
+            .font(AppFonts.rankingInfo)
+            .foregroundStyle(.white.opacity(AppOpacity.muted))
+    }
+}
+"""
+
+projection_detail_view_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+struct ProjectionDetailView: View {
+    @StateObject var store: Store<ProjectionDetailState, ProjectionDetailIntent>
+
+    @State private var selectedTab = ProjectionDetailTab.outlook
+    @State private var showTierToast = false
+    @Environment(\\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\\.analytics) private var analytics
+    @State private var hasLoggedGameLog = false
+
+    private var projection: Projection {
+        store.state.projection
+    }
+
+    private var player: Player? {
+        if case let .loaded(player) = store.state.player { return player }
+        return nil
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                ProjectionDetailHeaderCard(
+                    projection: projection,
+                    showTierToast: $showTierToast
+                )
+                ProjectionScheduleCard(projection: projection)
+                ProjectionFantasyBar(player: player)
+                ProjectionDetailScoreCard(projection: projection, player: player)
+                tabBar
+                tabContent
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 6)
+            .padding(.bottom, 20)
+        }
+        .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+        .appBackground()
+        .analyticsScreen("projection_detail")
+        .overlay(alignment: .bottom) {
+            if showTierToast, let tier = projection.playerTier {
+                TierToastView(tier: tier)
+                    .padding(.bottom, 16)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(reduceMotion ? nil : .spring(duration: 0.3), value: showTierToast)
+        .appNavigationBar(title: "")
+        .task { store.send(.onAppear) }
+    }
+
+    private var tabBar: some View {
+        HStack(spacing: 0) {
+            ForEach(ProjectionDetailTab.allCases, id: \\.self) { tab in
+                tabButton(tab)
+            }
+        }
+    }
+
+    private func tabButton(_ tab: ProjectionDetailTab) -> some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                selectedTab = tab
+            }
+            analytics.logDetailedEvent(AnalyticsEvent.detailTabSwitched, parameters: [
+                AnalyticsParam.tabName: String(describing: tab),
+                AnalyticsParam.feature: "projecting",
+                AnalyticsParam.playerId: projection.id,
+                AnalyticsParam.playerTier: projection.playerTier.map(String.init(describing:)) ?? "unknown"
+            ])
+            if tab == .gameLog {
+                store.send(.gameLogTabSelected)
+            }
+        } label: {
+            VStack(spacing: 4) {
+                Text(tab.title)
+                    .font(selectedTab == tab ? AppFonts.filterChip.weight(.semibold) : AppFonts.filterChip)
+                    .foregroundStyle(
+                        selectedTab == tab ? .white : .white.opacity(AppOpacity.muted)
+                    )
+                Rectangle()
+                    .fill(selectedTab == tab ? .orange : .clear)
+                    .frame(height: 2)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityAddTraits(selectedTab == tab ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private var tabContent: some View {
+        switch selectedTab {
+        case .outlook:
+            outlookContent
+        case .gameLog:
+            gameLogContent
+        }
+    }
+
+    @ViewBuilder
+    private var outlookContent: some View {
+        ProjectionOutlookCard(projection: projection, player: player)
+        if let player {
+            PlayerDetailOverviewTrendCard(player: player)
+        }
+    }
+
+    @ViewBuilder
+    private var gameLogContent: some View {
+        switch store.state.gameLog {
+        case .idle, .loading:
+            GameLogPlaceholderView(style: .loading)
+        case let .loaded(gameLog):
+            if gameLog.entries.isEmpty {
+                GameLogPlaceholderView(style: .empty)
+            } else {
+                GameLogTableView(entries: gameLog.entries)
+                    .onAppear {
+                        guard !hasLoggedGameLog else { return }
+                        hasLoggedGameLog = true
+                        analytics.logDetailedEvent(AnalyticsEvent.gameLogViewed, parameters: [
+                            AnalyticsParam.playerId: projection.id,
+                            AnalyticsParam.feature: "projecting",
+                            AnalyticsParam.entryCount: String(gameLog.entries.count)
+                        ])
+                    }
+            }
+        case let .failed(error):
+            GameLogErrorView(error: error) {
+                store.send(.refreshRequested)
+            }
+        }
+    }
+}
+
+private enum ProjectionDetailTab: CaseIterable {
+    case outlook
+    case gameLog
+
+    var title: String {
+        switch self {
+        case .outlook: String(localized: "projectionDetail.tab.outlook", defaultValue: "Trend Overview")
+        case .gameLog: String(localized: "projectionDetail.tab.gameLog", defaultValue: "Game Log")
+        }
+    }
+}
+"""
+
+projection_detail_subviews_swift = header() + """\
+import SwiftUI
+import BKSCore
+import BKSUICore
+
+// MARK: - ProjectionDetailHeaderCard
+
+struct ProjectionDetailHeaderCard: View {
+    let projection: Projection
+    @Binding var showTierToast: Bool
+    @Environment(\\.analytics) private var analytics
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .bottom, spacing: 12) {
+                headshot
+                headerInfo
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(12)
+        .appCard()
+    }
+
+    private var headshot: some View {
+        CachedAsyncImage(url: projection.headshotURL) { phase in
+            switch phase {
+            case let .success(image):
+                image
+                    .resizable()
+                    .scaledToFill()
+                    .accessibilityIgnoresInvertColors(true)
+            default:
+                Image(systemName: "person.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.white.opacity(AppOpacity.separator))
+            }
+        }
+        .frame(width: 90, height: 105)
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.sm))
+        .overlay(
+            RoundedRectangle(cornerRadius: AppRadius.sm)
+                .stroke(.white.opacity(AppOpacity.divider), lineWidth: 1)
+        )
+    }
+
+    private var headerInfo: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(projection.displayName)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+            teamPositionRow
+            Spacer(minLength: 0)
+            tierRow
+        }
+        .frame(height: 105, alignment: .leading)
+    }
+
+    private var teamPositionRow: some View {
+        HStack(spacing: 6) {
+            Text(projection.team).fontWeight(.semibold)
+            if let position = projection.position {
+                headerPipe
+                Text(position)
+            }
+            if let status = projection.injuryStatus {
+                headerPipe
+                Text(status.rawValue).foregroundStyle(status.color)
+            }
+        }
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+    }
+
+    private var tierRow: some View {
+        HStack(spacing: 6) {
+            Text(String(format: "%.0f", projection.projectionScore))
+                .monospacedDigit()
+                .frame(width: 44, alignment: .center)
+            if let tier = projection.playerTier {
+                headerPipe
+                Button {
+                    showTierToast = true
+                    analytics.logDetailedEvent(AnalyticsEvent.tierBadgeTapped, parameters: [
+                        AnalyticsParam.tier: String(describing: tier),
+                        AnalyticsParam.feature: "projecting"
+                    ])
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                        showTierToast = false
+                    }
+                } label: {
+                    Image(systemName: tier.systemImage)
+                        .foregroundStyle(tier.color)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(String(localized: "a11y.label.showTierDetails", defaultValue: "Show tier details"))
+            }
+        }
+        .lineLimit(1)
+        .font(AppFonts.playerInfoLine)
+        .foregroundStyle(.white.opacity(AppOpacity.primary))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var headerPipe: some View {
+        Text(String(localized: "|", defaultValue: "|")).foregroundStyle(.white.opacity(AppOpacity.separator))
+    }
+}
+
+// MARK: - ProjectionScheduleCard
+
+struct ProjectionScheduleCard: View {
+    let projection: Projection
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d"
+        return formatter
+    }()
+
+    var body: some View {
+        if let games = projection.upcomingGames, !games.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(String(localized: "projectionDetail.schedule.title", defaultValue: "Next 5 Games"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(AppOpacity.secondary))
+
+                HStack(spacing: 6) {
+                    ForEach(games) { game in
+                        gameChip(game)
+                    }
+                }
+            }
+            .padding(12)
+            .appCard()
+        } else {
+            VStack(spacing: 6) {
+                Image(systemName: "calendar")
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(AppOpacity.dim))
+                Text(String(localized: "projectionDetail.schedule.comingSoon",
+                            defaultValue: "Schedule data coming soon"))
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(AppOpacity.separator))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 20)
+            .appCard()
+        }
+    }
+
+    private func gameChip(_ game: ProjectedGame) -> some View {
+        VStack(spacing: 3) {
+            Text(Self.dateFormatter.string(from: game.gameDate))
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(AppOpacity.secondary))
+            Text(game.opponentAbbr)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white)
+            Image(systemName: game.isHome ? "house.fill" : "car.fill")
+                .font(.system(size: 8))
+                .foregroundStyle(game.isHome ? .green : .white.opacity(AppOpacity.muted))
+            if let score = game.projectedScore {
+                Text(String(format: "%.0f", score))
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(strengthColor(game.opponentStrength))
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+        .background(.white.opacity(AppOpacity.faint))
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.sm))
+    }
+
+    private func strengthColor(_ strength: Double?) -> Color {
+        guard let strength else { return .white }
+        if strength >= 70 { return .red.opacity(0.9) }
+        if strength >= 50 { return .white }
+        return .green
+    }
+}
+
+// MARK: - ProjectionFantasyBar
+
+struct ProjectionFantasyBar: View {
+    let player: Player?
+
+    var body: some View {
+        HStack(spacing: 0) {
+            statColumn(
+                label: String(localized: "projectionDetail.stats.dkAvg", defaultValue: "DK Avg"),
+                value: playerValue(player?.avgFantasyScore, format: "%.1f")
+            )
+            statDivider
+            statColumn(
+                label: String(localized: "projectionDetail.stats.homeAvg", defaultValue: "Home Avg"),
+                value: playerValue(player?.avgFantasyScoreHome, format: "%.1f")
+            )
+            statDivider
+            statColumn(
+                label: String(localized: "projectionDetail.stats.awayAvg", defaultValue: "Away Avg"),
+                value: playerValue(player?.avgFantasyScoreAway, format: "%.1f")
+            )
+        }
+        .padding(.vertical, 10)
+        .appCard()
+        .accessibilityElement(children: .combine)
+    }
+
+    private func statColumn(label: String, value: String) -> some View {
+        VStack(spacing: 2) {
+            Text(label)
+                .font(AppFonts.statLabel)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            Text(value)
+                .font(AppFonts.statValue)
+                .foregroundStyle(.white)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var statDivider: some View {
+        Rectangle()
+            .fill(.white.opacity(AppOpacity.divider))
+            .frame(width: 1, height: 20)
+    }
+
+    private func playerValue(_ value: Double?, format: String) -> String {
+        guard let value else { return "—" }
+        return String(format: format, value)
+    }
+}
+
+// MARK: - ProjectionDetailScoreCard
+
+struct ProjectionDetailScoreCard: View {
+    let projection: Projection
+    let player: Player?
+
+    var body: some View {
+        HStack(spacing: 0) {
+            statColumn(
+                label: String(localized: "projection.detail.score", defaultValue: "Score"),
+                value: String(format: "%.0f", projection.projectionScore),
+                color: projection.projectionTier.color
+            )
+            statDivider
+            statColumn(
+                label: String(localized: "projection.detail.playerTier", defaultValue: "Player Tier"),
+                value: projection.playerTier?.label ?? "—",
+                color: projection.playerTier?.color ?? .white.opacity(AppOpacity.separator)
+            )
+            statDivider
+            statColumn(
+                label: String(localized: "projectionDetail.score.consistency", defaultValue: "Consistency"),
+                value: consistencyValue,
+                color: .white
+            )
+        }
+        .padding(.vertical, 10)
+        .appCard()
+        .accessibilityElement(children: .combine)
+    }
+
+    private var consistencyValue: String {
+        if let consistency = player?.consistencyScore {
+            return String(format: "%.0f%%", consistency * 100)
+        }
+        if let consistency = projection.consistencyScore {
+            return String(format: "%.0f%%", consistency * 100)
+        }
+        return "—"
+    }
+
+    private func statColumn(label: String, value: String, color: Color) -> some View {
+        VStack(spacing: 2) {
+            Text(label)
+                .font(AppFonts.statLabel)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            Text(value)
+                .font(AppFonts.statValue)
+                .foregroundStyle(color)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var statDivider: some View {
+        Rectangle()
+            .fill(.white.opacity(AppOpacity.divider))
+            .frame(width: 1, height: 20)
+    }
+}
+
+// MARK: - ProjectionOutlookCard
+
+struct ProjectionOutlookCard: View {
+    let projection: Projection
+    let player: Player?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            let rows = buildRows()
+            ForEach(Array(rows.enumerated()), id: \\.offset) { index, item in
+                if index > 0 { rowDivider }
+                signalRow(label: item.label, value: item.value, color: item.color)
+            }
+        }
+        .padding(.bottom, 4)
+        .appCard()
+    }
+
+    private struct SignalRow {
+        let label: String
+        let value: String
+        let color: Color
+    }
+
+    // swiftlint:disable:next function_body_length
+    private func buildRows() -> [SignalRow] {
+        var rows: [SignalRow] = []
+
+        rows.append(SignalRow(
+            label: String(localized: "projection.detail.surging", defaultValue: "Surging"),
+            value: projection.isSurging
+                ? String(localized: "projection.detail.yes", defaultValue: "Yes")
+                : String(localized: "projection.detail.no", defaultValue: "No"),
+            color: projection.isSurging ? .green : .white.opacity(AppOpacity.separator)
+        ))
+
+        if let direction = projection.trendDirection {
+            let (display, color): (String, Color) = switch direction {
+            case .up:
+                (String(localized: "projectionDetail.outlook.trendUp", defaultValue: "Trending Up"), .green)
+            case .down:
+                (String(localized: "projectionDetail.outlook.trendDown", defaultValue: "Trending Down"), .red)
+            case .flat, .neutral:
+                (String(localized: "projectionDetail.outlook.trendFlat", defaultValue: "Flat"),
+                 .white.opacity(AppOpacity.separator))
+            }
+            rows.append(SignalRow(
+                label: String(localized: "projectionDetail.outlook.trend", defaultValue: "Trend"),
+                value: display,
+                color: color
+            ))
+        }
+
+        if let confidence = projection.confidenceScore {
+            rows.append(SignalRow(
+                label: String(localized: "projectionDetail.outlook.confidence", defaultValue: "Confidence"),
+                value: String(format: "%.0f%%", confidence * 100),
+                color: .white
+            ))
+        }
+
+        let consistency = projection.consistencyScore ?? player?.consistencyScore
+        if let consistency {
+            rows.append(SignalRow(
+                label: String(localized: "projectionDetail.outlook.consistency", defaultValue: "Consistency"),
+                value: String(format: "%.0f%%", consistency * 100),
+                color: .white
+            ))
+        }
+
+        if let strength = projection.avgOpponentStrength {
+            rows.append(SignalRow(
+                label: String(localized: "projectionDetail.outlook.oppStrength", defaultValue: "Avg Opp Strength"),
+                value: String(format: "%.0f", strength),
+                color: strength >= 70 ? .red : strength <= 45 ? .green : .white
+            ))
+        }
+
+        return rows
+    }
+
+    private func signalRow(label: String, value: String, color: Color) -> some View {
+        HStack {
+            Text(label).font(.caption2).foregroundStyle(.white.opacity(AppOpacity.secondary))
+            Spacer()
+            Text(value).font(.caption2.weight(.semibold).monospacedDigit()).foregroundStyle(color)
+        }.padding(.horizontal, 14).padding(.vertical, 8)
+    }
+
+    private var rowDivider: some View {
+        Divider().background(.white.opacity(AppOpacity.hairline)).padding(.leading, AppPadding.contentInner)
+    }
+}
+"""
+
+write(os.path.join(projecting_views_dir, "ProjectingView.swift"), projecting_view_swift)
+write(os.path.join(projecting_views_dir, "ProjectingSubviews.swift"), projecting_subviews_swift)
+write(os.path.join(projecting_views_dir, "ProjectionDetailView.swift"), projection_detail_view_swift)
+write(os.path.join(projecting_views_dir, "ProjectionDetailSubviews.swift"), projection_detail_subviews_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. project.yml  (XcodeGen spec)
@@ -2040,33 +7861,87 @@ print()
 print(f"✅ Scaffolded {app_name} at:")
 print(f"   {out_dir}")
 print()
-print("Swift source files:")
-print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
+print("Bootstrap:")
+print(f"  App/Sources/App/Bootstrap/{type_prefix}App.swift")
+print(f"  App/Sources/App/Bootstrap/AppShell.swift")
+print(f"  App/Sources/App/Bootstrap/DependencyContainer.swift")
+print(f"  App/Sources/App/Bootstrap/Authentication.swift")
+print(f"  App/Sources/App/Bootstrap/FirebaseAnalyticsAdapter.swift")
+print(f"  App/Sources/App/Bootstrap/TrendRefreshTask.swift")
+print()
+print("Models:")
+print(f"  App/Sources/Core/Models/Player.swift")
+print(f"  App/Sources/Core/Models/Opportunity.swift")
+print(f"  App/Sources/Core/Models/Projection.swift")
+print(f"  App/Sources/Core/Models/TodaySchedule.swift")
+print(f"  App/Sources/Core/Models/GameEntry.swift")
+print()
+print("Services:")
+print(f"  App/Sources/Core/Services/TrendingsService.swift")
+print(f"  App/Sources/Core/Services/OpportunitiesService.swift")
+print(f"  App/Sources/Core/Services/ProjectionsService.swift")
+print(f"  App/Sources/Core/Services/GamesService.swift")
+print()
+print("Sport configuration:")
 print(f"  App/Sources/Core/Sport/ScoringCalculator.swift")
 print(f"  App/Sources/Core/Sport/SportPositionMap.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration.swift")
 print(f"  App/Sources/Core/Sport/SportPositionMap+{swift_name}.swift")
 print(f"  App/Sources/Core/Sport/{calc_name}.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
-print(f"  App/Sources/Core/UI/TierThresholds+{swift_name}.swift")
-print(f"  App/Sources/Core/Models/GameEntry.swift")
-print(f"  App/Sources/Features/Trending/Views/GameLogViews.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+Environment.swift")
-print(f"  App/Sources/App/Bootstrap/{type_prefix}App.swift")
-print(f"  App/Sources/App/Bootstrap/DependencyContainer.swift")
-print(f"  App/Sources/App/Bootstrap/Authentication.swift")
-print(f"  App/Sources/App/Bootstrap/FirebaseAnalyticsAdapter.swift")
-print(f"  App/Sources/App/Bootstrap/TrendRefreshTask.swift")
+print()
+print("Core UI & Utilities:")
+print(f"  App/Sources/Core/UI/TierThresholds+{swift_name}.swift")
+print(f"  App/Sources/Core/UI/TierTypes+UI.swift")
+print(f"  App/Sources/Core/UI/SearchTipsView.swift")
+print(f"  App/Sources/Core/UI/SeasonModeBanner.swift")
+print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
+print(f"  App/Sources/Core/Utilities/Filterable+{swift_name}.swift")
+print(f"  App/Sources/Core/Utilities/PlayerLookup.swift")
+print()
+print("Trending feature:")
+print(f"  App/Sources/Features/Trending/Store/TrendingState.swift")
+print(f"  App/Sources/Features/Trending/Store/TrendingIntent.swift")
+print(f"  App/Sources/Features/Trending/Store/PlayerDetailState.swift")
+print(f"  App/Sources/Features/Trending/Store/PlayerDetailIntent.swift")
+print(f"  App/Sources/Features/Trending/Views/TrendingView.swift")
+print(f"  App/Sources/Features/Trending/Views/TrendingSubviews.swift")
+print(f"  App/Sources/Features/Trending/Views/PlayerRowView.swift")
+print(f"  App/Sources/Features/Trending/Views/PlayerDetailView.swift")
+print(f"  App/Sources/Features/Trending/Views/PlayerDetailSubviews.swift")
+print(f"  App/Sources/Features/Trending/Views/PlayerDetailOverviewView.swift")
+print(f"  App/Sources/Features/Trending/Views/GameLogViews.swift")
+print()
+print("Prospecting feature:")
+print(f"  App/Sources/Features/Prospecting/Store/ProspectingState.swift")
+print(f"  App/Sources/Features/Prospecting/Store/ProspectingIntent.swift")
+print(f"  App/Sources/Features/Prospecting/Store/OpportunityDetailState.swift")
+print(f"  App/Sources/Features/Prospecting/Store/OpportunityDetailIntent.swift")
+print(f"  App/Sources/Features/Prospecting/Views/ProspectingView.swift")
+print(f"  App/Sources/Features/Prospecting/Views/ProspectingSubviews.swift")
+print(f"  App/Sources/Features/Prospecting/Views/OpportunityRowView.swift")
+print(f"  App/Sources/Features/Prospecting/Views/OpportunityDetailView.swift")
+print(f"  App/Sources/Features/Prospecting/Views/OpportunityDetailSubviews.swift")
+print()
+print("Projecting feature:")
+print(f"  App/Sources/Features/Projecting/Store/ProjectingState.swift")
+print(f"  App/Sources/Features/Projecting/Store/ProjectingIntent.swift")
+print(f"  App/Sources/Features/Projecting/Store/ProjectionDetailState.swift")
+print(f"  App/Sources/Features/Projecting/Store/ProjectionDetailIntent.swift")
+print(f"  App/Sources/Features/Projecting/Views/ProjectingView.swift")
+print(f"  App/Sources/Features/Projecting/Views/ProjectingSubviews.swift")
+print(f"  App/Sources/Features/Projecting/Views/ProjectionDetailView.swift")
+print(f"  App/Sources/Features/Projecting/Views/ProjectionDetailSubviews.swift")
 print()
 print("Project infrastructure:")
-print(f"  App/project.yml                                  ← XcodeGen spec (packages, targets, schemes)")
-print(f"  App/<AppName>.xcodeproj/.../swiftpm/Package.resolved  ← pre-pinned SPM versions (no 'Missing package' errors)")
-print(f"  App/Config/Base.xcconfig                         ← shared build settings")
-print(f"  App/Config/Debug.xcconfig                        ← gitignored; pre-filled with placeholders, add real secrets")
-print(f"  App/Config/Debug.xcconfig.template               ← committed template (no secrets)")
-print(f"  App/Config/Release.xcconfig                      ← gitignored; pre-filled with placeholders, add real secrets")
-print(f"  App/Config/Release.xcconfig.template             ← committed template (no secrets)")
-print(f"  App/Tests/.gitkeep                               ← placeholder so XcodeGen sees the Tests/ source path")
+print(f"  App/project.yml")
+print(f"  App/Config/Base.xcconfig")
+print(f"  App/Config/Debug.xcconfig                        ← gitignored; add real secrets")
+print(f"  App/Config/Debug.xcconfig.template")
+print(f"  App/Config/Release.xcconfig                      ← gitignored; add real secrets")
+print(f"  App/Config/Release.xcconfig.template")
+print(f"  App/Tests/.gitkeep")
 print(f"  App/Config/{app_target}Tests.xcconfig")
 print(f"  App/Sources/App/Resources/Info.plist")
 print(f"  App/Sources/App/Resources/Configuration.plist    ← runtime API URLs")
@@ -2078,16 +7953,9 @@ print(f"  .swiftformat")
 print(f"  .gitignore")
 print()
 print("Next steps:")
-print(f"  1. Copy Bootstrap/ source files from BKS-Basketball-Client-iOS and adapt to {swift_name}:")
-print(f"       {app_target}App.swift, AppShell.swift, DependencyContainer.swift,")
-print(f"       TrendRefreshTask.swift, Authentication.swift, FirebaseAnalyticsAdapter.swift")
-print(f"  2. In DependencyContainer.swift: SportConfiguration.basketball → .{slug}")
-print(f"  3. In {app_target}App.swift: .sportConfiguration(.basketball) → .{slug}")
-print(f"  4. Copy service files from BKS-Basketball-Client-iOS/App/Sources/Core/Services/ and adapt")
-print(f"  5. Copy feature Views/ and Store/ from BKS-Basketball-Client-iOS and adapt")
-print(f"  6. Replace App/Sources/App/Resources/GoogleService-Info.plist with real Firebase config")
-print(f"  7. Fill in teamAbbreviationByID in SportConfiguration+{swift_name}.swift")
-print(f"  8. Fill in real API keys in App/Config/Debug.xcconfig (gitignored)")
+print(f"  1. Replace App/Sources/App/Resources/GoogleService-Info.plist with real Firebase config")
+print(f"  2. Fill in teamAbbreviationByID in SportConfiguration+{swift_name}.swift")
+print(f"  3. Fill in real API keys in App/Config/Debug.xcconfig (gitignored)")
 PYEOF
 
 # ── copy shared assets ────────────────────────────────────────────────────────
