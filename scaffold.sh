@@ -8658,6 +8658,118 @@ PROJECTGEN.md
 write(os.path.join(out_dir, ".gitignore"), gitignore)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 18. CLAUDE.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Build position filter group names for the source structure comment
+position_labels = ", ".join(p["label"] for p in positions)
+
+claude_md = f"""# CLAUDE.md
+
+## Project Overview
+iOS app built with Swift and SwiftUI, targeting iOS {deploy_tgt}+. Uses Swift Package Manager for dependencies.
+
+## Build & Test Commands
+- **Build**: `xcodebuild -scheme MyApp -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'`
+- **Test**: `xcodebuild test -scheme MyApp -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'`
+- **Lint**: `swiftlint`
+- **Regenerate project**: `./generate.sh` (from repo root — runs xcodegen then syncs both Package.resolved files)
+  - **Never** run `xcodegen generate` directly; always use `./generate.sh` to keep the inner and outer Package.resolved in sync
+
+## Code Standards
+- Use async/await for all new concurrency code (no Combine for new work)
+- All view models must be `@Observable` classes
+- No force unwraps (`!`) outside of test files
+- All public APIs must have doc comments
+- Follow Swift naming conventions (camelCase properties, PascalCase types)
+- Prefer value types (structs/enums) unless reference semantics are needed
+- Run `swiftlint` before completing any task
+
+## Localization
+- All user-visible strings **must** use `String(localized:defaultValue:)` with a descriptive key and an English default value
+- Keys follow the pattern `feature.context.name` (e.g., `profile.row.analytics`, `dataNotice.title`)
+- The string catalog is at `Sources/App/Resources/Localizable.xcstrings`
+- Supported languages: **en**, **fr-CA**, **es** — when adding new strings, add translations for all three languages in the `.xcstrings` file
+- Accessibility labels and hints (`a11y.*`) follow the same rules — they must have `defaultValue:` and entries in the string catalog
+- **Never** use bare `String(localized: "some.key")` without `defaultValue:` — it renders the raw key if the catalog entry is missing
+
+## Template Origin
+
+This project was scaffolded by the **BKS-Sports-iOS** code generator:
+
+https://github.com/bkatnich/BKS-Sports-iOS
+
+The generator takes `sports/{slug}.yaml` and produces the sport-specific Swift files. If the generator's templates change, re-run `./scaffold.sh {slug}` from the template repo to regenerate those files.
+
+## Architecture
+- **Pattern**: MVI (Store/Reduce unidirectional data flow) via BKSCore
+- **Navigation**: NavigationStack with typed destinations
+- **DI**: Swinject container bootstrapped at app launch; `SportConfiguration` injected via SwiftUI `.environment()`
+
+### Source Structure
+```
+Sources/
+├── App/           — Composition root ({type_prefix}App, AppShell, DependencyContainer)
+├── Core/
+│   ├── Services/  — Network services (TrendingsService, OpportunitiesService, ProjectionsService, GamesService)
+│   ├── Models/    — Domain models (Player, Opportunity, Projection, GameEntry, TodaySchedule)
+│   ├── Sport/     — Multi-sport abstraction (SportConfiguration, SportPositionMap, ScoringCalculator)
+│   ├── Utilities/ — Shared helpers (Filterable, ConfigurationKeys, PlayerLookup)
+│   └── UI/        — Shared views (TierTypes+UI, TierThresholds, SearchTipsView, SeasonModeBanner)
+└── Features/
+    ├── Trending/
+    │   ├── Views/ — TrendingView, PlayerDetailView, PlayerRowView, GameLogViews
+    │   └── Store/ — TrendingState, TrendingIntent, PlayerDetailState, PlayerDetailIntent
+    ├── Prospecting/
+    │   ├── Views/ — ProspectingView, OpportunityDetailView, OpportunityRowView
+    │   └── Store/ — ProspectingState, ProspectingIntent, OpportunityDetailState, OpportunityDetailIntent
+    └── Projecting/
+        ├── Views/ — ProjectingView, ProjectionDetailView
+        └── Store/ — ProjectingState, ProjectingIntent, ProjectionDetailState, ProjectionDetailIntent
+```
+
+### Agent ownership boundaries
+- **Core/Services/ + Core/Models/**: Data Agent
+- **Core/Sport/ + Core/Utilities/ + Core/UI/**: whichever agent's task requires it; coordinate if both need changes
+- **Features/*/Views/**: UI Agent
+- **Features/*/Store/**: UI Agent (state) or Data Agent (service wiring)
+- **Tests/**: Test Agent
+
+## Xcode Project Protection
+- **NEVER** remove or modify the `FIRAAppCheckDebugToken` environment variable from any Xcode scheme. This is the Firebase App Check debug token required for API access in debug builds. Deleting it breaks all authenticated network calls.
+- **NEVER** change the Development Team identifier (`DEVELOPMENT_TEAM`) in `project.yml` or the Xcode project settings. This is tied to the signing certificate and provisioning profiles.
+
+## Multi-Agent Workflow
+
+### When to use agents
+- Feature work spanning UI + data layers → spawn separate agents per layer
+- Bug investigation with unclear cause → spawn parallel research agents with competing hypotheses
+- Any PR touching 3+ modules → use agent team
+- Simple single-file changes → handle directly, no agents needed
+
+### Agent ownership boundaries
+Each agent owns a distinct set of files. Two agents must never edit the same file.
+- **UI Agent**: `Sources/Features/*/Views/`
+- **Data Agent**: `Sources/Core/Services/`, `Sources/Core/Models/`
+- **Test Agent**: `Tests/`
+- Shared code (`Sources/Core/Sport/`, `Sources/Core/Utilities/`, `Sources/Core/UI/`) is owned by whichever agent's task requires the change; coordinate via the lead if both need changes
+
+### Workflow stages
+1. **Research** — Read-only agents investigate in parallel. No file writes.
+2. **Plan** — Lead synthesizes findings and assigns implementation tasks with clear file ownership.
+3. **Implement** — Agents work in isolated worktrees. Each agent runs `swiftlint` before finishing.
+4. **Verify** — Verification agent runs full test suite and reviews diffs. Must pass before merge.
+
+### Rules
+- Always use `isolation: "worktree"` for implementation agents
+- Always spawn a verification agent after implementation completes
+- Research agents must be read-only
+- If an agent encounters a build failure it cannot resolve in 2 attempts, report back to lead rather than continuing
+"""
+
+write(os.path.join(out_dir, "CLAUDE.md"), claude_md)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -8761,6 +8873,7 @@ print(f"  App/Sources/App/Resources/GoogleService-Info.plist  ← placeholder, r
 print(f"  .swiftlint.yml")
 print(f"  .swiftformat")
 print(f"  .gitignore")
+print(f"  CLAUDE.md")
 print()
 print("Next steps:")
 print(f"  1. Replace App/Sources/App/Resources/GoogleService-Info.plist with real Firebase config")

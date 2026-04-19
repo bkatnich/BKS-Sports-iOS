@@ -35,7 +35,7 @@ The YAML spec drives everything — no changes to `scaffold.sh` are needed for a
 
 1. **Parses** `sports/<slug>.yaml` via `pyyaml`
 2. **Validates** required fields: `name`, `slug`, `prefix`, `appName`, `bundleId`, `platform`, `swiftVersion`, `xcodeVersion`, `scoring`, `positions`, `tiers`, `gameLog`, `api`
-3. **Generates 7 Swift files** into the output app directory:
+3. **Generates 7 Swift files + CLAUDE.md** into the output app directory:
 
 | File | Destination | Purpose |
 |------|-------------|---------|
@@ -46,6 +46,7 @@ The YAML spec drives everything — no changes to `scaffold.sh` are needed for a
 | `TierThresholds+<Sport>.swift` | `App/Sources/Views/` | UI tier display thresholds |
 | `GameEntry.swift` | `App/Sources/Models/` | Game stat model + `PlayerGameLog` aggregate |
 | `GameLogViews.swift` | `App/Sources/Features/Trending/` | SwiftUI game log table and placeholder views |
+| `CLAUDE.md` | repo root | Claude Code project instructions (build commands, architecture, agent workflow) |
 
 ## YAML Spec Structure
 
