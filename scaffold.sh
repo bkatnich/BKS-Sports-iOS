@@ -8701,6 +8701,8 @@ https://github.com/bkatnich/BKS-Sports-iOS
 
 The generator takes `sports/{slug}.yaml` and produces the sport-specific Swift files. If the generator's templates change, re-run `./scaffold.sh {slug}` from the template repo to regenerate those files.
 
+**Do NOT** automatically propagate changes from this project back to the template repo. Always ask for explicit permission before modifying files in the BKS-Sports-iOS generator.
+
 ## Architecture
 - **Pattern**: MVI (Store/Reduce unidirectional data flow) via BKSCore
 - **Navigation**: NavigationStack with typed destinations
