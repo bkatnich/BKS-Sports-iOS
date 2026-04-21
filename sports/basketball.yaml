@@ -142,14 +142,14 @@ packages:
     from: "1.0.1"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.0.4"
+    from: "1.0.17"
   swinject:
     url: https://github.com/Swinject/Swinject.git
     from: "2.9.0"
   firebaseSDK:
     url: https://github.com/firebase/firebase-ios-sdk.git
     from: "11.0.0"
-  firebaseProducts: [FirebaseAnalytics, FirebaseAuth, FirebaseAppCheck, FirebaseFirestore]
+  firebaseProducts: [FirebaseAnalytics, FirebaseAuth, FirebaseAppCheck, FirebaseFirestore, FirebaseMessaging, FirebaseInAppMessaging-Beta]
 
 # ---------------------------------------------------------------------------
 # API endpoints and field lists per service
@@ -224,6 +224,9 @@ api:
       lookahead: 5
       platform: dk
       mode: gpp
+
+  redeemPromoCode:
+    url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/redeem_promo_code
 
   leagueState:
     url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_league_state
