@@ -19,7 +19,7 @@
 #   <Calculator>.swift  (ScoringCalculator implementation)
 #   SportConfiguration+<Sport>.swift
 #   TierThresholds+<Sport>.swift
-#   GameEntry.swift, GameLogViews.swift
+#   GameLogViews.swift
 #   Features/Board/ — BoardEntry, BoardEntryBuilder, BoardState, BoardIntent, BoardView (stubs)
 #   Features/Profile/ — ProfileContainerView, NotificationsDetailView
 #   workspace.yml, generate.sh, project.yml, xcconfig files, Info.plist, storekit stub
@@ -421,151 +421,6 @@ extension ScoringCalculator where Self == {calc_name} {{
 write(os.path.join(out_dir, "App/Sources/Core/Sport", f"{calc_name}.swift"), calc_file)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. GameEntry.swift
-# ─────────────────────────────────────────────────────────────────────────────
-
-stat_fields  = gamelog.get("stats", [])
-averages     = gamelog.get("averages", [])
-percentages  = gamelog.get("percentages", [])
-dnp_cond     = gamelog.get("isDNPCondition", 'minutes == "0" || minutes.isEmpty')
-
-# stat declarations
-stat_decls = "\n".join([f"    let {s['key']}: {s['type']}" for s in stat_fields])
-
-# init params
-init_params = "\n".join([f"        {s['key']}: {s['type']}," for s in stat_fields])
-
-# init assignments
-init_assigns = "\n".join([f"        self.{s['key']} = {s['key']}" for s in stat_fields])
-
-# averages
-def avg_block(a):
-    k = a["key"]
-    src = a["sourceKey"]
-    d0 = chr(36) + "0"
-    d1 = chr(36) + "1"
-    return f"""\
-    var {k}: Double {{
-        guard !entries.isEmpty else {{ return 0 }}
-        return Double(entries.reduce(0) {{ {d0} + {d1}.{src} }}) / Double(entries.count)
-    }}
-"""
-
-# percentages
-def pct_block(p):
-    k = p["key"]
-    made = p["madeKey"]
-    att  = p["attemptedKey"]
-    d0 = chr(36) + "0"
-    d1 = chr(36) + "1"
-    return f"""\
-    var {k}: Double {{
-        let totalMade = entries.reduce(0) {{ {d0} + {d1}.{made} }}
-        let totalAttempted = entries.reduce(0) {{ {d0} + {d1}.{att} }}
-        guard totalAttempted > 0 else {{ return 0 }}
-        return Double(totalMade) / Double(totalAttempted) * 100
-    }}
-"""
-
-avg_blocks = "\n".join([avg_block(a) for a in averages])
-pct_blocks = "\n".join([pct_block(p) for p in percentages])
-
-game_entry = header() + f"""\
-import Foundation
-
-// MARK: - GameResult
-
-enum GameResult: Codable, Equatable {{
-    case win(teamScore: Int, opponentScore: Int)
-    case loss(teamScore: Int, opponentScore: Int)
-
-    var isWin: Bool {{
-        if case .win = self {{ return true }}
-        return false
-    }}
-
-    private var scores: (team: Int, opponent: Int) {{
-        switch self {{
-        case let .win(team, opponent): (team, opponent)
-        case let .loss(team, opponent): (team, opponent)
-        }}
-    }}
-
-    var displayScore: String {{
-        "\\\\(scores.team)-\\\\(scores.opponent)"
-    }}
-}}
-
-// MARK: - GameEntry
-
-struct GameEntry: Codable, Equatable, Identifiable {{
-    var id: String {{ gameID }}
-
-    let gameID: String
-    let gameDate: Date
-    let opponent: String
-    let opponentAbbreviation: String
-    let isHomeGame: Bool
-    let result: GameResult
-
-{stat_decls}
-    let plusMinus: String
-
-    init(
-        gameID: String,
-        gameDate: Date,
-        opponent: String,
-        opponentAbbreviation: String,
-        isHomeGame: Bool,
-        result: GameResult,
-{init_params}
-        plusMinus: String
-    ) {{
-        self.gameID = gameID
-        self.gameDate = gameDate
-        self.opponent = opponent
-        self.opponentAbbreviation = opponentAbbreviation
-        self.isHomeGame = isHomeGame
-        self.result = result
-{init_assigns}
-        self.plusMinus = plusMinus
-    }}
-}}
-
-// MARK: - GameEntry Helpers
-
-extension GameEntry {{
-    /// True when the player did not participate in the game.
-    var isDNP: Bool {{
-        {dnp_cond}
-    }}
-}}
-
-// MARK: - PlayerGameLog
-
-struct PlayerGameLog: Codable, Equatable {{
-    let playerID: String
-    let entries: [GameEntry]
-    let fetchedAt: Date
-}}
-
-extension PlayerGameLog {{
-{avg_blocks}
-{pct_blocks}
-}}
-
-// MARK: - TeamScheduleCache
-
-struct TeamScheduleCache: Codable {{
-    let teamID: String
-    let completedGameIDs: [String]
-    let fetchedAt: Date
-}}
-"""
-
-write(os.path.join(out_dir, "App/Sources/Core/Models/GameEntry.swift"), game_entry)
-
-# ─────────────────────────────────────────────────────────────────────────────
 # 5. TierThresholds+<Sport>.swift
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -926,43 +781,6 @@ write(os.path.join(out_dir, "App/Sources/Features/Board/Views/GameLogViews.swift
 # 8c. SportConfiguration.swift  (base struct — app-side, not in BKSCore)
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. SportConfiguration+Environment.swift
-#    Defines the SwiftUI EnvironmentKey for SportConfiguration.
-#    This is app-side code — not part of BKSCore or BKSUICore.
-# ─────────────────────────────────────────────────────────────────────────────
-
-sport_config_env = header() + f"""\
-import SwiftUI
-
-// MARK: - EnvironmentKey
-
-private struct SportConfigurationKey: EnvironmentKey {{
-    static let defaultValue: SportConfiguration = .{slug}
-}}
-
-// MARK: - EnvironmentValues
-
-extension EnvironmentValues {{
-    /// The active sport configuration injected into the SwiftUI environment.
-    var sportConfiguration: SportConfiguration {{
-        get {{ self[SportConfigurationKey.self] }}
-        set {{ self[SportConfigurationKey.self] = newValue }}
-    }}
-}}
-
-// MARK: - View Helper
-
-extension View {{
-    /// Injects a `SportConfiguration` into the SwiftUI environment.
-    func sportConfiguration(_ config: SportConfiguration) -> some View {{
-        environment(\\.sportConfiguration, config)
-    }}
-}}
-"""
-
-write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportConfiguration+Environment.swift"), sport_config_env)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8d. Bootstrap files  (App/Sources/App/Bootstrap/)
@@ -1844,145 +1662,8 @@ struct Projection: Codable, Equatable, Hashable, Identifiable, Filterable {
     }
 }
 
-// MARK: - PlayFadeRecommendation
-
-enum PlayFadeRecommendation: String, Codable, Equatable, Hashable {
-    case play
-    case fade
-    case neutral
-}
-
-// MARK: - ProjectedGame
-
-struct ProjectedGame: Codable, Equatable, Hashable, Identifiable {
-    let id: String
-    let gameDate: Date
-    let opponentAbbr: String
-    let isHome: Bool
-    let opponentStrength: Double?
-    let projectedScoreDk: Double?
-    let projectedScoreFd: Double?
-    let fpFloorDk: Double?
-    let fpFloorFd: Double?
-    let fpCeilingDk: Double?
-    let fpCeilingFd: Double?
-    let playFadeRecommendation: PlayFadeRecommendation?
-
-    init(
-        id: String,
-        gameDate: Date,
-        opponentAbbr: String,
-        isHome: Bool,
-        opponentStrength: Double? = nil,
-        projectedScoreDk: Double? = nil,
-        projectedScoreFd: Double? = nil,
-        fpFloorDk: Double? = nil,
-        fpFloorFd: Double? = nil,
-        fpCeilingDk: Double? = nil,
-        fpCeilingFd: Double? = nil,
-        playFadeRecommendation: PlayFadeRecommendation? = nil
-    ) {
-        self.id = id
-        self.gameDate = gameDate
-        self.opponentAbbr = opponentAbbr
-        self.isHome = isHome
-        self.opponentStrength = opponentStrength
-        self.projectedScoreDk = projectedScoreDk
-        self.projectedScoreFd = projectedScoreFd
-        self.fpFloorDk = fpFloorDk
-        self.fpFloorFd = fpFloorFd
-        self.fpCeilingDk = fpCeilingDk
-        self.fpCeilingFd = fpCeilingFd
-        self.playFadeRecommendation = playFadeRecommendation
-    }
-}
 """
 
-today_schedule_swift = header() + """\
-import Foundation
-
-// MARK: - TodaySchedule
-
-struct TodaySchedule: Codable, Equatable {
-    /// Date string in "yyyy-MM-dd" format, determined in Eastern Time by the server.
-    let date: String
-    let gameCount: Int
-    let games: [ScheduledGame]
-
-    /// `true` when the server reports at least one game scheduled today.
-    /// `false` means either no games today or the sync hasn't run yet — both treated the same.
-    var hasGames: Bool { gameCount > 0 }
-}
-
-// MARK: - ScheduledGame
-
-struct ScheduledGame: Codable, Equatable, Identifiable {
-    let id: Int
-    let homeTeamAbbr: String
-    let visitorTeamAbbr: String
-    let status: String
-    let gameType: String
-    let gameDatetime: Date
-}
-"""
-
-playoff_series_swift = header() + """\
-import Foundation
-
-// MARK: - PlayoffSeries
-
-struct PlayoffSeries: Codable, Equatable, Hashable, Identifiable {
-    let seriesID: String
-    let roundNumber: Int
-    let roundName: String
-    let conference: String
-    let higherSeedTeam: String
-    let lowerSeedTeam: String
-    let higherSeed: Int
-    let lowerSeed: Int
-    let winsHigherSeed: Int
-    let winsLowerSeed: Int
-    let status: SeriesStatus
-    let winner: String?
-    let gamesPlayed: Int
-    let eliminationGameNext: Bool
-    let homeCourt: [String: Bool]
-
-    var id: String { seriesID }
-
-    /// Returns true if the higher-seed team is home for the next game.
-    var isHigherSeedHomeNext: Bool? {
-        homeCourt["\\(gamesPlayed + 1)"]
-    }
-}
-
-// MARK: - SeriesStatus
-
-enum SeriesStatus: String, Codable, Equatable, Hashable {
-    case scheduled
-    case active
-    case completed
-}
-"""
-
-league_state_swift = header() + """\
-import Foundation
-
-/// Top-level league/season state fetched from the server.
-/// `SeasonMode` is defined in Opportunity.swift and shared here.
-struct LeagueState: Codable, Equatable {
-    let mode: SeasonMode
-    let playoffRound: Int?
-    let playoffStartDate: String?
-    let regularSeasonEndDate: String?
-    let season: Int?
-}
-"""
-
-write(os.path.join(models_dir, "Player.swift"), player_swift)
-write(os.path.join(models_dir, "Opportunity.swift"), opportunity_swift)
-write(os.path.join(models_dir, "Projection.swift"), projection_swift)
-write(os.path.join(models_dir, "TodaySchedule.swift"), today_schedule_swift)
 write(os.path.join(models_dir, "PlayoffSeries.swift"), playoff_series_swift)
 write(os.path.join(models_dir, "LeagueState.swift"), league_state_swift)
 
@@ -3434,109 +3115,7 @@ extension FeatureTier {
 }
 """
 
-search_tips_view_swift = header() + """\
-import SwiftUI
-
-/// Sport-specific search tips popover content.
-struct SearchTipsView: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(String(localized: "trending.searchTips.title", defaultValue: "Search Tips"))
-                .font(.subheadline.weight(.semibold))
-            VStack(alignment: .leading, spacing: 6) {
-                searchTipRow(
-                    icon: "person.fill",
-                    label: String(localized: "trending.searchTips.playerName", defaultValue: "Player Name"),
-                    example: String(localized: "trending.searchTips.playerName.example", defaultValue: "e.g. Shohei")
-                )
-                searchTipRow(
-                    icon: "tshirt.fill",
-                    label: String(localized: "trending.searchTips.teamAbbr", defaultValue: "Team Abbreviation"),
-                    example: String(localized: "trending.searchTips.teamAbbr.example", defaultValue: "e.g. LAD")
-                )
-                searchTipRow(
-                    icon: "building.2.fill",
-                    label: String(localized: "trending.searchTips.teamName", defaultValue: "Team Name"),
-                    example: String(localized: "trending.searchTips.teamName.example", defaultValue: "e.g. Dodgers")
-                )
-                searchTipRow(
-                    icon: "line.3.horizontal.decrease.circle.fill",
-                    label: String(localized: "trending.searchTips.position", defaultValue: "Position"),
-                    example: String(localized: "trending.searchTips.position.example", defaultValue: "e.g. SP")
-                )
-            }
-        }
-        .font(.caption)
-        .foregroundStyle(.primary)
-        .padding()
-        .frame(width: 260)
-    }
-
-    private func searchTipRow(icon: String, label: String, example: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: icon)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(label)
-                    .font(.caption.weight(.medium))
-                Text(example)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-}
-"""
-
-season_mode_banner_swift = header() + """\
-import BKSCore
-import BKSUICore
-import SwiftUI
-
-struct SeasonModeBanner: View {
-    let mode: SeasonMode
-
-    var body: some View {
-        switch mode {
-        case .regularSeason:
-            EmptyView()
-        case .playoffs:
-            bannerCapsule(
-                icon: "trophy.fill",
-                text: String(localized: "seasonMode.playoffs", defaultValue: "Playoffs"),
-                color: .orange
-            )
-        case .offseason:
-            bannerCapsule(
-                icon: "moon.fill",
-                text: String(localized: "seasonMode.offseason", defaultValue: "Offseason"),
-                color: .gray
-            )
-        }
-    }
-
-    private func bannerCapsule(icon: String, text: String, color: Color) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-            Text(text)
-        }
-        .font(.caption.weight(.medium))
-        .foregroundStyle(.white)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(color.opacity(0.85))
-        .clipShape(Capsule())
-        .padding(.top, 4)
-        .accessibilityLabel(text)
-    }
-}
-"""
-
 write(os.path.join(core_ui_dir, "TierTypes+UI.swift"), tier_types_ui_swift)
-write(os.path.join(core_ui_dir, "SearchTipsView.swift"), search_tips_view_swift)
-write(os.path.join(core_ui_dir, "SeasonModeBanner.swift"), season_mode_banner_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9e. Core Utilities
@@ -4980,12 +4559,12 @@ Sources/
 ├── App/           — Composition root ({type_prefix}App, AppShell, DependencyContainer)
 ├── Core/
 │   ├── Services/  — Sport-specific implementations (OpportunitiesService, ProjectionsService, GamesService)
-│   ├── Models/    — Domain models (Player, Opportunity, Projection, GameEntry, TodaySchedule)
+│   ├── Models/    — Domain models (Player, Opportunity, Projection, PlayoffSeries, LeagueState)
 │   ├── Sport/     — Sport extensions (SportConfiguration+<Sport>, SportPositionMap+<Sport>, <Calc>)
 │   │              — Base types (SportConfiguration, SportPositionMap, ScoringCalculator) live in BKSCore
 │   ├── Utilities/ — Shared helpers (ConfigurationKeys, VisiblePushEvent, NotificationPreferenceKey)
 │   │              — (Filterable, PlayerLookup, PushNotificationNames) live in BKSCore
-│   └── UI/        — Shared views (TierTypes+UI, TierThresholds, SearchTipsView, SeasonModeBanner)
+│   └── UI/        — Shared views (TierTypes+UI, TierThresholds)
 └── Features/
     ├── Board/          — Primary sport feature (stub — customise post-generation)
     │   ├── Models/ — BoardEntry, BoardEntryBuilder
@@ -5124,8 +4703,6 @@ print("Models:")
 print(f"  App/Sources/Core/Models/Player.swift")
 print(f"  App/Sources/Core/Models/Opportunity.swift")
 print(f"  App/Sources/Core/Models/Projection.swift")
-print(f"  App/Sources/Core/Models/TodaySchedule.swift")
-print(f"  App/Sources/Core/Models/GameEntry.swift")
 print(f"  App/Sources/Core/Models/PlayoffSeries.swift")
 print(f"  App/Sources/Core/Models/LeagueState.swift")
 print()
@@ -5138,13 +4715,10 @@ print("Sport configuration (BKSCore owns base types; scaffold generates sport ex
 print(f"  App/Sources/Core/Sport/SportPositionMap+{swift_name}.swift")
 print(f"  App/Sources/Core/Sport/{calc_name}.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
-print(f"  App/Sources/Core/Sport/SportConfiguration+Environment.swift")
 print()
 print("Core UI & Utilities:")
 print(f"  App/Sources/Core/UI/TierThresholds+{swift_name}.swift")
 print(f"  App/Sources/Core/UI/TierTypes+UI.swift")
-print(f"  App/Sources/Core/UI/SearchTipsView.swift")
-print(f"  App/Sources/Core/UI/SeasonModeBanner.swift")
 print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
 print(f"  App/Sources/Core/Utilities/VisiblePushEvent.swift")
 print(f"  App/Sources/Core/Utilities/NotificationPreferenceKey+{swift_name}.swift")
