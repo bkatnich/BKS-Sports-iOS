@@ -245,12 +245,6 @@ import Foundation
 enum VisiblePushEvent: String {{
 {cases_block}
 }}
-
-// MARK: - PushNotificationNames
-
-enum PushNotificationNames {{
-    static let visiblePushTapped = Notification.Name("{bundle_id}.visiblePushTapped")
-}}
 """
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", "VisiblePushEvent.swift"), visible_push_swift)
@@ -924,94 +918,14 @@ struct GameLogErrorView: View {{
 write(os.path.join(out_dir, "App/Sources/Features/Board/Views/GameLogViews.swift"), gamelog_views)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8a. ScoringCalculator.swift  (protocol — app-side, not in BKSCore)
+# 8b. SportPositionMap+<Sport>.swift  (BKSCore owns SportPositionMap base struct)
 # ─────────────────────────────────────────────────────────────────────────────
 
-scoring_calculator_proto = header() + f"""\
-import Foundation
-
-/// Computes a DFS fantasy score for a single game entry.
-///
-/// Each sport/platform combination provides its own implementation.
-protocol ScoringCalculator {{
-    /// Returns the DFS fantasy score for the given game entry stats.
-    func score(for entry: GameEntry) -> Double
-}}
-"""
-
-write(os.path.join(out_dir, "App/Sources/Core/Sport", "ScoringCalculator.swift"), scoring_calculator_proto)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8b. SportPositionMap.swift  (base struct — app-side, not in BKSCore)
-# ─────────────────────────────────────────────────────────────────────────────
-
-sport_position_map_base = header() + f"""\
-import Foundation
-
-/// Maps broad UI chip labels to the raw position strings returned by the API,
-/// enabling sport-agnostic position filtering.
-struct SportPositionMap {{
-    let filterChips: [String]
-    private let terms: [String: [String]]
-
-    init(filterChips: [String], terms: [String: [String]]) {{
-        self.filterChips = filterChips
-        self.terms = terms
-    }}
-
-    func matchesChip(_ chip: String?, position: String?) -> Bool {{
-        guard let chip else {{ return true }}
-        guard let position, !position.isEmpty else {{ return false }}
-        guard let chipTerms = terms[chip] else {{ return false }}
-        let pos = position.lowercased()
-        for term in chipTerms where pos == term.lowercased() {{ return true }}
-        if pos.contains("-") {{
-            let parts = pos.split(separator: "-").map {{ $0.lowercased() }}
-            for part in parts {{
-                for term in chipTerms where part == term.lowercased() {{ return true }}
-            }}
-        }}
-        return false
-    }}
-}}
-"""
-
-write(os.path.join(out_dir, "App/Sources/Core/Sport", "SportPositionMap.swift"), sport_position_map_base)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8c. SportConfiguration.swift  (base struct — app-side, not in BKSCore)
 # ─────────────────────────────────────────────────────────────────────────────
 
-sport_config_base = header() + f"""\
-import BKSCore
-import BKSUICore
-
-// MARK: - SportConfiguration
-
-/// Centralises all sport-specific values used by services, views, and reducers.
-struct SportConfiguration {{
-    let slug: String
-    let cacheKeyPrefix: String
-    let positionMap: SportPositionMap
-    let scoringCalculator: any ScoringCalculator
-    let tierThresholds: [TierLevel: [TierThreshold]]
-    let trendingFields: [String]
-    let opportunityFields: [String]
-    let opportunityParams: OpportunityParams
-    let projectionParams: ProjectionParams
-    let teamAbbreviationByID: [Int: String]
-
-    func teamAbbreviation(for teamID: Int) -> String {{
-        teamAbbreviationByID[teamID] ?? ""
-    }}
-
-    func thresholds(for level: TierLevel) -> [TierThreshold] {{
-        tierThresholds[level] ?? []
-    }}
-}}
-"""
-
-write(os.path.join(out_dir, "App/Sources/Core/Sport", "SportConfiguration.swift"), sport_config_base)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. SportConfiguration+Environment.swift
@@ -2582,7 +2496,6 @@ private struct OpportunityDTO: Decodable {{
 }}
 """
 
-write(os.path.join(services_dir, "TrendingsService.swift"), trendings_service_swift)
 write(os.path.join(services_dir, "OpportunitiesService.swift"), opportunities_service_swift)
 
 projections_service_swift = header() + f"""\
@@ -3445,7 +3358,6 @@ private struct SeriesDTO: Decodable {{
 
 write(os.path.join(services_dir, "ProjectionsService.swift"), projections_service_swift)
 write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
-write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9d. Core UI files
@@ -3632,80 +3544,6 @@ write(os.path.join(core_ui_dir, "SeasonModeBanner.swift"), season_mode_banner_sw
 
 utilities_dir = os.path.join(out_dir, "App/Sources/Core/Utilities")
 
-filterable_swift = header() + """\
-import Foundation
-import BKSCore
-
-// MARK: - Injury availability
-
-extension Filterable where Self: InjuryTracking {
-    /// Returns `true` when the player is out or doubtful and should be
-    /// excluded from active lists.
-    var isUnavailable: Bool {
-        switch injuryStatus {
-        case .out, .doubtful: true
-        default: false
-        }
-    }
-}
-
-/// Domain models that carry an injury status conform to this protocol
-/// so the generic `isUnavailable` logic can apply.
-protocol InjuryTracking {
-    var injuryStatus: InjuryStatus? { get }
-}
-
-extension Player: InjuryTracking {}
-extension Opportunity: InjuryTracking {}
-extension Projection: InjuryTracking {}
-
-// MARK: - Position-aware filtering
-
-extension Array where Element: Filterable {
-    /// Filters the array by search text and position chip.
-    /// Pass the sport's `SportPositionMap` to control which raw position
-    /// strings each chip label matches.
-    func filtered(search: String, chip: String?, positionMap: SportPositionMap) -> [Element] {
-        filter { item in
-            let matchesSearch: Bool = {
-                guard !search.isEmpty else { return true }
-                if item.displayName.localizedCaseInsensitiveContains(search) { return true }
-                if item.team.localizedCaseInsensitiveContains(search) { return true }
-                for field in item.additionalSearchFields
-                    where field.localizedCaseInsensitiveContains(search) { return true }
-                return false
-            }()
-            let matchesPosition = positionMap.matchesChip(chip, position: item.position)
-            return matchesSearch && matchesPosition
-        }
-    }
-}
-"""
-
-player_lookup_swift = header() + """\
-import Foundation
-
-/// Finds a `Player` record from an array by `externalPersonID` (preferred)
-/// or `displayName` + `team` fallback. Sport-agnostic — works for any sport
-/// whose player model carries an optional external data-provider ID.
-enum PlayerLookup {
-    static func find(
-        externalPersonID: Int?,
-        displayName: String,
-        team: String,
-        in players: [Player]
-    ) -> Player? {
-        if let personID = externalPersonID,
-           let match = players.first(where: { $0.externalPersonID == personID }) {
-            return match
-        }
-        return players.first { $0.displayName == displayName && $0.team == team }
-    }
-}
-"""
-
-write(os.path.join(utilities_dir, f"Filterable+{swift_name}.swift"), filterable_swift)
-write(os.path.join(utilities_dir, "PlayerLookup.swift"), player_lookup_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # 9f. Board Feature
@@ -5141,10 +4979,12 @@ The generator takes `sports/{slug}.yaml` and produces the sport-specific Swift f
 Sources/
 ├── App/           — Composition root ({type_prefix}App, AppShell, DependencyContainer)
 ├── Core/
-│   ├── Services/  — Network services (TrendingsService, OpportunitiesService, ProjectionsService, GamesService)
+│   ├── Services/  — Sport-specific implementations (OpportunitiesService, ProjectionsService, GamesService)
 │   ├── Models/    — Domain models (Player, Opportunity, Projection, GameEntry, TodaySchedule)
-│   ├── Sport/     — Multi-sport abstraction (SportConfiguration, SportPositionMap, ScoringCalculator)
-│   ├── Utilities/ — Shared helpers (Filterable, ConfigurationKeys, PlayerLookup)
+│   ├── Sport/     — Sport extensions (SportConfiguration+<Sport>, SportPositionMap+<Sport>, <Calc>)
+│   │              — Base types (SportConfiguration, SportPositionMap, ScoringCalculator) live in BKSCore
+│   ├── Utilities/ — Shared helpers (ConfigurationKeys, VisiblePushEvent, NotificationPreferenceKey)
+│   │              — (Filterable, PlayerLookup, PushNotificationNames) live in BKSCore
 │   └── UI/        — Shared views (TierTypes+UI, TierThresholds, SearchTipsView, SeasonModeBanner)
 └── Features/
     ├── Board/          — Primary sport feature (stub — customise post-generation)
@@ -5289,17 +5129,12 @@ print(f"  App/Sources/Core/Models/GameEntry.swift")
 print(f"  App/Sources/Core/Models/PlayoffSeries.swift")
 print(f"  App/Sources/Core/Models/LeagueState.swift")
 print()
-print("Services:")
-print(f"  App/Sources/Core/Services/TrendingsService.swift")
+print("Services (sport-specific implementations — protocols in BKSCore):")
 print(f"  App/Sources/Core/Services/OpportunitiesService.swift")
 print(f"  App/Sources/Core/Services/ProjectionsService.swift")
 print(f"  App/Sources/Core/Services/GamesService.swift")
-print(f"  App/Sources/Core/Services/PlayoffService.swift")
 print()
-print("Sport configuration:")
-print(f"  App/Sources/Core/Sport/ScoringCalculator.swift")
-print(f"  App/Sources/Core/Sport/SportPositionMap.swift")
-print(f"  App/Sources/Core/Sport/SportConfiguration.swift")
+print("Sport configuration (BKSCore owns base types; scaffold generates sport extensions):")
 print(f"  App/Sources/Core/Sport/SportPositionMap+{swift_name}.swift")
 print(f"  App/Sources/Core/Sport/{calc_name}.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
@@ -5314,8 +5149,6 @@ print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
 print(f"  App/Sources/Core/Utilities/VisiblePushEvent.swift")
 print(f"  App/Sources/Core/Utilities/NotificationPreferenceKey+{swift_name}.swift")
 print(f"  App/Sources/Core/Utilities/NotificationPreferenceKey+FCM.swift")
-print(f"  App/Sources/Core/Utilities/Filterable+{swift_name}.swift")
-print(f"  App/Sources/Core/Utilities/PlayerLookup.swift")
 print()
 print("Board feature (stub — add sport-specific logic post-generation):")
 print(f"  App/Sources/Features/Board/Models/BoardEntry.swift")
