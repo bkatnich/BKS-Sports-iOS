@@ -118,11 +118,13 @@ def header(year=2026):
 # 1. ConfigurationKeys+<Sport>.swift
 # ─────────────────────────────────────────────────────────────────────────────
 
+players_api      = api.get("players", {})
 opps_api         = api.get("opportunities", {})
 proj_api         = api.get("projections", {})
 today_api        = api.get("todayGames", {})
 gamelog_api      = api.get("gameLog", {})
 
+players_url      = players_api.get("url", "")
 opps_url         = opps_api.get("url", "")
 proj_url         = proj_api.get("url", "")
 today_url        = today_api.get("url", "")
@@ -178,6 +180,10 @@ config_keys += f"""\
         name: "gameLogBaseURL",
         defaultValue: "{gamelog_base}"
     )
+    static let getPlayersURL = ConfigurationKey(
+        name: "getPlayersURL",
+        defaultValue: "{players_url}"
+    )
     static let getOpportunitiesURL = ConfigurationKey(
         name: "getOpportunitiesURL",
         defaultValue: "{opps_url}"
@@ -208,6 +214,102 @@ enum SubscriptionProductID {{
 """
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"ConfigurationKeys+{swift_name}.swift"), config_keys)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b. VisiblePushEvent.swift
+#     Visible (banner) push notification event types for this sport.
+#     Cases drive deep-link routing in AppDelegate.handleNotificationTap.
+# ─────────────────────────────────────────────────────────────────────────────
+
+visible_push_events = fcm.get("visiblePushEvents", [
+    {"name": "seriesClinch",    "rawValue": "series_clinch"},
+    {"name": "champion",        "rawValue": "champion"},
+    {"name": "eliminationGame", "rawValue": "elimination_game"},
+    {"name": "bracketAdvance",  "rawValue": "bracket_advance"},
+])
+
+cases_block = "\n".join(
+    f'    case {e["name"]:<18} = "{e["rawValue"]}"'
+    for e in visible_push_events
+)
+
+visible_push_swift = header() + f"""\
+import Foundation
+
+// MARK: - VisiblePushEvent
+
+/// Visible push notification event types for the {name} app.
+/// These are banner notifications — the app handles taps for deep-link routing.
+enum VisiblePushEvent: String {{
+{cases_block}
+}}
+
+// MARK: - PushNotificationNames
+
+enum PushNotificationNames {{
+    static let visiblePushTapped = Notification.Name("{bundle_id}.visiblePushTapped")
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Utilities", "VisiblePushEvent.swift"), visible_push_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1c. NotificationPreferenceKey+<Sport>.swift
+#     Sport-specific notification preference key and accessor.
+# ─────────────────────────────────────────────────────────────────────────────
+
+notif_pref_key_swift = header() + f"""\
+import BKSCore
+
+// MARK: - {name} notification preference key
+
+extension NotificationPreferenceKey {{
+    /// Playoff series/elimination alerts — {slug}-specific.
+    public static let playoffAlerts = NotificationPreferenceKey(rawValue: "playoff_alerts")
+}}
+
+// MARK: - {name} preference accessors
+
+extension NotificationPreferences {{
+    /// Playoff alerts preference. Stored in `sportPreferences["playoff_alerts"]`.
+    public var playoffAlerts: Bool? {{
+        get {{ sportPreferences[NotificationPreferenceKey.playoffAlerts.rawValue] }}
+        set {{ sportPreferences[NotificationPreferenceKey.playoffAlerts.rawValue] = newValue }}
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"NotificationPreferenceKey+{swift_name}.swift"), notif_pref_key_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1d. NotificationPreferenceKey+FCM.swift
+#     Maps raw FCM event strings → preference keys for this sport.
+# ─────────────────────────────────────────────────────────────────────────────
+
+fcm_cases = "\n".join(
+    f'        case "{e["rawValue"]}":'
+    for e in visible_push_events
+)
+
+notif_fcm_swift = header() + f"""\
+import BKSCore
+
+extension NotificationPreferenceKey {{
+    /// Maps FCM event strings to preference keys for the {name} app.
+    /// Sport-specific playoff events are handled here; core events delegate to BKSCore.
+    init?(fcmEvent: String) {{
+        switch fcmEvent {{
+{fcm_cases}
+            self = .playoffAlerts
+        default:
+            guard let key = NotificationPreferenceKey(coreEvent: fcmEvent) else {{ return nil }}
+            self = key
+        }}
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Utilities", "NotificationPreferenceKey+FCM.swift"), notif_fcm_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. SportPositionMap extension
@@ -7961,10 +8063,6 @@ SWIFT_VERSION = {swift_ver}
 SDKROOT = iphoneos
 PRODUCT_NAME = $(TARGET_NAME)
 
-// Versioning
-MARKETING_VERSION = 0.0.1
-CURRENT_PROJECT_VERSION = 1
-
 // App target
 ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
 CODE_SIGN_ENTITLEMENTS = Sources/App/Resources/{app_target}.entitlements
@@ -8022,12 +8120,18 @@ GCC_WARN_UNUSED_FUNCTION = YES
 GCC_WARN_UNUSED_VARIABLE = YES
 """
 
+version_xcconfig = """\
+MARKETING_VERSION = 0.0.1
+CURRENT_PROJECT_VERSION = 1
+"""
+
 debug_template = f"""\
 // Debug.xcconfig — development configuration
 // Copy this file to Debug.xcconfig and fill in your secret values.
 // Debug.xcconfig is gitignored — do NOT commit it.
 
 #include "Base.xcconfig"
+#include "Version.xcconfig"
 
 // Debug build settings
 GCC_OPTIMIZATION_LEVEL = 0
@@ -8053,6 +8157,7 @@ release_template = f"""\
 // Release.xcconfig is gitignored — do NOT commit it.
 
 #include "Base.xcconfig"
+#include "Version.xcconfig"
 
 // Release build settings
 SWIFT_OPTIMIZATION_LEVEL = -O
@@ -8081,6 +8186,7 @@ TEST_HOST = $(BUILT_PRODUCTS_DIR)/{app_target}.app/{app_target}
 """
 
 write(os.path.join(out_dir, "App/Config/Base.xcconfig"), base_xcconfig)
+write(os.path.join(out_dir, "App/Config/Version.xcconfig"), version_xcconfig)
 write(os.path.join(out_dir, "App/Config/Debug.xcconfig.template"), debug_template)
 write(os.path.join(out_dir, "App/Config/Release.xcconfig.template"), release_template)
 write(os.path.join(out_dir, f"App/Config/{app_target}Tests.xcconfig"), tests_xcconfig)
@@ -8249,20 +8355,12 @@ config_plist = f"""\
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-\t<key>featureFlagsEnabled</key>
-\t<false/>
-\t<key>networkTimeoutSeconds</key>
-\t<real>30</real>
 \t<key>gameLogBaseURL</key>
 \t<string>{gamelog_base}</string>
-\t<key>getPlayersURL</key>
-\t<string>{players_url}</string>
+\t<key>opportunitiesIncludeResting</key>
+\t<true/>
 \t<key>getOpportunitiesURL</key>
 \t<string>{opps_url}</string>
-\t<key>gradientTopColor</key>
-\t<string>0.05,0.3,0.65</string>
-\t<key>gradientBottomColor</key>
-\t<string>0.01,0.04,0.1</string>
 </dict>
 </plist>
 """
@@ -8952,6 +9050,9 @@ print(f"  App/Sources/Core/UI/TierTypes+UI.swift")
 print(f"  App/Sources/Core/UI/SearchTipsView.swift")
 print(f"  App/Sources/Core/UI/SeasonModeBanner.swift")
 print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
+print(f"  App/Sources/Core/Utilities/VisiblePushEvent.swift")
+print(f"  App/Sources/Core/Utilities/NotificationPreferenceKey+{swift_name}.swift")
+print(f"  App/Sources/Core/Utilities/NotificationPreferenceKey+FCM.swift")
 print(f"  App/Sources/Core/Utilities/Filterable+{swift_name}.swift")
 print(f"  App/Sources/Core/Utilities/PlayerLookup.swift")
 print()
@@ -8995,6 +9096,7 @@ print()
 print("Project infrastructure:")
 print(f"  App/project.yml")
 print(f"  App/Config/Base.xcconfig")
+print(f"  App/Config/Version.xcconfig")
 print(f"  App/Config/Debug.xcconfig                        ← gitignored; add real secrets")
 print(f"  App/Config/Debug.xcconfig.template")
 print(f"  App/Config/Release.xcconfig                      ← gitignored; add real secrets")
