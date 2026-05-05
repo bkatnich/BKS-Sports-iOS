@@ -7829,7 +7829,7 @@ bkscore_from  = pkg.get("bkscore",   {}).get("from", "1.0.1")
 bksuicore_from = pkg.get("bksuicore", {}).get("from", "1.0.16")
 swinject_from = pkg.get("swinject",  {}).get("from", "2.9.0")
 firebase_from = pkg.get("firebaseSDK", {}).get("from", "11.0.0")
-firebase_products = pkg.get("firebaseProducts", ["FirebaseAnalytics", "FirebaseAuth", "FirebaseAppCheck", "FirebaseFirestore"])
+firebase_products = pkg.get("firebaseProducts", ["FirebaseAnalytics", "FirebaseAuth", "FirebaseAppCheck", "FirebaseFirestore", "FirebaseMessaging", "FirebaseInAppMessaging-Beta"])
 
 firebase_deps = "\n".join(
     [f"      - package: FirebaseSDK\n        product: {p}" for p in firebase_products]
@@ -7926,6 +7926,7 @@ targets:
       - path: Sources/App/Resources/PrivacyInfo.xcprivacy
       - path: Sources/App/Resources/Configuration.plist
       - path: Sources/App/Resources/GoogleService-Info.plist
+      - path: Sources/App/Resources/{app_target}.storekit
 
   {app_target}Tests:
     type: bundle.unit-test
@@ -8104,7 +8105,7 @@ info_plist = f"""\
 \t<string>$(APP_ENVIRONMENT)</string>
 \t<key>BGTaskSchedulerPermittedIdentifiers</key>
 \t<array>
-\t\t<string>{bundle_id}.trendrefresh</string>
+\t\t<string>{bundle_id}.datarefresh</string>
 \t</array>
 \t<key>CFBundleDevelopmentRegion</key>
 \t<string>en</string>
@@ -8124,6 +8125,8 @@ info_plist = f"""\
 \t<string>$(MARKETING_VERSION)</string>
 \t<key>CFBundleVersion</key>
 \t<string>$(CURRENT_PROJECT_VERSION)</string>
+\t<key>FirebaseAppDelegateProxyEnabled</key>
+\t<false/>
 \t<key>FirebaseDataCollectionDefaultEnabled</key>
 \t<true/>
 \t<key>GameLogAPIKey</key>
@@ -8141,6 +8144,7 @@ info_plist = f"""\
 \t<array>
 \t\t<string>fetch</string>
 \t\t<string>processing</string>
+\t\t<string>remote-notification</string>
 \t</array>
 \t<key>UILaunchScreen</key>
 \t<dict>
@@ -8377,6 +8381,71 @@ google_service = f"""\
 """
 
 write(os.path.join(out_dir, "App/Sources/App/Resources/GoogleService-Info.plist"), google_service)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14b. StoreKit configuration stub
+# ─────────────────────────────────────────────────────────────────────────────
+
+storekit_stub = f"""\
+{{
+  "identifier" : "_{bundle_id}",
+  "nonConsumableIAP" : [
+
+  ],
+  "nonRenewingSubscriptionIAP" : [
+
+  ],
+  "products" : [
+
+  ],
+  "settings" : {{
+
+  }},
+  "subscriptionGroups" : [
+    {{
+      "id" : "REPLACE_WITH_APP_STORE_GROUP_ID",
+      "localizations" : [
+
+      ],
+      "name" : "{sub_group}",
+      "subscriptions" : [
+        {{
+          "adHocOfferCodesAllowed" : true,
+          "displayPrice" : "2.99",
+          "familySharable" : false,
+          "groupNumber" : 1,
+          "internalID" : "REPLACE_WITH_INTERNAL_ID",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {{
+              "description" : "{app_name} subscription",
+              "displayName" : "{app_name}",
+              "locale" : "en_US"
+            }}
+          ],
+          "offerCodes" : [
+
+          ],
+          "paymentMode" : "SUBSCRIPTION",
+          "productID" : "{sub_product_id}",
+          "promotionalOffers" : [
+
+          ],
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "{app_name} Basic Monthly",
+          "subscriptionGroupID" : "REPLACE_WITH_APP_STORE_GROUP_ID",
+          "type" : "RecurringSubscription"
+        }}
+      ]
+    }}
+  ],
+  "version" : {{
+    "formatVersion" : 2
+  }}
+}}
+"""
+
+write(os.path.join(out_dir, f"App/Sources/App/Resources/{app_target}.storekit"), storekit_stub)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 15. .swiftlint.yml
@@ -8938,6 +9007,7 @@ print(f"  App/Sources/App/Resources/Configuration.plist    ← runtime API URLs"
 print(f"  App/Sources/App/Resources/{app_target}.entitlements")
 print(f"  App/Sources/App/Resources/PrivacyInfo.xcprivacy")
 print(f"  App/Sources/App/Resources/GoogleService-Info.plist  ← placeholder, replace with real Firebase config")
+print(f"  App/Sources/App/Resources/{app_target}.storekit   ← replace REPLACE_WITH_* values with real App Store IDs")
 print(f"  .swiftlint.yml")
 print(f"  .swiftformat")
 print(f"  .gitignore")
