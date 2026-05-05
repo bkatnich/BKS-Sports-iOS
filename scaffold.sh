@@ -118,24 +118,25 @@ def header(year=2026):
 # 1. ConfigurationKeys+<Sport>.swift
 # ─────────────────────────────────────────────────────────────────────────────
 
-players_api      = api.get("players", {})
 opps_api         = api.get("opportunities", {})
 proj_api         = api.get("projections", {})
 today_api        = api.get("todayGames", {})
 gamelog_api      = api.get("gameLog", {})
-league_state_api = api.get("leagueState", {})
-bracket_api      = api.get("playoffBracket", {})
-promo_api        = api.get("redeemPromoCode", {})
 
-players_url      = players_api.get("url", "")
 opps_url         = opps_api.get("url", "")
 proj_url         = proj_api.get("url", "")
 today_url        = today_api.get("url", "")
 gamelog_base     = gamelog_api.get("baseURL", "")
 api_key_needed   = gamelog_api.get("apiKeyRequired", False)
-league_state_url = league_state_api.get("url", "")
-bracket_url      = bracket_api.get("url", "")
-promo_url        = promo_api.get("url", "")
+
+fcm             = spec.get("fcm", {})
+fcm_gameday     = fcm.get("gamedayTopic", "gameday")
+fcm_playoff     = fcm.get("playoffTopic", f"{slug}")
+
+subscription    = spec.get("subscription", {})
+sub_suffix      = subscription.get("productSuffix", "basic.monthly")
+sub_group       = subscription.get("groupID", f"{type_prefix}Subscriptions")
+sub_product_id  = f"{bundle_id}.{sub_suffix}"
 
 config_keys = header() + f"""\
 import Foundation
@@ -143,7 +144,26 @@ import BKSCore
 
 // MARK: - {name}-specific configuration keys
 
+extension ConfigurationKey where Value == Bool {{
+    static let opportunitiesIncludeResting = ConfigurationKey(
+        name: "opportunitiesIncludeResting",
+        defaultValue: false
+    )
+}}
+
 extension ConfigurationKey where Value == String {{
+    static let vegasBookPreference = ConfigurationKey(
+        name: "vegasBookPreference",
+        defaultValue: "dk"
+    )
+    static let fcmGamedayTopic = ConfigurationKey(
+        name: "fcmGamedayTopic",
+        defaultValue: "{fcm_gameday}"
+    )
+    static let fcmPlayoffTopic = ConfigurationKey(
+        name: "fcmPlayoffTopic",
+        defaultValue: "{fcm_playoff}"
+    )
 """
 if api_key_needed:
     config_keys += f"""\
@@ -158,10 +178,6 @@ config_keys += f"""\
         name: "gameLogBaseURL",
         defaultValue: "{gamelog_base}"
     )
-    static let getPlayersURL = ConfigurationKey(
-        name: "getPlayersURL",
-        defaultValue: "{players_url}"
-    )
     static let getOpportunitiesURL = ConfigurationKey(
         name: "getOpportunitiesURL",
         defaultValue: "{opps_url}"
@@ -174,18 +190,20 @@ config_keys += f"""\
         name: "getProjectionsURL",
         defaultValue: "{proj_url}"
     )
-    static let getLeagueStateURL = ConfigurationKey(
-        name: "getLeagueStateURL",
-        defaultValue: "{league_state_url}"
-    )
-    static let getPlayoffBracketURL = ConfigurationKey(
-        name: "getPlayoffBracketURL",
-        defaultValue: "{bracket_url}"
-    )
-    static let redeemPromoCodeURL = ConfigurationKey(
-        name: "redeemPromoCodeURL",
-        defaultValue: "{promo_url}"
-    )
+}}
+
+// MARK: - Background task identifier
+
+enum DataRefreshTaskID {{
+    static let identifier = "{bundle_id}.datarefresh"
+}}
+
+// MARK: - Subscription product IDs
+
+enum SubscriptionProductID {{
+    static let basicMonthly = "{sub_product_id}"
+    static let subscriptionGroupID = "{sub_group}"
+    static var allCurrentProductIDs: Set<String> {{ [basicMonthly] }}
 }}
 """
 
@@ -946,16 +964,9 @@ write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportConfiguration+Envir
 # ─────────────────────────────────────────────────────────────────────────────
 
 bootstrap_app = header() + f"""\
-// swiftlint:disable file_length
-
 import BackgroundTasks
 import BKSCore
 import BKSUICore
-import FirebaseAnalytics
-import FirebaseAppCheck
-import FirebaseCore
-import FirebaseInAppMessaging
-import FirebaseMessaging
 import OSLog
 import SwiftUI
 import Swinject
@@ -964,7 +975,6 @@ import UserNotifications
 
 @main
 struct {type_prefix}App: App {{
-    /// Register app delegate for Firebase setup
     @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
 
     private static let logger = Logger(
@@ -979,90 +989,92 @@ struct {type_prefix}App: App {{
 
     @StateObject private var networkMonitor = NetworkMonitor()
 
-    private let trendingsService: TrendingsServiceProtocol
     private let opportunitiesService: OpportunitiesServiceProtocol
     private let projectionsService: ProjectionsServiceProtocol
     private let gamesService: GamesServiceProtocol
     private let promoCodeService: PromoCodeServiceProtocol
+    private let activityService: any ActivityFeedServiceProtocol
     private let configuration: ConfigurationProtocol
-    private let auth: AuthenticationProtocol
+    private let storage: StorageProtocol
     private let analyticsAdapter = FirebaseAnalyticsAdapter()
     private let metricsCollector: MetricsCollectorProtocol
+    private let subscriptionService: SubscriptionService
+
+    @State private var splashDismissed = false
+    @State private var pendingConsentResult: AuthResult?
+    @State private var isErasingCache = false
 
     init() {{
-        Self.logLaunchDiagnostics()
+        BKSAppScaffold.logLaunchDiagnostics(logger: Self.logger)
 
-        let container = Container.defaultContainer()
+        let appDelegate = UIApplication.shared.delegate as? AppDelegate
+        let container = appDelegate?.container ?? Container.defaultContainer()
 
         let resolvedAuth = container.require(Store<AuthState, AuthIntent>.self)
         authStore = resolvedAuth
+        boardStore = container.require(Store<BoardState, BoardIntent>.self)
 
-        let resolvedBoard = container.require(Store<BoardState, BoardIntent>.self)
-        boardStore = resolvedBoard
-
-        let resolvedAuth2 = container.require(AuthenticationProtocol.self)
-        auth = resolvedAuth2
-
-        profileStore = Self.makeProfileStore(container: container, authStore: resolvedAuth, auth: resolvedAuth2)
-
+        let auth = container.require(AuthenticationProtocol.self)
         configuration = container.require(ConfigurationProtocol.self)
-        trendingsService = container.require(TrendingsServiceProtocol.self)
-        opportunitiesService = container.require(OpportunitiesServiceProtocol.self)
-        projectionsService = container.require(ProjectionsServiceProtocol.self)
-        gamesService = container.require(GamesServiceProtocol.self)
+        storage = container.require(StorageProtocol.self)
+
+        (opportunitiesService, projectionsService, gamesService) = Self.resolveSportServices(from: container)
+
         promoCodeService = container.require(PromoCodeServiceProtocol.self)
+        activityService = container.require(ActivityFeedServiceProtocol.self)
         metricsCollector = container.require(MetricsCollectorProtocol.self)
         metricsCollector.startCollecting()
 
-        // Store container on AppDelegate so silent push can resolve services
-        (UIApplication.shared.delegate as? AppDelegate)?.container = container
+        let resolvedSubscription = container.require(SubscriptionService.self)
+        subscriptionService = resolvedSubscription
+        subscriptionService.startTransactionListener()
 
-        signInStore = Self.makeSignInStore(
+        let opps = opportunitiesService
+        let projs = projectionsService
+        let games = gamesService
+
+        profileStore = BKSAppScaffold.makeProfileStore(
             container: container,
             authStore: resolvedAuth,
-            trendingsService: trendingsService,
-            opportunitiesService: opportunitiesService,
-            projectionsService: projectionsService,
-            gamesService: gamesService
-        )
+            auth: auth
+        ) {{ prefs in
+            AppDelegate.notificationPreferences = prefs
+            let svc = container.require(UserPreferencesServiceProtocol.self)
+            try? await svc.updatePreferences(prefs)
+        }}
 
+        signInStore = BKSAppScaffold.makeSignInStore(
+            container: container,
+            authStore: resolvedAuth
+        ) {{
+            Task {{ await Self.prefetch(opps: opps, projs: projs, games: games) }}
+        }}
+
+        Self.registerDataRefresh(opps: opps, projs: projs, games: games)
+    }}
+
+    private static func registerDataRefresh(
+        opps: OpportunitiesServiceProtocol,
+        projs: ProjectionsServiceProtocol,
+        games: GamesServiceProtocol
+    ) {{
         DataRefreshTask.register(
-            trendingsService: trendingsService,
-            opportunitiesService: opportunitiesService,
-            projectionsService: projectionsService,
-            gamesService: gamesService
+            identifier: DataRefreshTaskID.identifier,
+            fetchOpportunities: {{ _ = try await opps.fetchOpportunities(includeResting: true) }},
+            fetchProjections:   {{ _ = try await projs.fetchProjections() }},
+            fetchSchedule:      {{ _ = try await games.fetchTodaySchedule() }}
         )
     }}
 
-    private static func logLaunchDiagnostics() {{
-        let bundle = Bundle.main
-        let appName = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Unknown"
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
-        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        let bundleID = bundle.bundleIdentifier ?? "Unknown"
-        let device = UIDevice.current
-        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
-
-        #if DEBUG
-            let configuration = "DEBUG"
-        #else
-            let configuration = "RELEASE"
-        #endif
-
-        logger.info(\"\"\"
-        App Launch — \\(appName, privacy: .public) \\
-        v\\(version, privacy: .public) (\\(build, privacy: .public)) \\
-        [\\(configuration, privacy: .public)]
-        \"\"\")
-        logger.info(\"\"\"
-        Device — \\(device.model, privacy: .public) · \\
-        \\(device.systemName, privacy: .public) \\(osVersion, privacy: .public)
-        \"\"\")
-        logger.debug("Bundle ID — \\(bundleID, privacy: .public)")
+    private static func resolveSportServices(
+        from container: Container
+    ) -> (OpportunitiesServiceProtocol, ProjectionsServiceProtocol, GamesServiceProtocol) {{
+        (
+            container.require(OpportunitiesServiceProtocol.self),
+            container.require(ProjectionsServiceProtocol.self),
+            container.require(GamesServiceProtocol.self)
+        )
     }}
-
-    @State private var splashDismissed = false
-    @State private var pendingSignUpResult: AuthResult?
 
     private var authSessionResolved: Bool {{
         if case .undetermined = authStore.state.session {{ return false }}
@@ -1071,104 +1083,81 @@ struct {type_prefix}App: App {{
 
     var body: some Scene {{
         WindowGroup {{
-            rootView
-                .environmentObject(networkMonitor)
-                .appConfiguration(configuration)
-                .sportConfiguration(.{slug})
-                .analytics(analyticsAdapter)
-                .task {{
-                    authStore.send(.checkStoredCredential)
-                    profileStore.send(.onAppear)
-                    await prefetchAllData()
-                    await Self.registerForPushNotifications()
-                }}
-                .onReceive(
-                    NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
-                ) {{ _ in
-                    analyticsAdapter.logEvent(AnalyticsEvent.appBackgrounded, parameters: nil)
-                    DataRefreshTask.scheduleIfNeeded()
-                }}
-                .onReceive(
-                    NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
-                ) {{ _ in
-                    analyticsAdapter.logEvent(AnalyticsEvent.appForegrounded, parameters: nil)
-                }}
-                .preferredColorScheme(.dark)
-        }}
-    }}
-
-    @MainActor
-    private static func makeProfileStore(
-        container: Container,
-        authStore: Store<AuthState, AuthIntent>,
-        auth: AuthenticationProtocol
-    ) -> Store<ProfileState, ProfileIntent> {{
-        let storage = container.require(StorageProtocol.self)
-        let eraseDeviceData: @MainActor @Sendable () -> Void = {{
-            try? storage.deleteAll(from: .file)
-            try? storage.deleteAll(from: .userDefaults)
-            try? storage.deleteAll(from: .keychain)
-            authStore.send(.signOutRequested)
-        }}
-        let signOut: @MainActor @Sendable () -> Void = {{ authStore.send(.signOutRequested) }}
-        let removeAccount: @MainActor @Sendable () async throws -> Void = {{ try await auth.deleteAccount() }}
-        let reduce = ProfileState.makeReduce(
-            storage: storage,
-            analytics: FirebaseAnalyticsAdapter(),
-            onSignOutRequested: signOut,
-            onEraseDeviceData: eraseDeviceData,
-            onRemoveAccount: removeAccount
-        )
-        return Store(initial: ProfileState(), reduce: reduce)
-    }}
-
-    @MainActor
-    // swiftlint:disable:next function_parameter_count
-    private static func makeSignInStore(
-        container: Container,
-        authStore: Store<AuthState, AuthIntent>,
-        trendingsService: TrendingsServiceProtocol,
-        opportunitiesService: OpportunitiesServiceProtocol,
-        projectionsService: ProjectionsServiceProtocol,
-        gamesService: GamesServiceProtocol
-    ) -> Store<SignInState, SignInIntent> {{
-        let auth = container.require(AuthenticationProtocol.self)
-        let storage = container.require(StorageProtocol.self)
-        let reduce = SignInState.makeReduce(
-            auth: auth,
-            storage: storage
-        ) {{ result in
-            FirebaseAnalyticsAdapter().logEvent(AnalyticsEvent.signInCompleted, parameters: nil)
-            authStore.send(.signInSucceeded(result))
-            Task {{
-                await prefetchAllData(
-                    trendingsService: trendingsService,
-                    opportunitiesService: opportunitiesService,
-                    projectionsService: projectionsService,
-                    gamesService: gamesService
+            BKSRootView(
+                authStore: authStore,
+                authSessionResolved: authSessionResolved,
+                pendingConsentResult: $pendingConsentResult,
+                splashDismissed: $splashDismissed
+            ) {{ credential in
+                {swift_name}AppShell(
+                    boardStore: boardStore,
+                    profileStore: profileStore,
+                    credential: credential,
+                    promoCodeService: promoCodeService,
+                    activityService: activityService,
+                    isErasingCache: $isErasingCache,
+                    onEraseCachedData: eraseCachedData
                 )
+            }} consentContent: {{ result in
+                subscriptionConsentView(for: result)
+            }} signInContent: {{
+                SignInView(store: signInStore, animateIn: splashDismissed, auth: nil) {{ result in
+                    analyticsAdapter.logEvent(AnalyticsEvent.signUpCompleted, parameters: nil)
+                    if loadConsentAccepted(from: storage) {{
+                        authStore.send(.signInSucceeded(result))
+                    }} else {{
+                        pendingConsentResult = result
+                    }}
+                }}
             }}
+            .environmentObject(networkMonitor)
+            .appConfiguration(configuration)
+            .sportConfiguration(SportConfiguration.{slug})
+            .analytics(analyticsAdapter)
+            .environment(\\.subscriptionService, subscriptionService)
+            .task {{
+                authStore.send(.checkStoredCredential)
+                profileStore.send(.onAppear)
+                await Self.prefetch(
+                    opps: opportunitiesService,
+                    projs: projectionsService,
+                    games: gamesService
+                )
+                await BKSAppScaffold.registerForPushNotifications()
+                await subscriptionService.refreshEntitlement()
+                await subscriptionService.fetchProducts()
+            }}
+            .onReceive(
+                NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+            ) {{ _ in
+                analyticsAdapter.logEvent(AnalyticsEvent.appBackgrounded, parameters: nil)
+                DataRefreshTask.scheduleIfNeeded(identifier: DataRefreshTaskID.identifier)
+            }}
+            .onReceive(
+                NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
+            ) {{ _ in
+                analyticsAdapter.logEvent(AnalyticsEvent.appForegrounded, parameters: nil)
+            }}
+            .onReceive(
+                NotificationCenter.default.publisher(for: DataRefreshTask.dataDidRefreshNotification)
+            ) {{ _ in
+                boardStore.send(.refreshRequested)
+            }}
+            .onChange(of: boardStore.state.loadState.isLoading) {{ wasLoading, nowLoading in
+                if wasLoading, !nowLoading, isErasingCache {{
+                    isErasingCache = false
+                }}
+            }}
+            .preferredColorScheme(.dark)
         }}
-        return Store(
-            initial: SignInState(),
-            reduce: reduce
-        )
     }}
 
-    private func prefetchAllData() async {{
-        await Self.prefetchAllData(
-            trendingsService: trendingsService,
-            opportunitiesService: opportunitiesService,
-            projectionsService: projectionsService,
-            gamesService: gamesService
-        )
-    }}
+    // MARK: - Prefetch
 
-    private static func prefetchAllData(
-        trendingsService: TrendingsServiceProtocol,
-        opportunitiesService: OpportunitiesServiceProtocol,
-        projectionsService: ProjectionsServiceProtocol,
-        gamesService: GamesServiceProtocol
+    private static func prefetch(
+        opps: OpportunitiesServiceProtocol,
+        projs: ProjectionsServiceProtocol,
+        games: GamesServiceProtocol
     ) async {{
         let log = Logger(
             subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
@@ -1177,15 +1166,7 @@ struct {type_prefix}App: App {{
         await withTaskGroup(of: Void.self) {{ group in
             group.addTask {{
                 do {{
-                    let players = try await trendingsService.fetchPlayers()
-                    log.info("Prefetched \\(players.count, privacy: .public) players")
-                }} catch {{
-                    log.error("Trending prefetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-            group.addTask {{
-                do {{
-                    let result = try await opportunitiesService.fetchOpportunities()
+                    let result = try await opps.fetchOpportunities()
                     log.info("Prefetched \\(result.opportunities.count, privacy: .public) opportunities")
                 }} catch {{
                     log.error("Opportunities prefetch failed: \\(error.diagnosticDescription, privacy: .public)")
@@ -1193,7 +1174,7 @@ struct {type_prefix}App: App {{
             }}
             group.addTask {{
                 do {{
-                    let projections = try await projectionsService.fetchProjections()
+                    let projections = try await projs.fetchProjections()
                     log.info("Prefetched \\(projections.count, privacy: .public) projections")
                 }} catch {{
                     log.error("Projections prefetch failed: \\(error.diagnosticDescription, privacy: .public)")
@@ -1201,7 +1182,7 @@ struct {type_prefix}App: App {{
             }}
             group.addTask {{
                 do {{
-                    let schedule = try await gamesService.fetchTodaySchedule()
+                    let schedule = try await games.fetchTodaySchedule()
                     log.info("Prefetched today schedule: \\(schedule.gameCount, privacy: .public) game(s)")
                 }} catch {{
                     log.error("Today schedule prefetch failed: \\(error.diagnosticDescription, privacy: .public)")
@@ -1210,270 +1191,92 @@ struct {type_prefix}App: App {{
         }}
     }}
 
-    /// Requests notification permission and registers with APNs.
-    /// Called after launch so the prompt appears after the user sees the app.
-    private static func registerForPushNotifications() async {{
+    // MARK: - Cache erase
+
+    private func eraseCachedData() {{
+        isErasingCache = true
         do {{
-            let granted = try await UNUserNotificationCenter.current()
-                .requestAuthorization(options: [.alert, .sound, .badge])
-            guard granted else {{ return }}
-            await MainActor.run {{
-                UIApplication.shared.registerForRemoteNotifications()
-            }}
-        }} catch {{
-            // Permission denied or unavailable — silent failure is intentional
-        }}
+            try storage.deleteAll(from: .file)
+        }} catch {{}}
+        boardStore.send(.refreshRequested)
     }}
 
-    private var signInView: some View {{
-        SignInView(store: signInStore, animateIn: splashDismissed, auth: auth) {{ result in
-            analyticsAdapter.logEvent(AnalyticsEvent.signUpCompleted, parameters: nil)
-            pendingSignUpResult = result
-        }}
-    }}
+    // MARK: - Subscription consent
 
-    private var rootView: some View {{
-        ZStack {{
-            switch authStore.state.session {{
-            case .undetermined:
-                Color.clear
-
-            case .unauthenticated:
-                if let pendingResult = pendingSignUpResult {{
-                    promoCodeInterstitial(for: pendingResult)
-                        .compositingGroup()
-                        .transition(.opacity)
-                }} else {{
-                    signInView
-                        .compositingGroup()
-                        .transition(.opacity)
-                }}
-
-            case let .authenticated(credential):
-                AppShell(
-                    boardStore: boardStore,
-                    profileStore: profileStore,
-                    credential: credential,
-                    trendingsService: trendingsService,
-                    gamesService: gamesService,
-                    promoCodeService: promoCodeService
-                )
-                .compositingGroup()
-                .transition(.opacity)
-            }}
-
-            if !splashDismissed {{
-                SplashView(onDismiss: {{
-                    splashDismissed = true
-                }}, authSessionResolved: authSessionResolved)
-            }}
-        }}
-        .animation(.easeInOut(duration: 0.4), value: {{
-            if case .authenticated = authStore.state.session {{ return true }}
-            return false
-        }}())
-    }}
-
-    private func promoCodeInterstitial(for result: AuthResult) -> some View {{
-        let ts = trendingsService, os = opportunitiesService, ps = projectionsService, gs = gamesService
-        let store = Store(
-            initial: PromoCodeState(),
-            reduce: PromoCodeState.makeReduce(service: promoCodeService) {{
+    private func subscriptionConsentView(for result: AuthResult) -> some View {{
+        SubscriptionConsentView(
+            title: String(localized: "consent.title", defaultValue: "Welcome to {app_name}"),
+            subtitle: String(
+                localized: "consent.subtitle",
+                defaultValue: "Your subscription keeps the insights sharp all season."
+            ),
+            termsURL: URL(string: "https://www.blackkatt.ca/terms-of-service.html")!,
+            privacyURL: URL(string: "https://www.blackkatt.ca/privacy-policy.html")!,
+            promoCodeService: promoCodeService,
+            subscriptionService: subscriptionService,
+            onAccepted: {{
+                saveConsentAccepted(to: storage)
                 authStore.send(.signInSucceeded(result))
-                pendingSignUpResult = nil
-                Task {{
-                    await Self.prefetchAllData(
-                        trendingsService: ts,
-                        opportunitiesService: os,
-                        projectionsService: ps,
-                        gamesService: gs
-                    )
-                }}
-            }}
+                pendingConsentResult = nil
+                let opps = opportunitiesService
+                let projs = projectionsService
+                let games = gamesService
+                Task {{ await Self.prefetch(opps: opps, projs: projs, games: games) }}
+            }},
+            termContent: {{ consentTermRows }}
         )
-        return PromoCodeView(store: store, showSkip: true)
+    }}
+
+    @ViewBuilder
+    private var consentTermRows: some View {{
+        EmptyView()
     }}
 }}
 
 // MARK: - AppDelegate
 
-// swiftlint:disable:next line_length
-final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate, MessagingDelegate, InAppMessagingDisplayDelegate {{
-    private let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "AppDelegate"
-    )
+@MainActor
+final class AppDelegate: BKSAppDelegate {{
+    override func makeContainer() -> Container {{ Container.defaultContainer() }}
 
-    /// Stored so the silent-push handler can resolve services for a force-refresh.
-    var container: Container?
-
-    /// Pre-loads the detailed analytics preference so the adapter flag
-    /// is ready before the profile store is created.
-    private static func loadDetailedAnalyticsPreference() {{
-        guard let data = UserDefaults.standard.data(forKey: UserPreferences.storageKey),
-              let prefs = try? JSONDecoder().decode(UserPreferences.self, from: data)
-        else {{
-            return
-        }}
-        FirebaseAnalyticsAdapter.detailedEnabled = prefs.detailedAnalyticsEnabled
+    override func fcmTopics(config: ConfigurationProtocol) -> [String] {{
+        [config.value(for: .fcmGamedayTopic), config.value(for: .fcmPlayoffTopic)]
     }}
 
-    func application(
-        _ application: UIApplication,
-        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
-    ) -> Bool {{
-        #if DEBUG
-            AppCheck.setAppCheckProviderFactory(AppCheckDebugProviderFactory())
-            let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
-            logger.debug("Bundle identifier: \\(bundleID, privacy: .public)")
-        #else
-            AppCheck.setAppCheckProviderFactory(AppAttestProviderFactory())
-        #endif
-        logger.debug("FirebaseApp.configure() — starting")
-        FirebaseApp.configure()
-        if FirebaseApp.app() != nil {{
-            logger.debug("FirebaseApp.configure() — succeeded")
+    override func shouldSuppressForegroundPush(eventRaw: String) -> Bool {{
+        eventRaw == DataRefreshTask.SilentPushEvent.playersUpdate.rawValue
+    }}
+
+    override func preferenceKey(for fcmEvent: String) -> NotificationPreferenceKey? {{
+        NotificationPreferenceKey(fcmEvent: fcmEvent)
+    }}
+
+    override func handleNotificationTap(eventRaw: String, userInfo: [AnyHashable: Any]) {{
+        if let event = VisiblePushEvent(rawValue: eventRaw) {{
+            NotificationCenter.default.post(
+                name: PushNotificationNames.visiblePushTapped,
+                object: event,
+                userInfo: userInfo
+            )
         }} else {{
-            logger.error("FirebaseApp.configure() — failed, app is nil")
+            super.handleNotificationTap(eventRaw: eventRaw, userInfo: userInfo)
         }}
-
-        // Register delegates for notifications and FCM token delivery
-        UNUserNotificationCenter.current().delegate = self
-        Messaging.messaging().delegate = self
-
-        // Fix Firebase In-App Messaging in SwiftUI: supply the active window scene
-        // so the SDK can present over the correct UIWindowScene rather than keyWindow
-        InAppMessaging.inAppMessaging().delegate = self
-
-        // Basic analytics are always collected.
-        // Detailed analytics require user opt-in via the Profile toggle.
-        Analytics.setAnalyticsCollectionEnabled(true)
-        Analytics.logEvent(AnalyticsEvent.appStartUp, parameters: nil)
-        Self.loadDetailedAnalyticsPreference()
-        return true
     }}
 
-    func application(
-        _ application: UIApplication,
-        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
-    ) {{
-        // Forward APNs token to Firebase Messaging so FCM can send pushes
-        Messaging.messaging().apnsToken = deviceToken
-        let token = deviceToken.map {{ String(format: "%02.2hhx", $0) }}.joined()
-        logger.info("APNs device token: \\(token, privacy: .public)")
-    }}
-
-    func application(
-        _ application: UIApplication,
-        didFailToRegisterForRemoteNotificationsWithError error: Error
-    ) {{
-        logger.warning("APNs registration failed: \\(error.localizedDescription, privacy: .public)")
-    }}
-
-    // MARK: - MessagingDelegate
-
-    /// Called by Firebase Messaging once both the APNs token and FCM registration token are ready.
-    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {{
-        guard let fcmToken else {{ return }}
-        logger.info("FCM Token — \\(fcmToken, privacy: .public)")
-    }}
-
-    // MARK: - InAppMessagingDisplayDelegate
-
-    func messageClicked(_ inAppMessage: InAppMessagingDisplayMessage, with action: InAppMessagingAction) {{
-        logger.info("In-app message clicked: \\(inAppMessage.campaignInfo.campaignName, privacy: .public)")
-    }}
-
-    func messageDismissed(_ inAppMessage: InAppMessagingDisplayMessage,
-                          dismissType: InAppMessagingDismissType) {{
-        logger.info("In-app message dismissed: \\(inAppMessage.campaignInfo.campaignName, privacy: .public)")
-    }}
-
-    func impressionDetected(for inAppMessage: InAppMessagingDisplayMessage) {{
-        logger.info("In-app message displayed: \\(inAppMessage.campaignInfo.campaignName, privacy: .public)")
-    }}
-
-    func displayError(for inAppMessage: InAppMessagingDisplayMessage, error: Error) {{
-        logger.warning("In-app message display error: \\(error.localizedDescription, privacy: .public)")
-    }}
-
-    // MARK: - UNUserNotificationCenterDelegate
-
-    /// Case 1: Foreground notification — show banner/sound/badge while app is open.
-    func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {{
-        let userInfo = notification.request.content.userInfo
-        logger.info("Foreground notification received: \\(userInfo, privacy: .public)")
-        // Also forward to Messaging (swizzling disabled)
-        Messaging.messaging().appDidReceiveMessage(userInfo)
-        completionHandler([.banner, .sound, .badge])
-    }}
-
-    /// Case 2: User tapped a notification — handle deep-link or action from payload.
-    func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse,
-        withCompletionHandler completionHandler: @escaping () -> Void
-    ) {{
-        let userInfo = response.notification.request.content.userInfo
-        logger.info("Notification tapped: \\(userInfo, privacy: .public)")
-        Messaging.messaging().appDidReceiveMessage(userInfo)
-        // Future: parse userInfo and post a NotificationCenter event to navigate the app
-        completionHandler()
-    }}
-
-    /// Case 3: All remote notifications — foreground, background, and silent.
-    /// This fires for every remote push regardless of content-available.
-    func application(
-        _ application: UIApplication,
-        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
-        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
-    ) {{
-        let state: String
-        switch application.applicationState {{
-        case .active:      state = "foreground"
-        case .background:  state = "background"
-        case .inactive:    state = "inactive"
-        @unknown default:  state = "unknown"
-        }}
-        logger.info("Remote notification [\\(state, privacy: .public)]: \\(userInfo, privacy: .public)")
-
-        // Forward to Messaging (swizzling disabled)
-        Messaging.messaging().appDidReceiveMessage(userInfo)
-
-        // If content-available: 1, treat as data refresh signal
-        let aps = userInfo["aps"] as? [String: Any]
-        let contentAvailable = aps?["content-available"] as? Int ?? 0
-        guard contentAvailable == 1 else {{
-            completionHandler(.noData)
-            return
-        }}
-
-        logger.info("Silent push — triggering force refresh")
+    override func handleSilentPush(eventRaw: String, userInfo: [AnyHashable: Any]) async {{
         guard
             let storage = container?.resolve(StorageProtocol.self),
-            let trendingsService = container?.resolve(TrendingsServiceProtocol.self),
-            let opportunitiesService = container?.resolve(OpportunitiesServiceProtocol.self),
-            let projectionsService = container?.resolve(ProjectionsServiceProtocol.self),
-            let gamesService = container?.resolve(GamesServiceProtocol.self)
-        else {{
-            logger.error("Silent push — DI container not ready")
-            completionHandler(.failed)
-            return
-        }}
-        Task {{
-            await DataRefreshTask.forceClearAndRefresh(
-                storage: storage,
-                trendingsService: trendingsService,
-                opportunitiesService: opportunitiesService,
-                projectionsService: projectionsService,
-                gamesService: gamesService
-            )
-            completionHandler(.newData)
-        }}
+            let opps = container?.resolve(OpportunitiesServiceProtocol.self),
+            let projs = container?.resolve(ProjectionsServiceProtocol.self),
+            let games = container?.resolve(GamesServiceProtocol.self)
+        else {{ return }}
+        await DataRefreshTask.handleSilentPush(
+            userInfo: userInfo,
+            storage: storage,
+            fetchOpportunities: {{ _ = try await opps.fetchOpportunities(includeResting: true) }},
+            fetchProjections: {{ _ = try await projs.fetchProjections() }},
+            fetchSchedule: {{ _ = try await games.fetchTodaySchedule() }}
+        )
     }}
 }}
 """
@@ -1482,25 +1285,7 @@ bootstrap_container = header() + f"""\
 import Alamofire
 import BKSCore
 import BKSUICore
-import FirebaseAuth
 import Swinject
-
-// MARK: - Resolver + require
-
-extension Resolver {{
-    func require<T>(_ type: T.Type, name: String? = nil) -> T {{
-        if let name {{
-            guard let resolved = resolve(type, name: name) else {{
-                preconditionFailure("DI: missing registration for \\\\(type) (name: \\\\(name))")
-            }}
-            return resolved
-        }}
-        guard let resolved = resolve(type) else {{
-            preconditionFailure("DI: missing registration for \\\\(type)")
-        }}
-        return resolved
-    }}
-}}
 
 // MARK: - Container
 
@@ -1508,10 +1293,16 @@ extension Container {{
     @MainActor
     static func defaultContainer() -> Container {{
         let container = Container()
+
+        BKSContainerBuilder.registerCoreServices(
+            on: container,
+            subscriptionProductIDs: SubscriptionProductID.allCurrentProductIDs
+        )
+
         container.registerSportConfiguration()
-        container.registerCoreServices()
-        container.registerDomainServices()
-        container.registerFeatureStores()
+        container.registerSportServices()
+        container.registerBoardStore()
+
         return container
     }}
 
@@ -1519,31 +1310,7 @@ extension Container {{
         register(SportConfiguration.self) {{ _ in .{slug} }}.inObjectScope(.container)
     }}
 
-    // swiftlint:disable:next function_body_length
-    private func registerCoreServices() {{
-        register(LoggerProtocol.self) {{ _ in AppLogger(category: "General") }}
-        register(StorageProtocol.self) {{ _ in Storage() }}
-        register(ConfigurationProtocol.self) {{ resolver in
-            Configuration(storage: resolver.require(StorageProtocol.self))
-        }}
-        register(NetworkProtocol.self, name: "firebase") {{ _ in
-            let authInterceptor = FirebaseAuthInterceptor {{ forcingRefresh in
-                guard let user = Auth.auth().currentUser else {{
-                    throw TrendingsServiceError.unauthenticated
-                }}
-                return try await user.getIDToken(forcingRefresh: forcingRefresh)
-            }}
-            let retryPolicy = RetryPolicy(
-                retryLimit: 2,
-                exponentialBackoffBase: 2,
-                exponentialBackoffScale: 0.5
-            )
-            let interceptor = Interceptor(
-                adapters: [authInterceptor],
-                retriers: [authInterceptor, retryPolicy]
-            )
-            return Network(interceptor: interceptor)
-        }}
+    private func registerSportServices() {{
         register(NetworkProtocol.self, name: "apiKey") {{ resolver in
             let config = resolver.require(ConfigurationProtocol.self)
             let apiKeyInterceptor = APIKeyInterceptor(apiKey: config.value(for: .gameLogAPIKey))
@@ -1558,21 +1325,6 @@ extension Container {{
             )
             return Network(interceptor: interceptor)
         }}
-        register(MetricsCollectorProtocol.self) {{ _ in MetricsCollector() }}.inObjectScope(.container)
-        register(AuthenticationProtocol.self) {{ resolver in
-            Authentication(configuration: resolver.require(ConfigurationProtocol.self))
-        }}
-    }}
-
-    private func registerDomainServices() {{
-        register(TrendingsServiceProtocol.self) {{ resolver in
-            TrendingsService(
-                network: resolver.require(NetworkProtocol.self, name: "firebase"),
-                storage: resolver.require(StorageProtocol.self),
-                configuration: resolver.require(ConfigurationProtocol.self),
-                sportConfiguration: resolver.require(SportConfiguration.self)
-            )
-        }}.inObjectScope(.container)
         register(OpportunitiesServiceProtocol.self) {{ resolver in
             OpportunitiesService(
                 network: resolver.require(NetworkProtocol.self, name: "firebase"),
@@ -1598,95 +1350,29 @@ extension Container {{
                 sportConfiguration: resolver.require(SportConfiguration.self)
             )
         }}
-        register(PromoCodeServiceProtocol.self) {{ resolver in
-            PromoCodeService(
-                network: resolver.require(NetworkProtocol.self, name: "firebase"),
-                configuration: resolver.require(ConfigurationProtocol.self)
-            )
-        }}
     }}
 
     @MainActor
-    private func registerFeatureStores() {{
-        register(Store<AuthState, AuthIntent>.self) {{ resolver in
-            let storage = resolver.require(StorageProtocol.self)
-            let auth = resolver.require(AuthenticationProtocol.self)
-            return MainActor.assumeIsolated {{
-                Store(initial: AuthState(), reduce: AuthState.makeReduce(storage: storage, auth: auth))
-            }}
-        }}
+    private func registerBoardStore() {{
         register(Store<BoardState, BoardIntent>.self) {{ resolver in
-            let trendingsService = resolver.require(TrendingsServiceProtocol.self)
             let projectionService = resolver.require(ProjectionsServiceProtocol.self)
             let opportunityService = resolver.require(OpportunitiesServiceProtocol.self)
             let gamesService = resolver.require(GamesServiceProtocol.self)
+            let analysisService = resolver.require(DailyAnalysisServiceProtocol.self)
             let positionMap = resolver.require(SportConfiguration.self).positionMap
             return MainActor.assumeIsolated {{
                 Store(
                     initial: BoardState(),
                     reduce: BoardState.makeReduce(
-                        trendingsService: trendingsService,
                         projectionService: projectionService,
                         opportunityService: opportunityService,
                         gamesService: gamesService,
+                        analysisService: analysisService,
                         positionMap: positionMap
                     )
                 )
             }}
         }}
-    }}
-}}
-"""
-
-bootstrap_auth = header() + f"""\
-import FirebaseAuth
-import BKSCore
-import Foundation
-import OSLog
-
-final class Authentication: AuthenticationProtocol {{
-    private let logger = os.Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "Authentication"
-    )
-
-    init(configuration: ConfigurationProtocol) {{}}
-
-    func createUser(withEmail email: String, password: String) async throws -> AuthResult {{
-        let result = try await Auth.auth().createUser(withEmail: email, password: password)
-        return AuthResult(
-            provider: .email,
-            userID: result.user.uid,
-            email: result.user.email,
-            displayName: result.user.displayName
-        )
-    }}
-
-    func signIn(withEmail email: String, password: String) async throws -> AuthResult {{
-        let result = try await Auth.auth().signIn(withEmail: email, password: password)
-        return AuthResult(
-            provider: .email,
-            userID: result.user.uid,
-            email: result.user.email,
-            displayName: result.user.displayName
-        )
-    }}
-
-    func sendPasswordReset(toEmail email: String) async throws {{
-        try await Auth.auth().sendPasswordReset(withEmail: email)
-    }}
-
-    func signOut() {{
-        try? Auth.auth().signOut()
-    }}
-
-    func deleteAccount() async throws {{
-        try await Auth.auth().currentUser?.delete()
-    }}
-
-    func validateCredential(_ credential: StoredCredential) async -> Bool {{
-        guard let user = Auth.auth().currentUser else {{ return false }}
-        return (try? await user.getIDToken(forcingRefresh: false)) != nil
     }}
 }}
 """
@@ -1713,231 +1399,47 @@ struct FirebaseAnalyticsAdapter: AnalyticsConfigurable {{
 }}
 """
 
-bootstrap_data_refresh = header() + f"""\
-import BackgroundTasks
-import BKSCore
-import OSLog
-
-// MARK: - DataRefreshTask
-
-/// Registers and schedules a BGProcessingTask that refreshes trending stats
-/// once per day, targeting 3am local time.
-enum DataRefreshTask {{
-    static let identifier = "{bundle_id}.datarefresh"
-
-    private static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "DataRefreshTask"
-    )
-
-    // MARK: - Registration
-
-    static func register(
-        trendingsService: TrendingsServiceProtocol,
-        opportunitiesService: OpportunitiesServiceProtocol,
-        projectionsService: ProjectionsServiceProtocol,
-        gamesService: GamesServiceProtocol
-    ) {{
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) {{ task in
-            guard let processingTask = task as? BGProcessingTask else {{ return }}
-            handle(
-                processingTask,
-                trendingsService: trendingsService,
-                opportunitiesService: opportunitiesService,
-                projectionsService: projectionsService,
-                gamesService: gamesService
-            )
-        }}
-    }}
-
-    // MARK: - Scheduling
-
-    static func scheduleIfNeeded() {{
-        let request = BGProcessingTaskRequest(identifier: identifier)
-        request.requiresNetworkConnectivity = true
-        request.requiresExternalPower = false
-        request.earliestBeginDate = nextScheduledDate()
-
-        do {{
-            try BGTaskScheduler.shared.submit(request)
-            logger.info("Data refresh scheduled for \\(nextScheduledDate(), privacy: .public)")
-        }} catch {{
-            logger.warning("Failed to schedule trend refresh: \\(error.diagnosticDescription, privacy: .public)")
-        }}
-    }}
-
-    // MARK: - Execution
-
-    private static func handle(
-        _ task: BGProcessingTask,
-        trendingsService: TrendingsServiceProtocol,
-        opportunitiesService: OpportunitiesServiceProtocol,
-        projectionsService: ProjectionsServiceProtocol,
-        gamesService: GamesServiceProtocol
-    ) {{
-        // Reschedule immediately so the next run is already queued
-        scheduleIfNeeded()
-
-        let fetchTask = Task {{
-            do {{
-                let players = try await trendingsService.fetchPlayers()
-                let startDate = Calendar.current.date(
-                    byAdding: .day,
-                    value: -15,
-                    to: Date.now
-                ) ?? Date.now
-
-                let batches = stride(from: 0, to: players.count, by: 50).map {{
-                    Array(players[$0 ..< min($0 + 50, players.count)]).map(\\.id)
-                }}
-
-                for batch in batches {{
-                    try Task.checkCancellation()
-                    _ = try await gamesService.fetchGameLogs(playerIDs: batch, startDate: startDate)
-                }}
-
-                try Task.checkCancellation()
-                _ = try await opportunitiesService.fetchOpportunities()
-
-                try Task.checkCancellation()
-                _ = try await projectionsService.fetchProjections()
-
-                try Task.checkCancellation()
-                _ = try await gamesService.fetchTodaySchedule()
-
-                logger.info("Background data refresh completed for \\(players.count) players")
-                task.setTaskCompleted(success: true)
-            }} catch {{
-                logger.error("Background data refresh failed: \\(error.diagnosticDescription, privacy: .public)")
-                task.setTaskCompleted(success: false)
-            }}
-        }}
-
-        task.expirationHandler = {{
-            fetchTask.cancel()
-            logger.warning("Background data refresh expired before completion")
-        }}
-    }}
-
-    // MARK: - Force Refresh (silent push)
-
-    /// Clears the local file cache and fetches all data fresh from the server.
-    /// Called when a silent push notification is received to ensure the board
-    /// reflects the latest server state immediately.
-    static func forceClearAndRefresh(
-        storage: StorageProtocol,
-        trendingsService: TrendingsServiceProtocol,
-        opportunitiesService: OpportunitiesServiceProtocol,
-        projectionsService: ProjectionsServiceProtocol,
-        gamesService: GamesServiceProtocol
-    ) async {{
-        logger.info("Silent push — clearing cache and force-refreshing all data")
-
-        // Wipe the file cache so every subsequent load hits the network
-        try? storage.deleteAll(from: .file)
-
-        // Re-fetch all data sources in parallel
-        await withTaskGroup(of: Void.self) {{ group in
-            group.addTask {{
-                do {{
-                    let players = try await trendingsService.fetchPlayers()
-                    logger.info("Force-refreshed \\(players.count, privacy: .public) players")
-                }} catch {{
-                    logger.error("Force-refresh players failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-            group.addTask {{
-                do {{
-                    let result = try await opportunitiesService.fetchOpportunities()
-                    logger.info("Force-refreshed \\(result.opportunities.count, privacy: .public) opportunities")
-                }} catch {{
-                    logger.error("Force-refresh opportunities failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-            group.addTask {{
-                do {{
-                    let projections = try await projectionsService.fetchProjections()
-                    logger.info("Force-refreshed \\(projections.count, privacy: .public) projections")
-                }} catch {{
-                    logger.error("Force-refresh projections failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-            group.addTask {{
-                do {{
-                    let schedule = try await gamesService.fetchTodaySchedule()
-                    logger.info("Force-refreshed schedule: \\(schedule.gameCount, privacy: .public) game(s)")
-                }} catch {{
-                    logger.error("Force-refresh schedule failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-        }}
-
-        logger.info("Silent push force-refresh complete")
-    }}
-
-    // MARK: - Scheduling Helpers
-
-    private static func nextScheduledDate() -> Date {{
-        var components = Calendar.current.dateComponents([.year, .month, .day], from: Date.now)
-        components.hour = 3
-        components.minute = 0
-        components.second = 0
-
-        guard let todayAt3am = Calendar.current.date(from: components) else {{
-            return Date.now.addingTimeInterval(24 * 60 * 60)
-        }}
-
-        // If it's already past 3am today, schedule for 3am tomorrow
-        return todayAt3am > Date.now
-            ? todayAt3am
-            : Calendar.current.date(byAdding: .day, value: 1, to: todayAt3am) ?? todayAt3am
-    }}
-}}
-"""
-
 bootstrap_dir = os.path.join(out_dir, "App/Sources/App/Bootstrap")
 write(os.path.join(bootstrap_dir, f"{type_prefix}App.swift"), bootstrap_app)
 write(os.path.join(bootstrap_dir, "DependencyContainer.swift"), bootstrap_container)
-write(os.path.join(bootstrap_dir, "Authentication.swift"), bootstrap_auth)
 write(os.path.join(bootstrap_dir, "FirebaseAnalyticsAdapter.swift"), bootstrap_analytics)
-write(os.path.join(bootstrap_dir, "DataRefreshTask.swift"), bootstrap_data_refresh)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9a. AppShell.swift
 # ─────────────────────────────────────────────────────────────────────────────
 
-app_shell = header() + """\
-// UI infrastructure — no MVI. AppShell hosts the Board feature.
+app_shell = header() + f"""\
 import SwiftUI
 import BKSCore
 import BKSUICore
 
-struct AppShell: View {
+struct {swift_name}AppShell: View {{
     @ObservedObject var boardStore: Store<BoardState, BoardIntent>
     @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
     let credential: StoredCredential
-    let trendingsService: TrendingsServiceProtocol
-    let gamesService: GamesServiceProtocol
     let promoCodeService: PromoCodeServiceProtocol
+    let activityService: any ActivityFeedServiceProtocol
+    @Binding var isErasingCache: Bool
+    let onEraseCachedData: () -> Void
     @EnvironmentObject var networkMonitor: NetworkMonitor
-    @Environment(\\.accessibilityReduceMotion) private var reduceMotion
 
-    var body: some View {
-        BoardView(
-            store: boardStore,
-            credential: credential,
-            profileStore: profileStore,
-            promoCodeService: promoCodeService
-        )
-        .overlay(alignment: .top) {
-            if !networkMonitor.isConnected {
-                OfflineBanner()
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
-        }
-        .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: networkMonitor.isConnected)
-    }
-}
+    var body: some View {{
+        AppShell(
+            isOnline: networkMonitor.isConnected,
+            isErasingCache: $isErasingCache,
+            isBoardLoading: boardStore.state.loadState.isLoading
+        ) {{
+            BoardView(
+                store: boardStore,
+                credential: credential,
+                profileStore: profileStore,
+                promoCodeService: promoCodeService,
+                activityService: activityService,
+                onEraseCachedData: onEraseCachedData
+            )
+        }}
+    }}
+}}
 """
 
 write(os.path.join(bootstrap_dir, "AppShell.swift"), app_shell)
@@ -3852,102 +3354,6 @@ private struct SeriesDTO: Decodable {{
 write(os.path.join(services_dir, "ProjectionsService.swift"), projections_service_swift)
 write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
 write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
-
-promo_code_service_swift = header() + f"""\
-import BKSCore
-import Foundation
-import OSLog
-
-// MARK: - PromoCodeServiceProtocol
-
-protocol PromoCodeServiceProtocol {{
-    func redeemPromoCode(_ code: String) async throws -> PromoRedemptionResult
-}}
-
-// MARK: - PromoRedemptionResult
-
-struct PromoRedemptionResult: Decodable {{
-    let uid: String
-    let tier: String
-    let code: String
-    let status: String
-}}
-
-// MARK: - PromoCodeError
-
-enum PromoCodeError: LocalizedError {{
-    case invalidCode
-    case alreadyRedeemed
-    case missingCode
-    case serverError
-
-    var errorDescription: String? {{
-        switch self {{
-        case .invalidCode:
-            String(localized: "promoCode.error.invalidCode",
-                   defaultValue: "This promo code isn\\'t valid. Check the code and try again.")
-        case .alreadyRedeemed:
-            String(localized: "promoCode.error.alreadyRedeemed",
-                   defaultValue: "You\\'ve already redeemed this code.")
-        case .missingCode:
-            String(localized: "promoCode.error.missingCode",
-                   defaultValue: "Please enter a promo code.")
-        case .serverError:
-            String(localized: "promoCode.error.serverError",
-                   defaultValue: "Something went wrong. Try again later.")
-        }}
-    }}
-}}
-
-// MARK: - PromoCodeService
-
-final class PromoCodeService: PromoCodeServiceProtocol {{
-    private let network: NetworkProtocol
-    private let configuration: ConfigurationProtocol
-    private let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "PromoCodeService"
-    )
-
-    init(network: NetworkProtocol, configuration: ConfigurationProtocol) {{
-        self.network = network
-        self.configuration = configuration
-    }}
-
-    func redeemPromoCode(_ code: String) async throws -> PromoRedemptionResult {{
-        let url = configuration.value(for: .redeemPromoCodeURL)
-        let body = PromoCodeRequest(code: code)
-        logger.debug("Redeeming promo code")
-        do {{
-            let result: PromoRedemptionResult = try await network.post(url, body: body)
-            logger.info("Promo code redeemed — tier: \\\\(result.tier, privacy: .public)")
-            return result
-        }} catch let error as NetworkError {{
-            throw mapError(error)
-        }}
-    }}
-
-    private func mapError(_ error: NetworkError) -> Error {{
-        guard case let .httpError(statusCode, _) = error else {{ return error }}
-        switch statusCode {{
-        case 400: return PromoCodeError.missingCode
-        case 404: return PromoCodeError.invalidCode
-        case 409: return PromoCodeError.alreadyRedeemed
-        default:
-            logger.error("Promo code HTTP error: \\\\(statusCode, privacy: .public)")
-            return PromoCodeError.serverError
-        }}
-    }}
-}}
-
-// MARK: - Request DTO
-
-private struct PromoCodeRequest: Encodable {{
-    let code: String
-}}
-"""
-
-write(os.path.join(services_dir, "PromoCodeService.swift"), promo_code_service_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9d. Core UI files
@@ -8515,6 +7921,7 @@ targets:
 {firebase_deps}
     resources:
       - path: Sources/App/Resources/Assets.xcassets
+      - path: Sources/App/Resources/InfoPlist.xcstrings
       - path: Sources/App/Resources/Localizable.xcstrings
       - path: Sources/App/Resources/PrivacyInfo.xcprivacy
       - path: Sources/App/Resources/Configuration.plist
@@ -8755,6 +8162,79 @@ info_plist = f"""\
 """
 
 write(os.path.join(out_dir, "App/Sources/App/Resources/Info.plist"), info_plist)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10b. InfoPlist.xcstrings  (localised Info.plist strings)
+# ─────────────────────────────────────────────────────────────────────────────
+
+infoplist_xcstrings = f"""\
+{{
+  "sourceLanguage" : "en",
+  "strings" : {{
+    "CFBundleDisplayName" : {{
+      "extractionState" : "manual",
+      "localizations" : {{
+        "en" : {{
+          "stringUnit" : {{
+            "state" : "translated",
+            "value" : "{app_name}"
+          }}
+        }},
+        "es" : {{
+          "stringUnit" : {{
+            "state" : "translated",
+            "value" : "{app_name}"
+          }}
+        }},
+        "fr-CA" : {{
+          "stringUnit" : {{
+            "state" : "translated",
+            "value" : "{app_name}"
+          }}
+        }}
+      }}
+    }},
+    "CFBundleName" : {{
+      "extractionState" : "manual",
+      "localizations" : {{
+        "en" : {{
+          "stringUnit" : {{
+            "state" : "translated",
+            "value" : "{app_name}"
+          }}
+        }},
+        "es" : {{
+          "stringUnit" : {{
+            "state" : "translated",
+            "value" : "{app_name}"
+          }}
+        }},
+        "fr-CA" : {{
+          "stringUnit" : {{
+            "state" : "translated",
+            "value" : "{app_name}"
+          }}
+        }}
+      }}
+    }},
+    "NSHumanReadableCopyright" : {{
+      "comment" : "Copyright (human-readable)",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {{
+        "en" : {{
+          "stringUnit" : {{
+            "state" : "new",
+            "value" : "Copyright 2026 Black Katt Technologies Inc."
+          }}
+        }}
+      }}
+    }}
+  }},
+  "version" : "1.0"
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/App/Resources/InfoPlist.xcstrings"), infoplist_xcstrings)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. Configuration.plist  (runtime config — URLs baked in)
@@ -9291,6 +8771,74 @@ Each agent owns a distinct set of files. Two agents must never edit the same fil
 write(os.path.join(out_dir, "CLAUDE.md"), claude_md)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# workspace.yml  (xcodegen workspace config)
+# ─────────────────────────────────────────────────────────────────────────────
+
+workspace_yml = f"""\
+name: {type_prefix}
+fileGroups:
+  - .swiftlint.yml
+  - .swiftformat
+options:
+  groupOrdering:
+    - order: [App]
+projects:
+  App:
+    path: App
+"""
+
+write(os.path.join(out_dir, "workspace.yml"), workspace_yml)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate.sh  (project regeneration + Package.resolved sync)
+# ─────────────────────────────────────────────────────────────────────────────
+
+generate_sh = f"""\
+#!/usr/bin/env bash
+# generate.sh — Regenerate the Xcode project and sync Package.resolved.
+#
+# Usage (from repo root):
+#   ./generate.sh
+#
+# What it does:
+#   1. Runs xcodegen against App/project.yml
+#   2. Syncs the workspace Package.resolved into the xcodeproj's inner
+#      project.xcworkspace so both files agree on package versions.
+#      Without this sync Xcode reports "package dependencies screwed up"
+#      after every xcodegen run because the inner file is overwritten
+#      with whatever was last committed inside the xcodeproj bundle.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+APP_DIR="$REPO_ROOT/App"
+WORKSPACE_RESOLVED="$REPO_ROOT/{type_prefix}.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+INNER_RESOLVED="$APP_DIR/{type_prefix}.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+
+# ── 1. Generate xcodeproj ─────────────────────────────────────────────────────
+
+echo "Generating xcodeproj..."
+cd "$APP_DIR"
+xcodegen generate --spec project.yml
+
+# ── 2. Sync Package.resolved ──────────────────────────────────────────────────
+
+if [[ -f "$WORKSPACE_RESOLVED" ]]; then
+    cp "$WORKSPACE_RESOLVED" "$INNER_RESOLVED"
+    echo "Synced Package.resolved to xcodeproj"
+else
+    echo "Warning: Workspace Package.resolved not found — skipping sync"
+    echo "         Run 'xcodebuild -resolvePackageDependencies' to create it."
+fi
+
+echo "Done."
+"""
+
+generate_sh_path = os.path.join(out_dir, "generate.sh")
+write(generate_sh_path, generate_sh)
+os.chmod(generate_sh_path, 0o755)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -9302,9 +8850,7 @@ print("Bootstrap:")
 print(f"  App/Sources/App/Bootstrap/{type_prefix}App.swift")
 print(f"  App/Sources/App/Bootstrap/AppShell.swift")
 print(f"  App/Sources/App/Bootstrap/DependencyContainer.swift")
-print(f"  App/Sources/App/Bootstrap/Authentication.swift")
 print(f"  App/Sources/App/Bootstrap/FirebaseAnalyticsAdapter.swift")
-print(f"  App/Sources/App/Bootstrap/DataRefreshTask.swift")
 print()
 print("Models:")
 print(f"  App/Sources/Core/Models/Player.swift")
@@ -9321,7 +8867,6 @@ print(f"  App/Sources/Core/Services/OpportunitiesService.swift")
 print(f"  App/Sources/Core/Services/ProjectionsService.swift")
 print(f"  App/Sources/Core/Services/GamesService.swift")
 print(f"  App/Sources/Core/Services/PlayoffService.swift")
-print(f"  App/Sources/Core/Services/PromoCodeService.swift")
 print()
 print("Sport configuration:")
 print(f"  App/Sources/Core/Sport/ScoringCalculator.swift")
@@ -9388,6 +8933,7 @@ print(f"  App/Config/Release.xcconfig.template")
 print(f"  App/Tests/.gitkeep")
 print(f"  App/Config/{app_target}Tests.xcconfig")
 print(f"  App/Sources/App/Resources/Info.plist")
+print(f"  App/Sources/App/Resources/InfoPlist.xcstrings")
 print(f"  App/Sources/App/Resources/Configuration.plist    ← runtime API URLs")
 print(f"  App/Sources/App/Resources/{app_target}.entitlements")
 print(f"  App/Sources/App/Resources/PrivacyInfo.xcprivacy")
@@ -9396,6 +8942,8 @@ print(f"  .swiftlint.yml")
 print(f"  .swiftformat")
 print(f"  .gitignore")
 print(f"  CLAUDE.md")
+print(f"  workspace.yml")
+print(f"  generate.sh")
 print()
 print("Next steps:")
 print(f"  1. Replace App/Sources/App/Resources/GoogleService-Info.plist with real Firebase config")
@@ -9483,8 +9031,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/Alamofire/Alamofire.git",
       "state" : {
-        "revision" : "e938f8c66708e7352fc7e3512647fa54255b267a",
-        "version" : "5.11.2"
+        "revision" : "f684c8d51df7e77c8c4da52b6cdee8db12e2d8dc",
+        "version" : "5.12.0"
       }
     },
     {

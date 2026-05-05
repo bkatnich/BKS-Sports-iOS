@@ -139,10 +139,10 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "1.0.1"
+    from: "1.7.0"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.0.17"
+    from: "1.5.0"
   swinject:
     url: https://github.com/Swinject/Swinject.git
     from: "2.9.0"
@@ -364,6 +364,20 @@ gamelog:
       - key: minutes
         label: MIN
         localizationKey: gamelog.header.min
+
+# ---------------------------------------------------------------------------
+# FCM push notification topics
+# ---------------------------------------------------------------------------
+fcm:
+  gamedayTopic: gameday
+  playoffTopic: bks_basketball
+
+# ---------------------------------------------------------------------------
+# Subscription product IDs (StoreKit)
+# ---------------------------------------------------------------------------
+subscription:
+  productSuffix: basic.monthly
+  groupID: BKSBasketballSubscriptions
 
 # ---------------------------------------------------------------------------
 # Context file (used by LLM scaffold prompts)
