@@ -671,8 +671,8 @@ extension SportConfiguration {{
         opportunityFields: [
 {opp_fields_str}
         ],
-        opportunityParams: OpportunityParams(limit: {opp_limit}, platform: "{opp_platform}", mode: "{opp_mode}"),
-        projectionParams: ProjectionParams(lookahead: {proj_look}, platform: "{proj_plat}", mode: "{proj_mode}"),
+        opportunityParams: OpportunityParams(limit: {opp_limit}, mode: "{opp_mode}"),
+        projectionParams: ProjectionParams(lookahead: {proj_look}, mode: "{proj_mode}"),
         teamAbbreviationByID: [:] {team_lookup_comment}
     )
 }}
@@ -998,18 +998,6 @@ struct SportConfiguration {{
     let opportunityParams: OpportunityParams
     let projectionParams: ProjectionParams
     let teamAbbreviationByID: [Int: String]
-
-    struct OpportunityParams {{
-        let limit: Int
-        let platform: String
-        let mode: String
-    }}
-
-    struct ProjectionParams {{
-        let lookahead: Int
-        let platform: String
-        let mode: String
-    }}
 
     func teamAbbreviation(for teamID: Int) -> String {{
         teamAbbreviationByID[teamID] ?? ""
@@ -8836,8 +8824,8 @@ claude_md = f"""# CLAUDE.md
 iOS app built with Swift and SwiftUI, targeting iOS {deploy_tgt}+. Uses Swift Package Manager for dependencies.
 
 ## Build & Test Commands
-- **Build**: `xcodebuild -scheme MyApp -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'`
-- **Test**: `xcodebuild test -scheme MyApp -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'`
+- **Build**: `xcodebuild -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'`
+- **Test**: `xcodebuild test -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'`
 - **Lint**: `swiftlint`
 - **Regenerate project**: `./generate.sh` (from repo root — runs xcodegen then syncs both Package.resolved files)
   - **Never** run `xcodegen generate` directly; always use `./generate.sh` to keep the inner and outer Package.resolved in sync
