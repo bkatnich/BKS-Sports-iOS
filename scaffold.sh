@@ -1664,6 +1664,55 @@ struct Projection: Codable, Equatable, Hashable, Identifiable, Filterable {
 
 """
 
+playoff_series_swift = header() + """\
+import BKSCore
+
+// MARK: - SeriesStatus
+
+enum SeriesStatus: String, Codable, Equatable, Hashable {
+    case scheduled
+    case ongoing
+    case completed
+    case cancelled
+}
+
+// MARK: - PlayoffSeries
+
+struct PlayoffSeries: Codable, Equatable, Hashable, Identifiable {
+    let seriesID: String
+    let roundNumber: Int
+    let roundName: String
+    let conference: String
+    let higherSeedTeam: String
+    let lowerSeedTeam: String
+    let higherSeed: Int
+    let lowerSeed: Int
+    let winsHigherSeed: Int
+    let winsLowerSeed: Int
+    let status: SeriesStatus
+    let winner: String?
+    let gamesPlayed: Int
+    let eliminationGameNext: Bool
+    let homeCourt: String?
+
+    var id: String { seriesID }
+}
+"""
+
+league_state_swift = header() + """\
+import BKSCore
+
+// MARK: - LeagueState
+
+struct LeagueState: Codable, Equatable {
+    let mode: SeasonMode
+    let playoffRound: Int?
+    let playoffStartDate: String?
+    let regularSeasonEndDate: String?
+    let season: Int?
+}
+"""
+
 write(os.path.join(models_dir, "PlayoffSeries.swift"), playoff_series_swift)
 write(os.path.join(models_dir, "LeagueState.swift"), league_state_swift)
 
@@ -2439,6 +2488,33 @@ private extension Array where Element == Double {{
 }}
 """
 
+# Extract gamelog stat fields from YAML — drives GameEntry+Sport and GamesService mapping
+gamelog_stats = gamelog.get("stats", [])
+# Build stats dict lines: "key": stat.key ?? 0  (Int stats) or ?? 0.0 (Double stats)
+def stat_dict_line(s):
+    key = s["key"]
+    typ = s.get("type", "Int")
+    default = "0.0" if typ == "Double" else "0"
+    return f'                "{key}": stat.{key} ?? {default},'
+
+stats_dict_lines = "\n".join(stat_dict_line(s) for s in gamelog_stats if not s.get("isPlayingTime"))
+
+# Build GameEntry+Sport extension accessors
+def stat_accessor_line(s):
+    key = s["key"]
+    typ = s.get("type", "Int")
+    return f'    var {key}: {typ}           {{ stats["{key}"] ?? 0 }}'
+
+stat_accessor_lines = "\n".join(stat_accessor_line(s) for s in gamelog_stats if not s.get("isPlayingTime"))
+
+# Build projected stat accessors (non-minutes stats that appear in display)
+all_display_stats = display.get("primary", []) + display.get("secondary", [])
+proj_stat_keys = [s["key"] for s in all_display_stats if s["key"] not in ("dk", "minutes")]
+proj_accessor_lines = "\n".join(
+    f'    var {k}: Double?          {{ stats["{k}"] }}'
+    for k in proj_stat_keys
+)
+
 games_service_swift = header() + f"""\
 import Alamofire
 import BKSCore
@@ -2657,29 +2733,10 @@ final class GamesService: GamesServiceProtocol {{
             opponentAbbreviation: opponentAbbr,
             isHomeGame: isHome,
             result: result,
-            atBats: stat.atBats ?? 0,
-            single: stat.single ?? 0,
-            double: stat.double ?? 0,
-            triple: stat.triple ?? 0,
-            homeRun: stat.homeRun ?? 0,
-            rbi: stat.rbi ?? 0,
-            run: stat.run ?? 0,
-            walk: stat.walk ?? 0,
-            hitByPitch: stat.hitByPitch ?? 0,
-            stolenBase: stat.stolenBase ?? 0,
-            sacrificeFly: stat.sacrificeFly ?? 0,
-            sacrificeHit: stat.sacrificeHit ?? 0,
-            inningsPitched: stat.inningsPitched ?? 0.0,
-            strikeoutPitching: stat.strikeoutPitching ?? 0,
-            win: stat.win ?? 0,
-            earnedRunAllowed: stat.earnedRunAllowed ?? 0,
-            hitAgainst: stat.hitAgainst ?? 0,
-            walkAgainst: stat.walkAgainst ?? 0,
-            hitBatsmanAgainst: stat.hitBatsmanAgainst ?? 0,
-            completeGame: stat.completeGame ?? 0,
-            completeGameShutout: stat.completeGameShutout ?? 0,
-            noHitter: stat.noHitter ?? 0,
-            plusMinus: String(stat.plusMinus ?? 0)
+            minutes: stat.min ?? "0",
+            stats: [
+{stats_dict_lines}
+            ]
         )
     }}
 
@@ -3039,6 +3096,7 @@ private struct SeriesDTO: Decodable {{
 
 write(os.path.join(services_dir, "ProjectionsService.swift"), projections_service_swift)
 write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
+write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9d. Core UI files
@@ -3047,75 +3105,82 @@ write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
 core_ui_dir = os.path.join(out_dir, "App/Sources/Core/UI")
 
 tier_types_ui_swift = header() + """\
-import SwiftUI
 import BKSCore
 import BKSUICore
 
-// MARK: - PlayerTier + UI
+// MARK: - TierLevel threshold wiring
 
-extension PlayerTier {
-    var displayName: String { tierDisplayName + " Tier" }
-    var color: Color { tierColor }
+/// Routes tier threshold display to the sport configuration.
+/// Overrides the empty default in BKSUICore so TierToastView shows
+/// real criteria instead of the fallback placeholder.
+extension TierLevel: @retroactive TierDisplayable {
+    public var tierLevel: TierLevel { self }
 
-    var systemImage: String {
-        switch self {
-        case .elite: "crown.fill"
-        case .good: "star.fill"
-        case .solid: "checkmark.shield.fill"
-        case .bottomFeeder: "figure.walk"
-        }
+    public var tierThresholds: [TierThreshold] {
+        SportConfiguration.basketball.thresholds(for: self)
     }
-
-    var label: String {
-        switch self {
-        case .elite: "Elite"
-        case .good: "Good"
-        case .solid: "Solid"
-        case .bottomFeeder: "Bottom Feeder"
-        }
-    }
-}
-
-// MARK: - RotationTier + UI
-
-extension RotationTier {
-    /// Localized display label for the rotation tier.
-    var displayLabel: String {
-        switch self {
-        case .star:
-            String(localized: "rotationTier.star", defaultValue: "Star")
-        case .starter:
-            String(localized: "rotationTier.starter", defaultValue: "Starter")
-        case .rotation:
-            String(localized: "rotationTier.rotation", defaultValue: "Rotation")
-        case .fringe:
-            String(localized: "rotationTier.fringe", defaultValue: "Fringe")
-        case .bench:
-            String(localized: "rotationTier.bench", defaultValue: "Bench")
-        }
-    }
-
-    /// Color representing the rotation tier.
-    var color: Color {
-        switch self {
-        case .star: Color(red: 1.0, green: 0.843, blue: 0.0)
-        case .starter: Color(red: 0.290, green: 0.565, blue: 0.851)
-        case .rotation: Color(red: 0.204, green: 0.780, blue: 0.349)
-        case .fringe: .orange
-        case .bench: Color(red: 0.557, green: 0.557, blue: 0.576)
-        }
-    }
-}
-
-// MARK: - FeatureTier + UI
-
-extension FeatureTier {
-    var displayName: String { tierDisplayName }
-    var color: Color { tierColor }
 }
 """
 
 write(os.path.join(core_ui_dir, "TierTypes+UI.swift"), tier_types_ui_swift)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9d-ii. Sport-specific model extensions
+# ─────────────────────────────────────────────────────────────────────────────
+
+game_entry_basketball_swift = header() + f"""\
+import BKSCore
+
+// MARK: - GameEntry {swift_name} stat accessors
+
+public extension GameEntry {{
+{stat_accessor_lines}
+}}
+
+// MARK: - PlayerGameLog {swift_name} averages
+
+public extension PlayerGameLog {{
+    var averagePoints: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.points }}) / Double(entries.count)
+    }}
+
+    var averageRebounds: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.rebounds }}) / Double(entries.count)
+    }}
+
+    var averageAssists: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.assists }}) / Double(entries.count)
+    }}
+
+    var averageSteals: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.steals }}) / Double(entries.count)
+    }}
+
+    var fieldGoalPercentage: Double {{
+        let made = entries.reduce(0) {{ $0 + $1.fieldGoalsMade }}
+        let attempted = entries.reduce(0) {{ $0 + $1.fieldGoalsAttempted }}
+        guard attempted > 0 else {{ return 0 }}
+        return Double(made) / Double(attempted) * 100
+    }}
+}}
+"""
+
+projected_stat_line_basketball_swift = header() + f"""\
+import BKSCore
+
+// MARK: - ProjectedStatLine {swift_name} stat accessors
+
+public extension ProjectedStatLine {{
+{proj_accessor_lines}
+}}
+"""
+
+write(os.path.join(models_dir, f"GameEntry+{swift_name}.swift"), game_entry_basketball_swift)
+write(os.path.join(models_dir, f"ProjectedStatLine+{swift_name}.swift"), projected_stat_line_basketball_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9e. Core Utilities
@@ -4703,6 +4768,8 @@ print("Models:")
 print(f"  App/Sources/Core/Models/Player.swift")
 print(f"  App/Sources/Core/Models/Opportunity.swift")
 print(f"  App/Sources/Core/Models/Projection.swift")
+print(f"  App/Sources/Core/Models/GameEntry+{swift_name}.swift")
+print(f"  App/Sources/Core/Models/ProjectedStatLine+{swift_name}.swift")
 print(f"  App/Sources/Core/Models/PlayoffSeries.swift")
 print(f"  App/Sources/Core/Models/LeagueState.swift")
 print()
@@ -4710,6 +4777,7 @@ print("Services (sport-specific implementations — protocols in BKSCore):")
 print(f"  App/Sources/Core/Services/OpportunitiesService.swift")
 print(f"  App/Sources/Core/Services/ProjectionsService.swift")
 print(f"  App/Sources/Core/Services/GamesService.swift")
+print(f"  App/Sources/Core/Services/PlayoffService.swift")
 print()
 print("Sport configuration (BKSCore owns base types; scaffold generates sport extensions):")
 print(f"  App/Sources/Core/Sport/SportPositionMap+{swift_name}.swift")
