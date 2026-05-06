@@ -440,20 +440,10 @@ for tier_key, tier_val in tiers.items():
 
 tier_dict = ",\n".join(tier_cases)
 
-tier_thresh = header() + f"""\
-import BKSCore
-import BKSUICore
-
-extension TierDisplayable {{
-    /// {league}/{name}-specific tier thresholds.
-    /// Delegated to SportConfiguration so the YAML spec is the single source of truth.
-    var tierThresholds: [TierThreshold] {{
-        SportConfiguration.{slug}.thresholds(for: tierLevel)
-    }}
-}}
-"""
-
-write(os.path.join(out_dir, "App/Sources/Core/UI", f"TierThresholds+{swift_name}.swift"), tier_thresh)
+# TierThresholds+{Sport}.swift is intentionally not generated.
+# Threshold wiring lives in TierTypes+UI.swift via the @retroactive TierLevel
+# extension, which also satisfies the TierDisplayable protocol requirement.
+# A separate TierDisplayable extension would conflict with BKSUICore's default.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. SportConfiguration factory extension
@@ -4785,7 +4775,6 @@ print(f"  App/Sources/Core/Sport/{calc_name}.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
 print()
 print("Core UI & Utilities:")
-print(f"  App/Sources/Core/UI/TierThresholds+{swift_name}.swift")
 print(f"  App/Sources/Core/UI/TierTypes+UI.swift")
 print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
 print(f"  App/Sources/Core/Utilities/VisiblePushEvent.swift")
