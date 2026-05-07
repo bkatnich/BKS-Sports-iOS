@@ -91,6 +91,7 @@ api         = spec.get("api", {})
 gamelog         = spec.get("gamelog", {})
 dnp_condition   = gamelog.get("isDNPCondition", "false")
 season      = spec.get("season", {})
+has_playoffs = season.get("hasPlayoffs", False)
 
 swift_name  = name.replace(" ", "")         # "BaseBall" -> "Baseball"
 type_prefix = f"{prefix}{swift_name}"       # "BKSBaseball"
@@ -3648,6 +3649,21 @@ struct ProfileContainerView: View {{
 }}
 """
 
+playoff_toggle = """
+            Toggle(isOn: Binding(
+                get: { profileStore.state.preferences.notificationPreferences.isEnabled(.playoffAlerts) },
+                set: { profileStore.send(.notificationPreferenceToggled(.playoffAlerts, $0)) }
+            )) {
+                Label(
+                    String(localized: "profile.row.notifications.playoff",
+                           defaultValue: "Playoff Alerts"),
+                    systemImage: "trophy.fill"
+                )
+                .foregroundStyle(.white)
+            }
+            .tint(.accentColor)
+            .accessibilityIdentifier("profile.notification.playoff_alerts")""" if has_playoffs else "            EmptyView()"
+
 notifications_detail_swift = header() + f"""import BKSCore
 import BKSUICore
 import SwiftUI
@@ -3655,7 +3671,6 @@ import SwiftUI
 // MARK: - NotificationsDetailView
 //
 // Sport-specific notification preferences injected into BKSNotificationsView.
-// Add Toggle rows here for each sport-specific NotificationPreferenceKey.
 
 struct NotificationsDetailView: View {{
     @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
@@ -3664,16 +3679,7 @@ struct NotificationsDetailView: View {{
         BKSNotificationsView(
             profileStore: profileStore,
             appName: String(localized: "app.name", defaultValue: "{app_name}")
-        ) {{
-            // TODO: add sport-specific notification toggles
-            // Example from basketball:
-            // Toggle(isOn: Binding(
-            //     get: {{ profileStore.state.preferences.notificationPreferences.isEnabled(.playoffAlerts) }},
-            //     set: {{ profileStore.send(.notificationPreferenceToggled(.playoffAlerts, $0)) }}
-            // )) {{
-            //     Label("Playoff Alerts", systemImage: "trophy.fill").foregroundStyle(.white)
-            // }}
-            EmptyView()
+        ) {{{playoff_toggle}
         }}
     }}
 }}
@@ -3685,7 +3691,7 @@ write(os.path.join(board_models_dir,  "BoardEntry.swift"),               board_e
 write_if_absent(os.path.join(board_models_dir,  "BoardEntryBuilder.swift"), board_entry_builder_swift)
 write(os.path.join(board_store_dir,   "BoardIntent.swift"),              board_intent_swift)
 write(os.path.join(board_store_dir,   "BoardState.swift"),               board_state_swift)
-write(os.path.join(board_views_dir,   "BoardView.swift"),                board_view_swift)
+write_if_absent(os.path.join(board_views_dir,   "BoardView.swift"),                board_view_swift)
 write(os.path.join(profile_views_dir, "ProfileContainerView.swift"),     profile_container_swift)
 write(os.path.join(profile_views_dir, "NotificationsDetailView.swift"),  notifications_detail_swift)
 
