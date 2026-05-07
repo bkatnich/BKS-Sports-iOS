@@ -168,17 +168,17 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "1.0.1"
+    from: "2.0.4"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.0.16"
+    from: "1.5.1"
   swinject:
     url: https://github.com/Swinject/Swinject.git
     from: "2.9.0"
   firebaseSDK:
     url: https://github.com/firebase/firebase-ios-sdk.git
     from: "11.0.0"
-  firebaseProducts: [FirebaseAnalytics, FirebaseAuth, FirebaseAppCheck, FirebaseFirestore]
+  firebaseProducts: [FirebaseAnalytics, FirebaseAuth, FirebaseAppCheck, FirebaseFirestore, FirebaseMessaging, FirebaseInAppMessaging-Beta]
 
 # ---------------------------------------------------------------------------
 # API endpoints and field lists per service
@@ -254,6 +254,16 @@ api:
   todayGames:
     url: https://us-central1-bks-baseball.cloudfunctions.net/get_today_games
 
+  redeemPromoCode:
+    url: https://us-central1-bks-baseball.cloudfunctions.net/redeem_promo_code
+
+  leagueState:
+    url: https://us-central1-bks-baseball.cloudfunctions.net/get_league_state
+
+  playoffBracket:
+    url: https://us-central1-bks-baseball.cloudfunctions.net/get_playoff_bracket
+    # No query params sent — server defaults to current playoff year
+
   gameLog:
     baseURL: https://api.balldontlie.io/mlb/v1
     # Requires API key injected via GameLogAPIKey in Info.plist
@@ -287,6 +297,7 @@ gamelog:
     - key: atBats
       type: Int
       label: AB
+      isPlayingTime: true   # used as DNP indicator for hitters (0 AB = did not start)
     - key: single
       type: Int
       label: 1B
@@ -418,6 +429,20 @@ gamelog:
       - key: earnedRunAllowed
         label: ER
         localizationKey: gamelog.header.er
+
+# ---------------------------------------------------------------------------
+# FCM push notification topics
+# ---------------------------------------------------------------------------
+fcm:
+  gamedayTopic: gameday
+  playoffTopic: bks_baseball
+
+# ---------------------------------------------------------------------------
+# Subscription product IDs (StoreKit)
+# ---------------------------------------------------------------------------
+subscription:
+  productSuffix: basic.monthly
+  groupID: BKSBaseballSubscriptions
 
 # ---------------------------------------------------------------------------
 # Context file (used by LLM scaffold prompts)
