@@ -137,6 +137,7 @@ opps_api         = api.get("opportunities", {})
 proj_api         = api.get("projections", {})
 today_api        = api.get("todayGames", {})
 gamelog_api      = api.get("gameLog", {})
+external_id_key  = api.get("externalPersonIDKey", "external_person_id")
 
 players_url      = players_api.get("url", "")
 opps_url         = opps_api.get("url", "")
@@ -1903,7 +1904,7 @@ private struct PlayerDTO: Decodable {{
         case lastName = "last_name"
         case team, position
         case headshotURL = "headshot_url"
-        case externalPersonID = "nba_person_id"
+        case externalPersonID = "{external_id_key}"
         case playerTier = "player_tier"
         case avgFantasyScore = "avg_fantasy_score"
         case avgFantasyScoreHome = "avg_fantasy_score_home"
@@ -2211,7 +2212,7 @@ private struct OpportunityDTO: Decodable {{
         case position
         case opponentAbbr = "opponent_abbr"
         case headshotURL = "headshot_url"
-        case externalPersonID = "nba_person_id"
+        case externalPersonID = "{external_id_key}"
         case opportunityScore = "opportunity_score"
         case opportunityTier = "opportunity_tier"
         case playerTier = "player_tier"
@@ -2423,7 +2424,7 @@ private struct ProjectionPlayerDTO: Decodable {{
         case lastName = "last_name"
         case position
         case team
-        case externalPersonID = "nba_person_id"
+        case externalPersonID = "{external_id_key}"
         case headshotURL = "headshot_url"
         case avgFantasyScore = "avg_fantasy_score"
         case trendDirection = "trend_direction"

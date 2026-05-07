@@ -184,6 +184,7 @@ packages:
 # API endpoints and field lists per service
 # ---------------------------------------------------------------------------
 api:
+  externalPersonIDKey: mlb_person_id
   players:
     url: https://us-central1-bks-baseball.cloudfunctions.net/get_players
     fields:
