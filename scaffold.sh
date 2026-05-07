@@ -111,6 +111,18 @@ def write(path, content):
         f.write(content)
     print(f"  wrote  {os.path.relpath(path, out_dir)}")
 
+def write_if_absent(path, content):
+    """Write only when the file does not already exist.
+    Use this for files that require manual sport-specific implementation
+    so that re-running the scaffold never overwrites hand-written code."""
+    mkdir(os.path.dirname(path))
+    if os.path.exists(path):
+        print(f"  skip   {os.path.relpath(path, out_dir)}  (already exists — manual implementation preserved)")
+        return
+    with open(path, "w") as f:
+        f.write(content)
+    print(f"  wrote  {os.path.relpath(path, out_dir)}  (stub — requires manual implementation)")
+
 # ── copyright header ──────────────────────────────────────────────────────────
 
 def header(year=2026):
@@ -3252,29 +3264,42 @@ struct BoardEntry: Identifiable, Equatable, Hashable {{
 # ── BoardEntryBuilder.swift ──────────────────────────────────────────────────────────
 
 board_entry_builder_swift = header() + f"""import Foundation
+import OSLog
 import BKSCore
 
 // MARK: - BoardEntryBuilder
 //
-// Combines raw service responses into BoardEntry display models.
-// Implement buildEntries() with sport-specific merge logic.
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │  MANUAL IMPLEMENTATION REQUIRED                                         │
+// │                                                                         │
+// │  This file was generated as a stub by the BKS scaffold and will NOT    │
+// │  be overwritten on subsequent scaffold runs.                            │
+// │                                                                         │
+// │  Implement build() following this pattern:                              │
+// │    1. Build [externalPersonID: Projection] and [externalPersonID:      │
+// │       Opportunity] lookup dictionaries (first entry wins on duplicate). │
+// │    2. For each player, find matching projection + opportunity.          │
+// │    3. Identify tonight's game: the upcoming ProjectedGame whose date    │
+// │       matches the server's todayDateString ("yyyy-MM-dd" ET).           │
+// │    4. Resolve scores: tonight → nearest fallback → opportunity.         │
+// │    5. Construct and return BoardEntry. Exclude players with neither     │
+// │       projection nor opportunity.                                       │
+// │    6. See the basketball app's BoardEntryBuilder for a reference impl.  │
+// └─────────────────────────────────────────────────────────────────────────┘
+
+private let logger = os.Logger(subsystem: "{bundle_id}", category: "BoardEntryBuilder")
 
 enum BoardEntryBuilder {{
 
-    /// Merges opportunities, projections, and game data into ranked BoardEntry records.
-    static func buildEntries(
-        opportunities: OpportunitiesResult,
+    static func build(
+        players: [Player],
         projections: [Projection],
-        games: TodaySchedule,
-        sportConfiguration: SportConfiguration
+        opportunities: [Opportunity],
+        todayDateString: String?
     ) -> [BoardEntry] {{
-        // TODO: implement sport-specific entry building
-        // Pattern:
-        //   1. Index projections by player ID
-        //   2. For each opportunity, find matching projection + game
-        //   3. Construct BoardEntry merging all three data sources
-        //   4. Sort by topPickRank, then opportunityScore
-        return []
+        // !! Replace this fatalError with a real implementation before shipping !!
+        // See the basketball app's BoardEntryBuilder.swift for a reference.
+        fatalError("BoardEntryBuilder.build() not yet implemented for {name}")
     }}
 }}
 """
@@ -3644,7 +3669,7 @@ struct NotificationsDetailView: View {{
 # ── Write all files ─────────────────────────────────────────────────────────────────────────
 
 write(os.path.join(board_models_dir,  "BoardEntry.swift"),               board_entry_swift)
-write(os.path.join(board_models_dir,  "BoardEntryBuilder.swift"),        board_entry_builder_swift)
+write_if_absent(os.path.join(board_models_dir,  "BoardEntryBuilder.swift"), board_entry_builder_swift)
 write(os.path.join(board_store_dir,   "BoardIntent.swift"),              board_intent_swift)
 write(os.path.join(board_store_dir,   "BoardState.swift"),               board_state_swift)
 write(os.path.join(board_views_dir,   "BoardView.swift"),                board_view_swift)
