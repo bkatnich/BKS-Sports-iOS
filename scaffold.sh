@@ -88,12 +88,19 @@ tiers       = spec.get("tiers", {})
 scoring     = spec.get("scoring", {})
 packages    = spec.get("packages", {})
 api         = spec.get("api", {})
-gamelog     = spec.get("gamelog", {})
+gamelog         = spec.get("gamelog", {})
+dnp_condition   = gamelog.get("isDNPCondition", "false")
 season      = spec.get("season", {})
 
 swift_name  = name.replace(" ", "")         # "BaseBall" -> "Baseball"
 type_prefix = f"{prefix}{swift_name}"       # "BKSBaseball"
-calc_name   = scoring.get("calculator", f"DraftKings{swift_name}Calculator")
+calc_name   = scoring.get("calculator", f"{swift_name}ScoringCalculator")
+platform_label = (
+    scoring.get("platform", "DraftKings")
+    .replace("draftkings", "DraftKings")
+    .replace("fanduel", "FanDuel")
+)
+scoring_platform = scoring.get("platform", "dk")   # raw platform slug (e.g. "dk", "fd")
 
 # Output directory: explicit arg or auto-derived sibling of this repo
 if OUTPUT_DIR:
@@ -171,7 +178,7 @@ extension ConfigurationKey where Value == Bool {{
 extension ConfigurationKey where Value == String {{
     static let vegasBookPreference = ConfigurationKey(
         name: "vegasBookPreference",
-        defaultValue: "dk"
+        defaultValue: "{scoring_platform}"
     )
     static let fcmGamedayTopic = ConfigurationKey(
         name: "fcmGamedayTopic",
@@ -411,9 +418,9 @@ calc_file = header() + f"""\
 import Foundation
 import BKSCore
 
-// MARK: - DraftKings {league} {name} ({formula})
+// MARK: - {platform_label} {league} {name} ({formula})
 
-/// DraftKings Classic scoring for {league} {name}.
+/// {platform_label} Classic scoring for {league} {name}.
 struct {calc_name}: ScoringCalculator {{
     static let shared = Self()
 
@@ -427,7 +434,7 @@ struct {calc_name}: ScoringCalculator {{
 // MARK: - Convenience
 
 extension ScoringCalculator where Self == {calc_name} {{
-    static var {slug}DraftKings: {calc_name} {{ .shared }}
+    static var {slug}{platform_label}: {calc_name} {{ .shared }}
 }}
 """
 
@@ -510,7 +517,7 @@ import BKSUICore
 // MARK: - {league} {name}
 
 extension SportConfiguration {{
-    /// Sport configuration for {league} {name} / DraftKings Classic.
+    /// Sport configuration for {league} {name} / {platform_label} Classic.
     static let {slug} = SportConfiguration(
         slug: "{slug}",
         cacheKeyPrefix: "{slug}_",
@@ -1108,6 +1115,8 @@ final class AppDelegate: BKSAppDelegate {{
 }}
 """
 
+firebase_network_name = "firebase"  # DI resolver name for the Firebase-authenticated NetworkProtocol
+
 bootstrap_container = header() + f"""\
 import Alamofire
 import BKSCore
@@ -1154,7 +1163,7 @@ extension Container {{
         }}
         register(OpportunitiesServiceProtocol.self) {{ resolver in
             OpportunitiesService(
-                network: resolver.require(NetworkProtocol.self, name: "firebase"),
+                network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
                 storage: resolver.require(StorageProtocol.self),
                 configuration: resolver.require(ConfigurationProtocol.self),
                 sportConfiguration: resolver.require(SportConfiguration.self)
@@ -1162,7 +1171,7 @@ extension Container {{
         }}.inObjectScope(.container)
         register(ProjectionsServiceProtocol.self) {{ resolver in
             ProjectionsService(
-                network: resolver.require(NetworkProtocol.self, name: "firebase"),
+                network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
                 storage: resolver.require(StorageProtocol.self),
                 configuration: resolver.require(ConfigurationProtocol.self),
                 sportConfiguration: resolver.require(SportConfiguration.self)
@@ -1171,7 +1180,7 @@ extension Container {{
         register(GamesServiceProtocol.self) {{ resolver in
             GamesService(
                 network: resolver.require(NetworkProtocol.self, name: "apiKey"),
-                firebaseNetwork: resolver.require(NetworkProtocol.self, name: "firebase"),
+                firebaseNetwork: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
                 storage: resolver.require(StorageProtocol.self),
                 configuration: resolver.require(ConfigurationProtocol.self),
                 sportConfiguration: resolver.require(SportConfiguration.self)
@@ -3138,6 +3147,9 @@ import BKSCore
 
 public extension GameEntry {{
 {stat_accessor_lines}
+
+    /// Sport-specific DNP check. Overrides the BKSCore default.
+    var isDNP: Bool {{ {dnp_condition} }}
 }}
 
 // MARK: - PlayerGameLog {swift_name} averages
