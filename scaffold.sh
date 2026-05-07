@@ -90,8 +90,19 @@ packages    = spec.get("packages", {})
 api         = spec.get("api", {})
 gamelog         = spec.get("gamelog", {})
 dnp_condition   = gamelog.get("isDNPCondition", "false")
-season      = spec.get("season", {})
+season       = spec.get("season", {})
 has_playoffs = season.get("hasPlayoffs", False)
+season_modes = season.get("modes", ["regular_season", "playoffs", "offseason"])
+
+def season_mode_case(raw):
+    """Convert a snake_case mode string to a Swift enum case declaration."""
+    parts = raw.split("_")
+    camel = parts[0] + "".join(p.title() for p in parts[1:])
+    if camel == raw:
+        return f'    case {camel}'
+    return f'    case {camel} = "{raw}"'
+
+season_mode_cases = "\n".join(season_mode_case(m) for m in season_modes)
 
 swift_name  = name.replace(" ", "")         # "BaseBall" -> "Baseball"
 type_prefix = f"{prefix}{swift_name}"       # "BKSBaseball"
@@ -1552,9 +1563,7 @@ enum FeatureTier: String, Codable, Equatable, Hashable, CaseIterable, TierDispla
 // MARK: - SeasonMode
 
 enum SeasonMode: String, Codable, Equatable, Hashable {
-    case regularSeason = "regular_season"
-    case playoffs
-    case offseason
+SEASON_MODE_CASES_PLACEHOLDER
 }
 
 // MARK: - RotationTier
@@ -1567,6 +1576,7 @@ enum RotationTier: String, Codable, Equatable, Hashable {
     case bench
 }
 """
+opportunity_swift = opportunity_swift.replace("SEASON_MODE_CASES_PLACEHOLDER", season_mode_cases)
 
 projection_swift = header() + """\
 import Foundation
@@ -1712,18 +1722,19 @@ struct PlayoffSeries: Codable, Equatable, Hashable, Identifiable {
 }
 """
 
-league_state_swift = header() + """\
-import BKSCore
+_league_playoff_fields = """
+    let playoffRound: Int?
+    let playoffStartDate: String?
+    let regularSeasonEndDate: String?""" if has_playoffs else ""
+
+league_state_swift = header() + f"""import BKSCore
 
 // MARK: - LeagueState
 
-struct LeagueState: Codable, Equatable {
+struct LeagueState: Codable, Equatable {{
     let mode: SeasonMode
-    let playoffRound: Int?
-    let playoffStartDate: String?
-    let regularSeasonEndDate: String?
-    let season: Int?
-}
+    let season: Int?{_league_playoff_fields}
+}}
 """
 
 write(os.path.join(models_dir, "PlayoffSeries.swift"), playoff_series_swift)
