@@ -32,14 +32,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── argument check ───────────────────────────────────────────────────────────
 
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <sport-slug> [output-dir]"
+DRY_RUN=0
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+if [[ ${#POSITIONAL[@]} -lt 1 ]]; then
+    echo "Usage: $0 [--dry-run] <sport-slug> [output-dir]"
     echo "  e.g. $0 baseball"
     echo "  e.g. $0 baseball /path/to/BKS-Baseball-Client-iOS"
+    echo "  e.g. $0 --dry-run baseball    (print what would be generated, no writes)"
     exit 1
 fi
 
-SPORT_SLUG="$1"
+SPORT_SLUG="${POSITIONAL[0]}"
 YAML_FILE="$SCRIPT_DIR/sports/${SPORT_SLUG}.yaml"
 
 if [[ ! -f "$YAML_FILE" ]]; then
@@ -49,11 +59,15 @@ if [[ ! -f "$YAML_FILE" ]]; then
 fi
 
 # Optional explicit output directory; defaults to auto-derived sibling repo
-OUTPUT_DIR="${2:-}"
+OUTPUT_DIR="${POSITIONAL[1]:-}"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "🔍 Dry run — no files will be written."
+fi
 
 # ── python helper: parse yaml and emit scaffold ───────────────────────────────
 
-SCRIPT_DIR="$SCRIPT_DIR" SPORT_SLUG="$SPORT_SLUG" OUTPUT_DIR="$OUTPUT_DIR" python3 << 'PYEOF'
+SCRIPT_DIR="$SCRIPT_DIR" SPORT_SLUG="$SPORT_SLUG" OUTPUT_DIR="$OUTPUT_DIR" DRY_RUN="$DRY_RUN" python3 << 'PYEOF'
 import sys, os, re, textwrap
 sys.path.insert(0, '')
 
@@ -66,11 +80,24 @@ except ImportError:
 SCRIPT_DIR  = os.environ["SCRIPT_DIR"]
 SPORT_SLUG  = os.environ["SPORT_SLUG"]
 OUTPUT_DIR  = os.environ.get("OUTPUT_DIR", "")  # empty string means auto-derive
+DRY_RUN     = os.environ.get("DRY_RUN", "0") == "1"
 
 # ── load spec ─────────────────────────────────────────────────────────────────
 
 with open(os.path.join(SCRIPT_DIR, "sports", f"{SPORT_SLUG}.yaml")) as f:
     spec = yaml.safe_load(f)
+
+# ── validate required top-level sections ──────────────────────────────────────
+
+required_sections = ["sport", "positions", "tiers", "scoring", "api", "gamelog", "fcm", "subscription"]
+missing_sections  = [k for k in required_sections if k not in spec]
+if missing_sections:
+    sys.exit(f"ERROR: {SPORT_SLUG}.yaml is missing required section(s): {', '.join(missing_sections)}")
+
+required_sport_keys = ["name", "slug", "prefix", "appName", "bundleId", "deploymentTarget", "xcodeVersion", "swiftVersion"]
+missing_sport_keys  = [k for k in required_sport_keys if k not in spec.get("sport", {})]
+if missing_sport_keys:
+    sys.exit(f"ERROR: {SPORT_SLUG}.yaml sport section is missing required key(s): {', '.join(missing_sport_keys)}")
 
 sport       = spec["sport"]
 name        = sport["name"]          # e.g. "Baseball"
@@ -125,22 +152,33 @@ def mkdir(path):
     os.makedirs(path, exist_ok=True)
 
 def write(path, content):
+    rel = os.path.relpath(path, out_dir)
+    if DRY_RUN:
+        print(f"  would write  {rel}")
+        return
     mkdir(os.path.dirname(path))
     with open(path, "w") as f:
         f.write(content)
-    print(f"  wrote  {os.path.relpath(path, out_dir)}")
+    print(f"  wrote  {rel}")
 
 def write_if_absent(path, content):
     """Write only when the file does not already exist.
     Use this for files that require manual sport-specific implementation
     so that re-running the scaffold never overwrites hand-written code."""
+    rel = os.path.relpath(path, out_dir)
+    if DRY_RUN:
+        if os.path.exists(path):
+            print(f"  would skip   {rel}  (already exists)")
+        else:
+            print(f"  would write  {rel}  (stub — requires manual implementation)")
+        return
     mkdir(os.path.dirname(path))
     if os.path.exists(path):
-        print(f"  skip   {os.path.relpath(path, out_dir)}  (already exists — manual implementation preserved)")
+        print(f"  skip   {rel}  (already exists — manual implementation preserved)")
         return
     with open(path, "w") as f:
         f.write(content)
-    print(f"  wrote  {os.path.relpath(path, out_dir)}  (stub — requires manual implementation)")
+    print(f"  wrote  {rel}  (stub — requires manual implementation)")
 
 # ── copyright header ──────────────────────────────────────────────────────────
 
@@ -192,6 +230,10 @@ extension ConfigurationKey where Value == String {{
         name: "vegasBookPreference",
         defaultValue: "{scoring_platform}"
     )
+    static let ouPushThreshold = ConfigurationKey(
+        name: "ouPushThreshold",
+        defaultValue: {ou_push_threshold}
+    )
     static let fcmGamedayTopic = ConfigurationKey(
         name: "fcmGamedayTopic",
         defaultValue: "{fcm_gameday}"
@@ -230,6 +272,14 @@ config_keys += f"""\
         name: "getProjectionsURL",
         defaultValue: "{proj_url}"
     )
+    static let termsOfServiceURL = ConfigurationKey(
+        name: "termsOfServiceURL",
+        defaultValue: "https://www.blackkatt.ca/terms-of-service.html"
+    )
+    static let privacyPolicyURL = ConfigurationKey(
+        name: "privacyPolicyURL",
+        defaultValue: "https://www.blackkatt.ca/privacy-policy.html"
+    )
 }}
 
 // MARK: - Background task identifier
@@ -255,12 +305,7 @@ write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"ConfigurationKeys+{s
 #     Cases drive deep-link routing in AppDelegate.handleNotificationTap.
 # ─────────────────────────────────────────────────────────────────────────────
 
-visible_push_events = fcm.get("visiblePushEvents", [
-    {"name": "seriesClinch",    "rawValue": "series_clinch"},
-    {"name": "champion",        "rawValue": "champion"},
-    {"name": "eliminationGame", "rawValue": "elimination_game"},
-    {"name": "bracketAdvance",  "rawValue": "bracket_advance"},
-])
+visible_push_events = fcm.get("visiblePushEvents", [])
 
 cases_block = "\n".join(
     f'    case {e["name"]:<18} = "{e["rawValue"]}"'
@@ -314,10 +359,11 @@ write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"NotificationPreferen
 #     Maps raw FCM event strings → preference keys for this sport.
 # ─────────────────────────────────────────────────────────────────────────────
 
-fcm_cases = "\n".join(
-    f'        case "{e["rawValue"]}":'
-    for e in visible_push_events
-)
+if visible_push_events:
+    raw_values = ", ".join(f'"{e["rawValue"]}"' for e in visible_push_events)
+    fcm_cases = f'        case {raw_values}:\n            self = .playoffAlerts'
+else:
+    fcm_cases = ""
 
 notif_fcm_swift = header() + f"""\
 import BKSCore
@@ -328,7 +374,6 @@ extension NotificationPreferenceKey {{
     init?(fcmEvent: String) {{
         switch fcmEvent {{
 {fcm_cases}
-            self = .playoffAlerts
         default:
             guard let key = NotificationPreferenceKey(coreEvent: fcmEvent) else {{ return nil }}
             self = key
@@ -508,10 +553,11 @@ if opp_fields_str.endswith(","):
     opp_fields_str = opp_fields_str[:-1]
 
 # Opportunity params
-opp_params = opps_api.get("params", {})
-opp_limit    = opp_params.get("limit", 25)
-opp_platform = opp_params.get("platform", "dk")
-opp_mode     = opp_params.get("mode", "balanced")
+opp_params        = opps_api.get("params", {})
+opp_limit         = opp_params.get("limit", 25)
+opp_platform      = opp_params.get("platform", "dk")
+opp_mode          = opp_params.get("mode", "balanced")
+ou_push_threshold = opp_params.get("ouPushThreshold", 0.5)
 
 # Projection params
 proj_params  = proj_api.get("params", {})
@@ -529,9 +575,15 @@ import BKSUICore
 // MARK: - {league} {name}
 
 extension SportConfiguration {{
+    /// Fully-formatted splash subtitle built from the localized format string.
+    var splashSubtitle: String {{
+        String(format: String(localized: "splash.subtitle"), sportName)
+    }}
+
     /// Sport configuration for {league} {name} / {platform_label} Classic.
     static let {slug} = SportConfiguration(
         slug: "{slug}",
+        sportName: String(localized: "splash.sportName", defaultValue: "{name}"),
         cacheKeyPrefix: "{slug}_",
         positionMap: .{slug},
         scoringCalculator: {calc_name}.shared,
@@ -835,6 +887,7 @@ struct {type_prefix}App: App {{
 
     @StateObject private var networkMonitor = NetworkMonitor()
 
+    private let auth: AuthenticationProtocol
     private let opportunitiesService: OpportunitiesServiceProtocol
     private let projectionsService: ProjectionsServiceProtocol
     private let gamesService: GamesServiceProtocol
@@ -861,6 +914,7 @@ struct {type_prefix}App: App {{
         boardStore = container.require(Store<BoardState, BoardIntent>.self)
 
         let auth = container.require(AuthenticationProtocol.self)
+        self.auth = auth
         configuration = container.require(ConfigurationProtocol.self)
         storage = container.require(StorageProtocol.self)
 
@@ -889,11 +943,15 @@ struct {type_prefix}App: App {{
             try? await svc.updatePreferences(prefs)
         }}
 
+        let langService = container.require(LanguagePreferenceServiceProtocol.self)
         signInStore = BKSAppScaffold.makeSignInStore(
             container: container,
             authStore: resolvedAuth
         ) {{
-            Task {{ await Self.prefetch(opps: opps, projs: projs, games: games) }}
+            Task {{
+                await Self.prefetch(opps: opps, projs: projs, games: games)
+                await langService.syncLanguage()
+            }}
         }}
 
         Self.registerDataRefresh(opps: opps, projs: projs, games: games)
@@ -947,7 +1005,7 @@ struct {type_prefix}App: App {{
             }} consentContent: {{ result in
                 subscriptionConsentView(for: result)
             }} signInContent: {{
-                SignInView(store: signInStore, animateIn: splashDismissed, auth: nil) {{ result in
+                SignInView(store: signInStore, animateIn: splashDismissed, auth: auth) {{ result in
                     analyticsAdapter.logEvent(AnalyticsEvent.signUpCompleted, parameters: nil)
                     if loadConsentAccepted(from: storage) {{
                         authStore.send(.signInSucceeded(result))
@@ -961,6 +1019,7 @@ struct {type_prefix}App: App {{
             .sportConfiguration(SportConfiguration.{slug})
             .analytics(analyticsAdapter)
             .environment(\\.subscriptionService, subscriptionService)
+            .environment(\\.gamesService, GamesServiceBox(gamesService))
             .task {{
                 authStore.send(.checkStoredCredential)
                 profileStore.send(.onAppear)
@@ -988,6 +1047,12 @@ struct {type_prefix}App: App {{
                 NotificationCenter.default.publisher(for: DataRefreshTask.dataDidRefreshNotification)
             ) {{ _ in
                 boardStore.send(.refreshRequested)
+            }}
+            .onReceive(
+                NotificationCenter.default.publisher(for: PushNotificationNames.visiblePushTapped)
+            ) {{ notification in
+                guard let eventRaw = notification.object as? String else {{ return }}
+                boardStore.send(.pushNotificationTapped(eventRaw))
             }}
             .onChange(of: boardStore.state.loadState.isLoading) {{ wasLoading, nowLoading in
                 if wasLoading, !nowLoading, isErasingCache {{
@@ -1050,14 +1115,18 @@ struct {type_prefix}App: App {{
     // MARK: - Subscription consent
 
     private func subscriptionConsentView(for result: AuthResult) -> some View {{
-        SubscriptionConsentView(
+        let termsURL = URL(string: configuration.value(for: .termsOfServiceURL))
+            ?? URL(string: "https://www.blackkatt.ca/terms-of-service.html")!  // swiftlint:disable:this force_unwrapping
+        let privacyURL = URL(string: configuration.value(for: .privacyPolicyURL))
+            ?? URL(string: "https://www.blackkatt.ca/privacy-policy.html")!  // swiftlint:disable:this force_unwrapping
+        return SubscriptionConsentView(
             title: String(localized: "consent.title", defaultValue: "Welcome to {app_name}"),
             subtitle: String(
                 localized: "consent.subtitle",
                 defaultValue: "Your subscription keeps the insights sharp all season."
             ),
-            termsURL: URL(string: "https://www.blackkatt.ca/terms-of-service.html")!,
-            privacyURL: URL(string: "https://www.blackkatt.ca/privacy-policy.html")!,
+            termsURL: termsURL,
+            privacyURL: privacyURL,
             promoCodeService: promoCodeService,
             subscriptionService: subscriptionService,
             onAccepted: {{
@@ -1155,7 +1224,7 @@ extension Container {{
     }}
 
     private func registerSportConfiguration() {{
-        register(SportConfiguration.self) {{ _ in .{slug} }}.inObjectScope(.container)
+        register((any SportConfigurationProtocol).self) {{ _ in SportConfiguration.{slug} }}.inObjectScope(.container)
     }}
 
     private func registerSportServices() {{
@@ -1178,7 +1247,7 @@ extension Container {{
                 network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
                 storage: resolver.require(StorageProtocol.self),
                 configuration: resolver.require(ConfigurationProtocol.self),
-                sportConfiguration: resolver.require(SportConfiguration.self)
+                sportConfiguration: resolver.require((any SportConfigurationProtocol).self)
             )
         }}.inObjectScope(.container)
         register(ProjectionsServiceProtocol.self) {{ resolver in
@@ -1186,7 +1255,7 @@ extension Container {{
                 network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
                 storage: resolver.require(StorageProtocol.self),
                 configuration: resolver.require(ConfigurationProtocol.self),
-                sportConfiguration: resolver.require(SportConfiguration.self)
+                sportConfiguration: resolver.require((any SportConfigurationProtocol).self)
             )
         }}.inObjectScope(.container)
         register(GamesServiceProtocol.self) {{ resolver in
@@ -1195,7 +1264,7 @@ extension Container {{
                 firebaseNetwork: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
                 storage: resolver.require(StorageProtocol.self),
                 configuration: resolver.require(ConfigurationProtocol.self),
-                sportConfiguration: resolver.require(SportConfiguration.self)
+                sportConfiguration: resolver.require((any SportConfigurationProtocol).self)
             )
         }}
     }}
@@ -1207,7 +1276,7 @@ extension Container {{
             let opportunityService = resolver.require(OpportunitiesServiceProtocol.self)
             let gamesService = resolver.require(GamesServiceProtocol.self)
             let analysisService = resolver.require(DailyAnalysisServiceProtocol.self)
-            let positionMap = resolver.require(SportConfiguration.self).positionMap
+            let positionMap = resolver.require((any SportConfigurationProtocol).self).positionMap
             return MainActor.assumeIsolated {{
                 Store(
                     initial: BoardState(),
@@ -1464,7 +1533,7 @@ opportunity_swift = header() + """\
 import Foundation
 import BKSCore
 
-struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable {
+struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable, OpportunityProtocol, InjuryTracking {
     let id: String
     let displayName: String
     let team: String
@@ -1474,16 +1543,63 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable {
     let externalPersonID: Int?
 
     // Core Scoring
-    let opportunityScore: Double
-    let opportunityTier: FeatureTier
-    let playerTier: PlayerTier?
+    let opportunityScore: Double?
+    let opportunityTier: TierLevel
+    let playerTierDk: TierLevel?
+    let playerTierFd: TierLevel?
     let mode: String
-    let platform: String
+    let platforms: [String]             // e.g. ["dk", "fd"]
+
+    // Platform-split projections
+    let predictedFpDk: Double?
+    let predictedFpFd: Double?
+    let avgFantasyScoreDk: Double?
+    let avgFantasyScoreFd: Double?
+    let avgFantasyScoreHomeDk: Double?
+    let avgFantasyScoreAwayDk: Double?
+    let avgFantasyScoreHomeFd: Double?
+    let avgFantasyScoreAwayFd: Double?
+    let confidenceScoreDk: Double?
+    let confidenceScoreFd: Double?
+    let fpFloorDk: Double?
+    let fpFloorFd: Double?
+    let fpCeilingDk: Double?
+    let fpCeilingFd: Double?
+    let recentGameScores: [Double]?
+    let recentGameScoresFd: [Double]?
+    let recentGameMinutes: [Double]?
+    let projectedStats: ProjectedStatLine?
+    let simplifiedPer: Double?
+    let trueShootingPct: Double?
+    let usageRateProxy: Double?
+    let playoffSimplifiedPer: Double?
+    let playoffTrueShootingPct: Double?
+    let playoffUsageRateProxy: Double?
 
     // Key Signals
     let injuryStatus: InjuryStatus?
     let isSurging: Bool
     let isHome: Bool
+    /// Scheduled tip-off in UTC. Nil when the API omits the time.
+    let gameDateTime: Date?
+    let probOverDk: Double?
+    let probUnderDk: Double?
+    let probOverFd: Double?
+    let probUnderFd: Double?
+    /// True for the top picks within their opportunity tier.
+    let isTopPick: Bool
+    /// Rank within this player's opportunity tier (1–3). Nil for non-picks.
+    let topPickRank: Int?
+    /// Short tags explaining why this player is a top pick.
+    let topPickReasons: [String]
+    /// True when this player is a top ceiling play on the slate.
+    let isTopCeiling: Bool
+    /// Ceiling rank on the slate (1–3). Nil when isTopCeiling is false.
+    let topCeilingRank: Int?
+    /// True when this player is a top value play on the slate.
+    let isTopValue: Bool
+    /// Value rank on the slate (1–3). Nil when isTopValue is false.
+    let topValueRank: Int?
 
     // Playoff fields (null during regular season)
     let playoffRotationMultiplier: Double?
@@ -1491,8 +1607,22 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable {
     let playoffTrendTrust: Double?
     let playoffGamesPlayed: Int?
 
+    /// Vegas prop lines keyed by bookmaker ("dk", "fd", "pinnacle", "betmgm").
+    let vegasBooks: [String: VegasPropLines]?
+
+    /// Raw DK/FD fantasy points allowed by this opponent at the player's position.
+    let oppPtsAllowedByPos: Double?
+    let oppPtsAllowedByPosFd: Double?
+
+    let seasonFg3Pct: Double?
+    let playoffFg3Pct: Double?
+
+    /// True when the server sent no computed fantasy data for this player.
+    var isStub: Bool { opportunityScore == nil }
+
     var additionalSearchFields: [String] { [opponentAbbr] }
 
+    // swiftlint:disable function_body_length
     // swiftlint:disable:next function_default_parameter_at_end
     init(
         id: String,
@@ -1502,14 +1632,56 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable {
         opponentAbbr: String,
         headshotURL: URL?,
         externalPersonID: Int?,
-        opportunityScore: Double,
-        opportunityTier: FeatureTier,
-        playerTier: PlayerTier?,
-        mode: String,
-        platform: String,
+        opportunityScore: Double?,
+        opportunityTier: TierLevel,
+        playerTierDk: TierLevel?,
+        playerTierFd: TierLevel?,
+        mode: String = "",
+        platforms: [String],
+        predictedFpDk: Double? = nil,
+        predictedFpFd: Double? = nil,
+        avgFantasyScoreDk: Double? = nil,
+        avgFantasyScoreFd: Double? = nil,
+        avgFantasyScoreHomeDk: Double? = nil,
+        avgFantasyScoreAwayDk: Double? = nil,
+        avgFantasyScoreHomeFd: Double? = nil,
+        avgFantasyScoreAwayFd: Double? = nil,
+        confidenceScoreDk: Double? = nil,
+        confidenceScoreFd: Double? = nil,
+        fpFloorDk: Double? = nil,
+        fpFloorFd: Double? = nil,
+        fpCeilingDk: Double? = nil,
+        fpCeilingFd: Double? = nil,
+        recentGameScores: [Double]? = nil,
+        recentGameScoresFd: [Double]? = nil,
+        recentGameMinutes: [Double]? = nil,
+        projectedStats: ProjectedStatLine? = nil,
+        simplifiedPer: Double? = nil,
+        trueShootingPct: Double? = nil,
+        usageRateProxy: Double? = nil,
+        playoffSimplifiedPer: Double? = nil,
+        playoffTrueShootingPct: Double? = nil,
+        playoffUsageRateProxy: Double? = nil,
+        vegasBooks: [String: VegasPropLines]? = nil,
+        oppPtsAllowedByPos: Double? = nil,
+        oppPtsAllowedByPosFd: Double? = nil,
+        seasonFg3Pct: Double? = nil,
+        playoffFg3Pct: Double? = nil,
         injuryStatus: InjuryStatus?,
         isSurging: Bool,
         isHome: Bool,
+        gameDateTime: Date? = nil,
+        probOverDk: Double? = nil,
+        probUnderDk: Double? = nil,
+        probOverFd: Double? = nil,
+        probUnderFd: Double? = nil,
+        isTopPick: Bool = false,
+        topPickRank: Int? = nil,
+        topPickReasons: [String] = [],
+        isTopCeiling: Bool = false,
+        topCeilingRank: Int? = nil,
+        isTopValue: Bool = false,
+        topValueRank: Int? = nil,
         playoffRotationMultiplier: Double? = nil,
         rotationTier: RotationTier? = nil,
         playoffTrendTrust: Double? = nil,
@@ -1524,17 +1696,84 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable {
         self.externalPersonID = externalPersonID
         self.opportunityScore = opportunityScore
         self.opportunityTier = opportunityTier
-        self.playerTier = playerTier
+        self.playerTierDk = playerTierDk
+        self.playerTierFd = playerTierFd
         self.mode = mode
-        self.platform = platform
+        self.platforms = platforms
+        self.predictedFpDk = predictedFpDk
+        self.predictedFpFd = predictedFpFd
+        self.avgFantasyScoreDk = avgFantasyScoreDk
+        self.avgFantasyScoreFd = avgFantasyScoreFd
+        self.avgFantasyScoreHomeDk = avgFantasyScoreHomeDk
+        self.avgFantasyScoreAwayDk = avgFantasyScoreAwayDk
+        self.avgFantasyScoreHomeFd = avgFantasyScoreHomeFd
+        self.avgFantasyScoreAwayFd = avgFantasyScoreAwayFd
+        self.confidenceScoreDk = confidenceScoreDk
+        self.confidenceScoreFd = confidenceScoreFd
+        self.fpFloorDk = fpFloorDk
+        self.fpFloorFd = fpFloorFd
+        self.fpCeilingDk = fpCeilingDk
+        self.fpCeilingFd = fpCeilingFd
+        self.recentGameScores = recentGameScores
+        self.recentGameScoresFd = recentGameScoresFd
+        self.recentGameMinutes = recentGameMinutes
+        self.projectedStats = projectedStats
+        self.simplifiedPer = simplifiedPer
+        self.trueShootingPct = trueShootingPct
+        self.usageRateProxy = usageRateProxy
+        self.playoffSimplifiedPer = playoffSimplifiedPer
+        self.playoffTrueShootingPct = playoffTrueShootingPct
+        self.playoffUsageRateProxy = playoffUsageRateProxy
+        self.vegasBooks = vegasBooks
+        self.oppPtsAllowedByPos = oppPtsAllowedByPos
+        self.oppPtsAllowedByPosFd = oppPtsAllowedByPosFd
+        self.seasonFg3Pct = seasonFg3Pct
+        self.playoffFg3Pct = playoffFg3Pct
         self.injuryStatus = injuryStatus
         self.isSurging = isSurging
         self.isHome = isHome
+        self.gameDateTime = gameDateTime
+        self.probOverDk = probOverDk
+        self.probUnderDk = probUnderDk
+        self.probOverFd = probOverFd
+        self.probUnderFd = probUnderFd
+        self.isTopPick = isTopPick
+        self.topPickRank = topPickRank
+        self.topPickReasons = topPickReasons
+        self.isTopCeiling = isTopCeiling
+        self.topCeilingRank = topCeilingRank
+        self.isTopValue = isTopValue
+        self.topValueRank = topValueRank
         self.playoffRotationMultiplier = playoffRotationMultiplier
         self.rotationTier = rotationTier
         self.playoffTrendTrust = playoffTrendTrust
         self.playoffGamesPlayed = playoffGamesPlayed
     }
+    // swiftlint:enable function_body_length
+}
+
+// MARK: - VegasPropLines
+
+/// A single Vegas prop line for one stat category. Odds are American format (e.g. -110, +120).
+struct VegasPropLine: Codable, Equatable, Hashable {
+    let line: Double
+    let overOdds: Int
+    let underOdds: Int
+    let vig: Double?
+}
+
+/// Vegas prop lines for a player's game. Each field is optional — low-liquidity markets
+/// won't be posted for every player.
+struct VegasPropLines: Codable, Equatable, Hashable {
+    let pts: VegasPropLine?
+    let reb: VegasPropLine?
+    let ast: VegasPropLine?
+    let fg3m: VegasPropLine?
+    let stl: VegasPropLine?
+    let blk: VegasPropLine?
+    let tov: VegasPropLine?
+    let ptsRebAst: VegasPropLine?
+    let ptsReb: VegasPropLine?
 }
 
 // MARK: - FeatureTier
@@ -1772,7 +2011,7 @@ final class TrendingsService: TrendingsServiceProtocol {{
     private let network: NetworkProtocol
     private let storage: StorageProtocol
     private let configuration: ConfigurationProtocol
-    private let sportConfiguration: SportConfiguration
+    private let sportConfiguration: any SportConfigurationProtocol
     private let logger = os.Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
         category: "TrendingsService"
@@ -1789,7 +2028,7 @@ final class TrendingsService: TrendingsServiceProtocol {{
         network: NetworkProtocol,
         storage: StorageProtocol,
         configuration: ConfigurationProtocol,
-        sportConfiguration: SportConfiguration = .{slug}
+        sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
     ) {{
         self.network = network
         self.storage = storage
@@ -2077,7 +2316,7 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
     private let network: NetworkProtocol
     private let storage: StorageProtocol
     private let configuration: ConfigurationProtocol
-    private let sportConfiguration: SportConfiguration
+    private let sportConfiguration: any SportConfigurationProtocol
     private let logger = os.Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
         category: "OpportunitiesService"
@@ -2095,7 +2334,7 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
         network: NetworkProtocol,
         storage: StorageProtocol,
         configuration: ConfigurationProtocol,
-        sportConfiguration: SportConfiguration = .{slug}
+        sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
     ) {{
         self.network = network
         self.storage = storage
@@ -2278,7 +2517,7 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
     private let network: NetworkProtocol
     private let storage: StorageProtocol
     private let configuration: ConfigurationProtocol
-    private let sportConfiguration: SportConfiguration
+    private let sportConfiguration: any SportConfigurationProtocol
     private let logger = os.Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
         category: "ProjectionsService"
@@ -2295,7 +2534,7 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
         network: NetworkProtocol,
         storage: StorageProtocol,
         configuration: ConfigurationProtocol,
-        sportConfiguration: SportConfiguration = .{slug}
+        sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
     ) {{
         self.network = network
         self.storage = storage
@@ -2563,7 +2802,7 @@ final class GamesService: GamesServiceProtocol {{
     private let firebaseNetwork: NetworkProtocol
     private let storage: StorageProtocol
     private let configuration: ConfigurationProtocol
-    private let sportConfiguration: SportConfiguration
+    private let sportConfiguration: any SportConfigurationProtocol
     private let logger = os.Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
         category: "GamesService"
@@ -2584,7 +2823,7 @@ final class GamesService: GamesServiceProtocol {{
         firebaseNetwork: NetworkProtocol,
         storage: StorageProtocol,
         configuration: ConfigurationProtocol,
-        sportConfiguration: SportConfiguration = .{slug}
+        sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
     ) {{
         self.network = network
         self.firebaseNetwork = firebaseNetwork
@@ -3123,10 +3362,8 @@ write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
 write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9d. Core UI files
+# 9d. Core Utilities files (continued)
 # ─────────────────────────────────────────────────────────────────────────────
-
-core_ui_dir = os.path.join(out_dir, "App/Sources/Core/UI")
 
 tier_types_ui_swift = header() + """\
 import BKSCore
@@ -3141,12 +3378,12 @@ extension TierLevel: @retroactive TierDisplayable {
     public var tierLevel: TierLevel { self }
 
     public var tierThresholds: [TierThreshold] {
-        SportConfiguration.basketball.thresholds(for: self)
+        SportConfiguration.{slug}.thresholds(for: self)
     }
 }
 """
 
-write(os.path.join(core_ui_dir, "TierTypes+UI.swift"), tier_types_ui_swift)
+write(os.path.join(utilities_dir, "TierTypes+UI.swift"), tier_types_ui_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9d-ii. Sport-specific model extensions
@@ -3322,9 +3559,12 @@ enum BoardEntryBuilder {{
         opportunities: [Opportunity],
         todayDateString: String?
     ) -> [BoardEntry] {{
-        // !! Replace this fatalError with a real implementation before shipping !!
+        // Replace this stub with a real implementation before shipping.
         // See the basketball app's BoardEntryBuilder.swift for a reference.
-        fatalError("BoardEntryBuilder.build() not yet implemented for {name}")
+        #if DEBUG
+        assertionFailure("BoardEntryBuilder.build() not yet implemented for {name}")
+        #endif
+        return []
     }}
 }}
 """
@@ -3344,6 +3584,7 @@ struct BoardLoadResult {{
     let gameOdds: [String: GameOdds]
     let serverDateString: String?
     let dailyAnalysis: DailyAnalysis?
+    let playoffSeries: [PlayoffSeries]
 }}
 
 // MARK: - BoardViewMode
@@ -3365,12 +3606,15 @@ enum BoardIntent: CancellableIntent {{
     case tierFilterChanged(TierLevel?)
     case viewModeChanged(BoardViewMode)
     case navigationPathChanged(NavigationPath)
-    case playoffNotificationTapped(VisiblePushEvent, [AnyHashable: Any])
+    case pushNotificationTapped(String)
+    case deepLinkHandled
+    case refreshBannerExpired
 
     var cancelsInFlightWork: Bool {{
         switch self {{
         case .navigationPathChanged, .searchTextChanged, .positionFilterChanged,
-             .tierFilterChanged, .viewModeChanged, .playoffNotificationTapped:
+             .tierFilterChanged, .viewModeChanged, .pushNotificationTapped,
+             .deepLinkHandled, .refreshBannerExpired:
             false
         default:
             true
@@ -3526,8 +3770,14 @@ struct BoardState {{
                 state.navigationPath = path
                 return .none
 
-            case .playoffNotificationTapped:
-                // TODO: handle playoff notification deep-link routing
+            case .pushNotificationTapped:
+                // TODO: handle push notification deep-link routing
+                return .none
+
+            case .deepLinkHandled:
+                return .none
+
+            case .refreshBannerExpired:
                 return .none
             }}
         }}
@@ -4688,7 +4938,7 @@ Sources/
 
 ### Agent ownership boundaries
 - **Core/Services/ + Core/Models/**: Data Agent
-- **Core/Sport/ + Core/Utilities/ + Core/UI/**: whichever agent's task requires it; coordinate if both need changes
+- **Core/Sport/ + Core/Utilities/ + Core/Utilities/**: whichever agent's task requires it; coordinate if both need changes
 - **Features/*/Views/**: UI Agent
 - **Features/*/Store/**: UI Agent (state) or Data Agent (service wiring)
 - **Tests/**: Test Agent
@@ -4710,7 +4960,7 @@ Each agent owns a distinct set of files. Two agents must never edit the same fil
 - **UI Agent**: `Sources/Features/*/Views/`
 - **Data Agent**: `Sources/Core/Services/`, `Sources/Core/Models/`
 - **Test Agent**: `Tests/`
-- Shared code (`Sources/Core/Sport/`, `Sources/Core/Utilities/`, `Sources/Core/UI/`) is owned by whichever agent's task requires the change; coordinate via the lead if both need changes
+- Shared code (`Sources/Core/Sport/`, `Sources/Core/Utilities/`, `Sources/Core/Utilities/`) is owned by whichever agent's task requires the change; coordinate via the lead if both need changes
 
 ### Workflow stages
 1. **Research** — Read-only agents investigate in parallel. No file writes.
@@ -4830,7 +5080,7 @@ print(f"  App/Sources/Core/Sport/{calc_name}.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
 print()
 print("Core UI & Utilities:")
-print(f"  App/Sources/Core/UI/TierTypes+UI.swift")
+print(f"  App/Sources/Core/Utilities/TierTypes+UI.swift")
 print(f"  App/Sources/Core/Utilities/ConfigurationKeys+{swift_name}.swift")
 print(f"  App/Sources/Core/Utilities/VisiblePushEvent.swift")
 print(f"  App/Sources/Core/Utilities/NotificationPreferenceKey+{swift_name}.swift")
@@ -4882,6 +5132,14 @@ print(f"  2. Fill in teamAbbreviationByID in SportConfiguration+{swift_name}.swi
 print(f"  3. Fill in real API keys in App/Config/Debug.xcconfig (gitignored)")
 PYEOF
 
+# ── skip remaining steps in dry-run mode ─────────────────────────────────────
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo ""
+    echo "✅ Dry run complete — no files were written."
+    exit 0
+fi
+
 # ── copy shared assets ────────────────────────────────────────────────────────
 
 ASSETS_SRC="$SCRIPT_DIR/assets/Assets.xcassets"
@@ -4912,7 +5170,36 @@ STRINGS_DST="$(dirname "$ASSETS_DST")/Localizable.xcstrings"
 if [[ -f "$STRINGS_SRC" ]]; then
     cp "$STRINGS_SRC" "$STRINGS_DST"
     echo "  copied Localizable.xcstrings → App/Sources/App/Resources/"
-    echo "         (en, fr-CA, es — 100% translated, 257 keys)"
+
+    # Inject sport-specific splash.sportName key into the generated catalog.
+    # The shared catalog cannot contain this value because it differs per sport.
+    SPORT_DISPLAY="$(python3 -c "import yaml; s=yaml.safe_load(open('$SCRIPT_DIR/sports/$SPORT_SLUG.yaml')); print(s['sport'].get('displayName', s['sport']['name']))")"
+    python3 - "$STRINGS_DST" "$SPORT_DISPLAY" <<'PYEOF'
+import sys, json
+
+catalog_path = sys.argv[1]
+sport_display = sys.argv[2]
+
+with open(catalog_path, "r", encoding="utf-8") as f:
+    catalog = json.load(f)
+
+# French and Spanish sport names default to the English display name.
+# Translators can override these values in the string catalog after generation.
+catalog["strings"]["splash.sportName"] = {
+    "comment": "The sport name shown in the splash screen subtitle (e.g. 'Basketball Edition').",
+    "extractionState": "manual",
+    "localizations": {
+        "en":    {"stringUnit": {"state": "translated", "value": sport_display}},
+        "es":    {"stringUnit": {"state": "translated", "value": sport_display}},
+        "fr-CA": {"stringUnit": {"state": "translated", "value": sport_display}},
+    }
+}
+
+with open(catalog_path, "w", encoding="utf-8") as f:
+    json.dump(catalog, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PYEOF
+    echo "  injected splash.sportName = \"$SPORT_DISPLAY\" into Localizable.xcstrings"
 else
     echo "  warning: $STRINGS_SRC not found — skipping strings copy"
 fi

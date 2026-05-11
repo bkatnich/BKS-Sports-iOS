@@ -4,6 +4,7 @@
 
 sport:
   name: Baseball
+  displayName: Baseball      # Localized splash screen subtitle sport name (splash.sportName)
   slug: baseball
   prefix: BKS
   appName: BKS Baseball
@@ -168,10 +169,10 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "2.0.4"
+    from: "2.1.6"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.5.1"
+    from: "1.5.16"
   swinject:
     url: https://github.com/Swinject/Swinject.git
     from: "2.9.0"

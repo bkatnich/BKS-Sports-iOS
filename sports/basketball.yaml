@@ -4,6 +4,7 @@
 
 sport:
   name: Basketball
+  displayName: Basketball    # Localized splash screen subtitle sport name (splash.sportName)
   slug: basketball
   prefix: BKS
   appName: BKS Basketball
@@ -139,10 +140,10 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "1.7.0"
+    from: "2.1.6"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.5.0"
+    from: "1.5.16"
   swinject:
     url: https://github.com/Swinject/Swinject.git
     from: "2.9.0"
@@ -172,6 +173,8 @@ api:
       - avg_fantasy_score_away
       - avg_minutes
       - recent_game_scores
+      - recent_game_scores_fd
+      - recent_game_minutes
       - trend_score
       - trend_direction
       - trend_acceleration
@@ -180,7 +183,14 @@ api:
       - surging_category_count
       - confidence_score
       - consistency_score
-      - playoff_data_confidence
+      - simplified_per
+      - true_shooting_pct
+      - usage_rate_proxy
+      - playoff_simplified_per
+      - playoff_true_shooting_pct
+      - playoff_usage_rate_proxy
+      - season_fg3_pct
+      - playoff_fg3_pct
       - injury_status
       - previous_injury_status
       - injury_status_changed_at
@@ -188,6 +198,9 @@ api:
       - days_since_return
       - is_role_change
       - usage_efficiency_signal
+      - is_confirmed_starter
+      - lineup_confirmed_at
+      - season_games
     params: {}
 
   opportunities:
@@ -203,9 +216,36 @@ api:
       - nba_person_id
       - opportunity_score
       - opportunity_tier
-      - player_tier
+      - player_tier_dk
+      - player_tier_fd
       - mode
-      - platform
+      - platforms
+      - predicted_fp_dk
+      - predicted_fp_fd
+      - avg_fantasy_score_dk
+      - avg_fantasy_score_fd
+      - avg_fantasy_score_home
+      - avg_fantasy_score_away
+      - avg_fantasy_score_home_fd
+      - avg_fantasy_score_away_fd
+      - confidence_score_dk
+      - confidence_score_fd
+      - fp_floor_dk
+      - fp_floor_fd
+      - fp_ceiling_dk
+      - fp_ceiling_fd
+      - recent_game_scores
+      - recent_game_scores_fd
+      - recent_game_minutes
+      - projected_stats
+      - simplified_per
+      - true_shooting_pct
+      - usage_rate_proxy
+      - playoff_simplified_per
+      - playoff_true_shooting_pct
+      - playoff_usage_rate_proxy
+      - season_fg3_pct
+      - playoff_fg3_pct
       - injury_status
       - is_surging
       - is_home
@@ -213,10 +253,16 @@ api:
       - rotation_tier
       - playoff_trend_trust
       - playoff_games_played
+      - is_top_pick
+      - top_pick_rank
+      - top_pick_reasons
+      - vegas_prop_lines
+      - opp_pts_allowed_by_pos
+      - opp_pts_allowed_by_pos_fd
     params:
       limit: 25
-      platform: dk
       mode: balanced
+      ouPushThreshold: 0.5  # O/U highlight threshold — emitted as ConfigurationKey<Double>
 
   projections:
     url: https://us-central1-trendspotter-dbb4d.cloudfunctions.net/get_projections
@@ -372,6 +418,15 @@ gamelog:
 fcm:
   gamedayTopic: gameday
   playoffTopic: bks_basketball
+  visiblePushEvents:
+    - name: seriesClinch
+      rawValue: series_clinch
+    - name: champion
+      rawValue: champion
+    - name: eliminationGame
+      rawValue: elimination_game
+    - name: bracketAdvance
+      rawValue: bracket_advance
 
 # ---------------------------------------------------------------------------
 # Subscription product IDs (StoreKit)
