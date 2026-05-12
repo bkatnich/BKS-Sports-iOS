@@ -169,10 +169,10 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "2.1.6"
+    from: "2.1.7"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.5.16"
+    from: "1.5.17"
   swinject:
     url: https://github.com/Swinject/Swinject.git
     from: "2.9.0"
@@ -187,7 +187,7 @@ packages:
 api:
   externalPersonIDKey: mlb_person_id
   players:
-    url: https://us-central1-bks-baseball.cloudfunctions.net/get_players
+    url: ""
     fields:
       - id
       - first_name
@@ -219,7 +219,7 @@ api:
     params: {}
 
   opportunities:
-    url: https://us-central1-bks-baseball.cloudfunctions.net/get_opportunities
+    url: ""
     fields:
       - id
       - first_name
@@ -246,7 +246,7 @@ api:
       mode: balanced
 
   projections:
-    url: https://us-central1-bks-baseball.cloudfunctions.net/get_projections
+    url: ""
     fields: []
     params:
       lookahead: 5
@@ -254,16 +254,16 @@ api:
       mode: gpp
 
   todayGames:
-    url: https://us-central1-bks-baseball.cloudfunctions.net/get_today_games
+    url: ""
 
   redeemPromoCode:
-    url: https://us-central1-bks-baseball.cloudfunctions.net/redeem_promo_code
+    url: ""
 
   leagueState:
-    url: https://us-central1-bks-baseball.cloudfunctions.net/get_league_state
+    url: ""
 
   playoffBracket:
-    url: https://us-central1-bks-baseball.cloudfunctions.net/get_playoff_bracket
+    url: ""
     # No query params sent — server defaults to current playoff year
 
   gameLog:
@@ -433,11 +433,57 @@ gamelog:
         localizationKey: gamelog.header.er
 
 # ---------------------------------------------------------------------------
+# Team ID → abbreviation (BallDontLie /mlb/v1/teams integer IDs)
+# ---------------------------------------------------------------------------
+teamIDs:
+  1: ARI
+  2: ATL
+  3: BAL
+  4: BOS
+  5: CHC
+  6: CHW
+  7: CIN
+  8: CLE
+  9: COL
+  10: DET
+  11: HOU
+  12: KC
+  13: LAA
+  14: LAD
+  15: MIA
+  16: MIL
+  17: MIN
+  18: NYM
+  19: NYY
+  20: OAK
+  21: PHI
+  22: PIT
+  23: SD
+  24: SF
+  25: SEA
+  26: STL
+  27: TB
+  28: TEX
+  29: TOR
+  30: WSH
+
+# ---------------------------------------------------------------------------
 # FCM push notification topics
 # ---------------------------------------------------------------------------
 fcm:
   gamedayTopic: gameday
   playoffTopic: bks_baseball
+  visiblePushEvents:
+    - name: seriesClinch
+      rawValue: series_clinch
+    - name: champion
+      rawValue: champion
+    - name: eliminationGame
+      rawValue: elimination_game
+    - name: bracketAdvance
+      rawValue: bracket_advance
+    - name: analysisReady
+      rawValue: analysis_ready
 
 # ---------------------------------------------------------------------------
 # Subscription product IDs (StoreKit)
