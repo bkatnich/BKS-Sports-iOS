@@ -3484,6 +3484,8 @@ struct BoardView: View {{
     let onEraseCachedData: () -> Void
 
     @State private var showProfile = false
+    @State private var showInbox = false
+    private let notificationLogger = PushNotificationLogger.shared
 
     private var searchBinding: Binding<String> {{
         Binding(
@@ -3537,21 +3539,61 @@ struct BoardView: View {{
                 }}
         }}
         .task {{ store.send(.onAppear) }}
+        .sheet(isPresented: $showInbox) {{
+            NotificationInboxView(
+                logger: notificationLogger,
+                activityService: activityService
+            ) {{ _ in EmptyView() }}
+        }}
+        .onReceive(NotificationCenter.default.publisher(for: PushNotificationNames.openInboxRequested)) {{ _ in
+            showInbox = true
+        }}
     }}
 
     private var customNavBar: some View {{
         AppCustomNavBar(
             title: String(localized: "board.title", defaultValue: "Today's Blackboard"),
             subtitle: subtitleText,
-            slotWidth: 44,
-            leading: {{ Color.clear.frame(width: 44, height: 44) }},
-            trailing: {{
-                Button {{ showProfile = true }} label: {{
-                    Image(systemName: "person")
-                        .font(.system(size: 20))
-                        .foregroundStyle(.white)
+            slotWidth: 60,
+            leading: {{
+                if case .loaded = store.state.loadState {{
+                    Image("InAppIcon")
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 48, height: 48)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }} else {{
+                    Color.clear.frame(width: 48, height: 48)
                 }}
-                .accessibilityLabel(String(localized: "a11y.label.profile", defaultValue: "Profile"))
+            }},
+            trailing: {{
+                HStack(spacing: 16) {{
+                    Button {{ showInbox = true }} label: {{
+                        ZStack(alignment: .topTrailing) {{
+                            Image(systemName: "bell.fill")
+                                .font(.system(size: 20))
+                                .foregroundStyle(.white)
+                            if notificationLogger.unreadCount > 0 {{
+                                Circle()
+                                    .fill(Color.red)
+                                    .frame(width: 8, height: 8)
+                                    .offset(x: 4, y: -4)
+                            }}
+                        }}
+                    }}
+                    .accessibilityLabel(
+                        notificationLogger.unreadCount > 0
+                            ? String(localized: "a11y.label.alertsUnread",
+                                     defaultValue: "Alerts, \\(notificationLogger.unreadCount) unread")
+                            : String(localized: "a11y.label.alerts", defaultValue: "Alerts")
+                    )
+                    Button {{ showProfile = true }} label: {{
+                        Image(systemName: "person")
+                            .font(.system(size: 20))
+                            .foregroundStyle(.white)
+                    }}
+                    .accessibilityLabel(String(localized: "a11y.label.profile", defaultValue: "Profile"))
+                }}
             }}
         )
     }}
