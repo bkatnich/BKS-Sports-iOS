@@ -1363,13 +1363,14 @@ extension Container {{
                 sportConfiguration: resolver.require((any SportConfigurationProtocol).self)
             )
         }}
-        register(PlayoffServiceProtocol.self) {{ resolver in
-            PlayoffService(
-                network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
-                storage: resolver.require(StorageProtocol.self),
-                configuration: resolver.require(ConfigurationProtocol.self)
-            )
-        }}.inObjectScope(.container)
+        // PlayoffService has been merged into GamesService.
+        // register(PlayoffServiceProtocol.self) {{ resolver in
+        //     PlayoffService(
+        //         network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
+        //         storage: resolver.require(StorageProtocol.self),
+        //         configuration: resolver.require(ConfigurationProtocol.self)
+        //     )
+        // }}.inObjectScope(.container)
     }}
 
     @MainActor
@@ -1644,7 +1645,8 @@ struct LeagueState: Codable, Equatable {{
 
 write(os.path.join(models_dir, "PlayoffSeries.swift"), playoff_series_swift)
 write(os.path.join(models_dir, "LeagueState.swift"), league_state_swift)
-write_if_absent(os.path.join(models_dir, "Player.swift"), player_swift)
+# Player is now a shared public type in BKSCore — no local Player.swift generated
+# write_if_absent(os.path.join(models_dir, "Player.swift"), player_swift)
 write_if_absent(os.path.join(models_dir, "Opportunity.swift"), opportunity_swift)
 write_if_absent(os.path.join(models_dir, "Projection.swift"), projection_swift)
 
@@ -2448,6 +2450,65 @@ proj_accessor_lines = "\n".join(
     for k in proj_stat_keys
 )
 
+# Build PlayerGameLog average computed properties from gamelog.averages YAML entries.
+# Each entry has key, sourceKey, and label. We generate a simple count-based average
+# (sourceKey total / non-DNP game count), except for named special keys that get
+# sport-specific formulas injected below.
+gamelog_averages = gamelog.get("averages", [])
+gamelog_percentages = gamelog.get("percentages", [])
+
+# Build a lookup of stat key → type for quick access
+stat_type_map = {s["key"]: s.get("type", "Int") for s in gamelog_stats}
+
+def average_property_lines(averages, percentages, stats):
+    """Return Swift source lines for PlayerGameLog computed average properties."""
+    lines = []
+    for avg in averages:
+        key = avg["key"]
+        src = avg["sourceKey"]
+        src_type = stat_type_map.get(src, "Int")
+        if key == "battingAverage":
+            # Total hits (1B+2B+3B+HR) / atBats
+            lines.append(f"""    var battingAverage: Double {{
+        let ab = entries.reduce(0) {{ $0 + $1.atBats }}
+        guard ab > 0 else {{ return 0 }}
+        let hits = entries.reduce(0) {{ $0 + $1.single + $1.double + $1.triple + $1.homeRun }}
+        return Double(hits) / Double(ab)
+    }}""")
+        elif key == "averageERA":
+            # earnedRunAllowed * 9.0 / totalIP; guard IP > 0
+            lines.append(f"""    var averageERA: Double {{
+        let ip = entries.reduce(0.0) {{ $0 + $1.inningsPitched }}
+        guard ip > 0 else {{ return 0 }}
+        let er = entries.reduce(0) {{ $0 + $1.earnedRunAllowed }}
+        return Double(er) * 9.0 / ip
+    }}""")
+        else:
+            # Generic count-based average: total / number of played games
+            if src_type == "Double":
+                lines.append(f"""    var {key}: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return entries.reduce(0.0) {{ $0 + $1.{src} }} / Double(entries.count)
+    }}""")
+            else:
+                lines.append(f"""    var {key}: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.{src} }}) / Double(entries.count)
+    }}""")
+    for pct in percentages:
+        key = pct["key"]
+        made = pct["madeKey"]
+        attempted = pct["attemptedKey"]
+        lines.append(f"""    var {key}: Double {{
+        let made = entries.reduce(0) {{ $0 + $1.{made} }}
+        let attempted = entries.reduce(0) {{ $0 + $1.{attempted} }}
+        guard attempted > 0 else {{ return 0 }}
+        return Double(made) / Double(attempted) * 100
+    }}""")
+    return "\n\n".join(lines)
+
+gamelog_average_properties = average_property_lines(gamelog_averages, gamelog_percentages, gamelog_stats)
+
 games_service_swift = header() + f"""\
 import Alamofire
 import BKSCore
@@ -2456,12 +2517,8 @@ import OSLog
 
 // MARK: - GamesServiceProtocol
 
-protocol GamesServiceProtocol {{
+protocol GamesServiceProtocol: BKSCore.GamesServiceProtocol {{
     func fetchGameLog(playerID: String, teamID: String) async throws -> PlayerGameLog
-    func fetchGameLogs(playerIDs: [String], startDate: Date) async throws -> [PlayerGameLog]
-    func loadCachedGameLog(playerID: String) throws -> PlayerGameLog?
-    func fetchTodaySchedule() async throws -> TodaySchedule
-    func loadCachedTodaySchedule() throws -> TodaySchedule?
 }}
 
 // MARK: - GamesService
@@ -2595,6 +2652,7 @@ final class GamesService: GamesServiceProtocol {{
         let schedule = TodaySchedule(
             date: response.date,
             gameCount: response.gameCount,
+            noGamesToday: response.message?.lowercased().contains("no games") ?? false,
             games: response.games.map {{ dto in
                 ScheduledGame(
                     id: dto.gameID,
@@ -2602,7 +2660,7 @@ final class GamesService: GamesServiceProtocol {{
                     visitorTeamAbbr: dto.visitorTeamAbbr,
                     status: dto.status,
                     gameType: dto.gameType,
-                    gameDatetime: parseDate(dto.gameDatetime)
+                    gameDatetime: dto.gameDatetime.flatMap {{ parseDate($0) }} ?? parseDateOnly(response.date)
                 )
             }}
         )
@@ -2620,6 +2678,33 @@ final class GamesService: GamesServiceProtocol {{
         try storage.load(forKey: todayScheduleCacheKey, from: .file)
     }}
 
+    func fetchPlayoffBracket() async throws -> [PlayoffSeries] {{
+        let url: String = configuration.value(for: .getPlayoffBracketURL)
+        let response: BracketResponse = try await firebaseNetwork.get(url, parameters: nil)
+        let series = response.series.map {{ dto in
+            PlayoffSeries(
+                seriesID: dto.seriesID,
+                higherSeedTeam: dto.higherSeedTeam,
+                lowerSeedTeam: dto.lowerSeedTeam,
+                winsHigherSeed: dto.winsHigherSeed,
+                winsLowerSeed: dto.winsLowerSeed,
+                gamesPlayed: dto.gamesPlayed,
+                status: dto.status,
+                roundNumber: dto.roundNumber,
+                roundName: dto.roundName,
+                conference: dto.conference,
+                gameResults: []
+            )
+        }}
+        do {{
+            try storage.save(series, forKey: "{slug}_playoff_bracket_v1", in: .file)
+        }} catch {{
+            logger.warning("Failed to cache playoff bracket: \\\\(error.localizedDescription, privacy: .public)")
+        }}
+        logger.info("Fetched playoff bracket: \\\\(series.count, privacy: .public) series")
+        return series
+    }}
+
     // MARK: - Mapping
 
     // swiftlint:disable:next function_body_length
@@ -2629,11 +2714,11 @@ final class GamesService: GamesServiceProtocol {{
         let gameDate = parseDate(game.date ?? "")
 
         let isHome: Bool = {{
-            if let homeTeam = game.homeTeam {{
-                return String(homeTeam.id) == teamID
+            if let homeAbbr = game.homeTeam?.abbreviation {{
+                return homeAbbr.uppercased() == teamID.uppercased()
             }}
             if let homeID = game.homeTeamID {{
-                return String(homeID) == teamID
+                return sportConfiguration.teamAbbreviation(for: homeID).uppercased() == teamID.uppercased()
             }}
             return false
         }}()
@@ -2683,6 +2768,16 @@ final class GamesService: GamesServiceProtocol {{
         let dayFormatter = DateFormatter()
         dayFormatter.dateFormat = "yyyy-MM-dd"
         return dayFormatter.date(from: String(string.prefix(10))) ?? Date()
+    }}
+
+    private func parseDateOnly(_ dateString: String) -> Date {{
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter.date(from: String(dateString.prefix(10))) ?? Date()
     }}
 
     private func currentSeason() -> Int {{
@@ -2818,11 +2913,13 @@ private struct TodayScheduleResponse: Decodable {{
     let date: String
     let gameCount: Int
     let games: [ScheduledGameDTO]
+    let message: String?
 
     enum CodingKeys: String, CodingKey {{
         case date
         case gameCount = "game_count"
         case games
+        case message
     }}
 }}
 
@@ -2832,7 +2929,17 @@ private struct ScheduledGameDTO: Decodable {{
     let visitorTeamAbbr: String
     let status: String
     let gameType: String
-    let gameDatetime: String
+    let gameDatetime: String?
+    let homeOdds: GameSideOddsDTO?
+    let visitorOdds: GameSideOddsDTO?
+    let homeProjTotal: Double?
+    let visitorProjTotal: Double?
+    let projTotal: Double?
+    let bkWinner: String?
+    let bkWinnerConfidence: Double?
+    let bkSpreadPick: String?
+    let bkSpreadPickCovers: Bool?
+    let bkSpreadConfidence: Double?
 
     enum CodingKeys: String, CodingKey {{
         case gameID = "game_id"
@@ -2841,6 +2948,66 @@ private struct ScheduledGameDTO: Decodable {{
         case status
         case gameType = "game_type"
         case gameDatetime = "game_datetime"
+        case homeOdds = "home_odds"
+        case visitorOdds = "visitor_odds"
+        case homeProjTotal = "home_proj_total"
+        case visitorProjTotal = "visitor_proj_total"
+        case projTotal = "proj_total"
+        case bkWinner = "bk_winner"
+        case bkWinnerConfidence = "bk_winner_confidence"
+        case bkSpreadPick = "bk_spread_pick"
+        case bkSpreadPickCovers = "bk_spread_pick_covers"
+        case bkSpreadConfidence = "bk_spread_confidence"
+    }}
+}}
+
+private struct GameSideOddsDTO: Decodable {{
+    let impliedTeamTotal: Double
+    let overUnder: Double
+    let spread: Double
+    let isFavorite: Bool
+    let marketWinProb: Double?
+    let divergence: Double?
+
+    enum CodingKeys: String, CodingKey {{
+        case impliedTeamTotal = "implied_team_total"
+        case overUnder = "over_under"
+        case spread
+        case isFavorite = "is_favorite"
+        case marketWinProb = "market_win_prob"
+        case divergence
+    }}
+}}
+
+// MARK: - Playoff Bracket DTOs
+
+private struct BracketResponse: Decodable {{
+    let series: [SeriesDTO]
+}}
+
+private struct SeriesDTO: Decodable {{
+    let seriesID: String
+    let roundNumber: Int
+    let roundName: String
+    let conference: String
+    let higherSeedTeam: String
+    let lowerSeedTeam: String
+    let winsHigherSeed: Int
+    let winsLowerSeed: Int
+    let status: String
+    let gamesPlayed: Int
+
+    enum CodingKeys: String, CodingKey {{
+        case seriesID = "series_id"
+        case roundNumber = "round_number"
+        case roundName = "round_name"
+        case conference
+        case higherSeedTeam = "higher_seed_team"
+        case lowerSeedTeam = "lower_seed_team"
+        case winsHigherSeed = "wins_higher_seed"
+        case winsLowerSeed = "wins_lower_seed"
+        case status
+        case gamesPlayed = "games_played"
     }}
 }}
 
@@ -3029,7 +3196,8 @@ private struct SeriesDTO: Decodable {{
 
 write_if_absent(os.path.join(services_dir, "ProjectionsService.swift"), projections_service_swift)
 write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
-write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
+# PlayoffService merged into GamesService — fetchPlayoffBracket() is now in GamesService
+# write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9d. Core Utilities files (continued)
@@ -3057,32 +3225,7 @@ public extension GameEntry {{
 // MARK: - PlayerGameLog {swift_name} averages
 
 public extension PlayerGameLog {{
-    var averagePoints: Double {{
-        guard !entries.isEmpty else {{ return 0 }}
-        return Double(entries.reduce(0) {{ $0 + $1.points }}) / Double(entries.count)
-    }}
-
-    var averageRebounds: Double {{
-        guard !entries.isEmpty else {{ return 0 }}
-        return Double(entries.reduce(0) {{ $0 + $1.rebounds }}) / Double(entries.count)
-    }}
-
-    var averageAssists: Double {{
-        guard !entries.isEmpty else {{ return 0 }}
-        return Double(entries.reduce(0) {{ $0 + $1.assists }}) / Double(entries.count)
-    }}
-
-    var averageSteals: Double {{
-        guard !entries.isEmpty else {{ return 0 }}
-        return Double(entries.reduce(0) {{ $0 + $1.steals }}) / Double(entries.count)
-    }}
-
-    var fieldGoalPercentage: Double {{
-        let made = entries.reduce(0) {{ $0 + $1.fieldGoalsMade }}
-        let attempted = entries.reduce(0) {{ $0 + $1.fieldGoalsAttempted }}
-        guard attempted > 0 else {{ return 0 }}
-        return Double(made) / Double(attempted) * 100
-    }}
+{gamelog_average_properties}
 }}
 """
 
@@ -3134,7 +3277,7 @@ import BKSCore
 // into a single display-ready record.
 // Add sport-specific fields below the Sport-specific marker.
 
-struct BoardEntry: Identifiable, Equatable, Hashable {{
+struct BoardEntry: Identifiable, Equatable, Hashable, BoardEntryDisplayable {{
     let id: String
     let displayName: String
     let team: String
@@ -3166,6 +3309,10 @@ struct BoardEntry: Identifiable, Equatable, Hashable {{
 
     // MARK: - Sport-specific fields
     // Add fields here that are unique to this sport's board display.
+    // Reference: Baseball app BoardEntry has gameDateTime, battingOrder, probablePitcher,
+    // parkFactor, topPickReasons, trendDirection, recentGameScores, upcomingGames,
+    // rotationTier, trend slopes (trendHits/HR/RBI/Runs/SB/Doubles/TB),
+    // and season metrics (seasonAvg/OBP/SLG/OPS/WAR, wobaProxy, obpProxy, avgPaPerGame).
 }}
 """
 
@@ -3432,10 +3579,18 @@ struct BoardState {{
             }}
         }}()
 
+        async let playoffTask: [PlayoffSeries] = {{
+            do {{ return try await gamesService.fetchPlayoffBracket() }} catch {{
+                logger.warning("Board: playoff bracket fetch failed: \\(error.diagnosticDescription, privacy: .public)")
+                return []
+            }}
+        }}()
+
         let projections = await projectionsTask
         let opportunitiesResult = await opportunitiesTask
         let schedule = await scheduleTask
         let dailyAnalysis = await analysisTask
+        let playoffSeries = await playoffTask
 
         let entries = BoardEntryBuilder.build(
             players: [],
@@ -3461,7 +3616,7 @@ struct BoardState {{
             gameOdds: gameOdds,
             serverDateString: schedule?.date,
             dailyAnalysis: dailyAnalysis,
-            playoffSeries: []
+            playoffSeries: playoffSeries
         ))
     }}
 }}

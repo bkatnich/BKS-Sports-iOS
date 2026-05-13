@@ -169,10 +169,10 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "2.1.7"
+    from: "2.1.13"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.5.17"
+    from: "1.5.23"
   swinject:
     url: https://github.com/Swinject/Swinject.git
     from: "2.9.0"
@@ -484,6 +484,12 @@ fcm:
       rawValue: bracket_advance
     - name: analysisReady
       rawValue: analysis_ready
+      preferenceKey: analysisAlerts
+  notificationPreferences:
+    - key: analysisAlerts
+      rawValue: analysis_alerts
+      label: Analysis Alerts
+      systemImage: brain.head.profile
 
 # ---------------------------------------------------------------------------
 # Subscription product IDs (StoreKit)
