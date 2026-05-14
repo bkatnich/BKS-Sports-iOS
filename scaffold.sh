@@ -3646,6 +3646,7 @@ struct BoardView: View {{
 
     @State private var showProfile = false
     @State private var showInbox = false
+    @State private var selectedGame: ScheduledGame?
     private let notificationLogger = PushNotificationLogger.shared
 
     private var searchBinding: Binding<String> {{
@@ -3700,6 +3701,16 @@ struct BoardView: View {{
                 }}
         }}
         .task {{ store.send(.onAppear) }}
+        .sheet(item: $selectedGame) {{ game in
+            let oddsKey = "\\(game.visitorTeamAbbr)@\\(game.homeTeamAbbr):\\(game.gameSequence)"
+            GameDetailSheet(
+                game: game,
+                odds: store.state.gameOdds[oddsKey],
+                spreadLabel: String(localized: "gameDetail.spread", defaultValue: "Spread"),
+                spreadPickLabel: String(localized: "gameDetail.bkSpreadPick", defaultValue: "Spread Pick")
+            )
+            .presentationDetents([.medium, .large])
+        }}
         .sheet(isPresented: $showInbox) {{
             NotificationInboxView(
                 logger: notificationLogger,
@@ -3763,6 +3774,24 @@ struct BoardView: View {{
         VStack(spacing: 0) {{
             customNavBar
                 .skeletonPulse(delay: 0, active: isLoading)
+
+            if !store.state.todayGames.isEmpty {{
+                GamesStrip(
+                    games: store.state.todayGames,
+                    chipLabel: {{ game in
+{
+    "                        guard let series = store.state.series(for: game) else { return game.isDoubleheader ? \"Game \\(game.gameSequence)\" : nil }" if has_playoffs else
+    "                        game.isDoubleheader ? \"Game \\(game.gameSequence)\" : nil"
+}
+{
+    "                        return \"Game \\(series.gamesPlayed + 1)\"" if has_playoffs else ""
+}
+                    }},
+                    onSelect: {{ selectedGame = $0 }}
+                )
+                .padding(.top, 8)
+                .skeletonPulse(delay: 0.1, active: isLoading)
+            }}
 
             SlateAnalysisCard(analysis: store.state.dailyAnalysis)
                 .padding(.horizontal, 16)
