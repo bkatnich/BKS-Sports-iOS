@@ -638,7 +638,7 @@ if opp_fields_str.endswith(","):
 
 # Opportunity params
 opp_params        = opps_api.get("params", {})
-opp_limit         = opp_params.get("limit", 25)
+opp_limit         = opp_params.get("limit", 50)
 opp_platform      = opp_params.get("platform", "dk")
 opp_mode          = opp_params.get("mode", "balanced")
 ou_push_threshold = opp_params.get("ouPushThreshold", 0.5)
@@ -2660,7 +2660,9 @@ final class GamesService: GamesServiceProtocol {{
                     visitorTeamAbbr: dto.visitorTeamAbbr,
                     status: dto.status,
                     gameType: dto.gameType,
-                    gameDatetime: dto.gameDatetime.flatMap {{ parseDate($0) }} ?? parseDateOnly(response.date)
+                    gameDatetime: dto.gameDatetime.flatMap {{ parseDate($0) }} ?? parseDateOnly(response.date),
+                    isDoubleheader: dto.isDoubleheader,
+                    gameSequence: dto.gameSequence
                 )
             }}
         )
@@ -2940,6 +2942,8 @@ private struct ScheduledGameDTO: Decodable {{
     let bkSpreadPick: String?
     let bkSpreadPickCovers: Bool?
     let bkSpreadConfidence: Double?
+    let isDoubleheader: Bool
+    let gameSequence: Int
 
     enum CodingKeys: String, CodingKey {{
         case gameID = "game_id"
@@ -2958,6 +2962,8 @@ private struct ScheduledGameDTO: Decodable {{
         case bkSpreadPick = "bk_spread_pick"
         case bkSpreadPickCovers = "bk_spread_pick_covers"
         case bkSpreadConfidence = "bk_spread_confidence"
+        case isDoubleheader = "is_doubleheader"
+        case gameSequence = "game_sequence"
     }}
 }}
 
@@ -3602,7 +3608,7 @@ struct BoardState {{
         let games = schedule?.games ?? []
         let gameOdds = Dictionary(
             uniqueKeysWithValues: games.map {{ game in
-                let key = "\\(game.visitorTeamAbbr)@\\(game.homeTeamAbbr)"
+                let key = "\\(game.visitorTeamAbbr)@\\(game.homeTeamAbbr):\\(game.gameSequence)"
                 return (key, GameOdds(game: game))
             }}
         )
