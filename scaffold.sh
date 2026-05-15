@@ -2269,9 +2269,14 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
                 id: "\\\\(dto.id)-game-\\\\(index)",
                 gameDate: parseDate(game.date),
                 opponentAbbr: game.opponent,
-                isHome: game.isHome,
+                isHome: game.isHome ?? false,
                 opponentStrength: game.opportunityScore,
-                projectedScore: game.predictedFP
+                projectedScoreDk: game.predictedFPDk,
+                projectedScoreFd: game.predictedFPFd,
+                fpFloorDk: game.fpFloorDk,
+                fpFloorFd: game.fpFloorFd,
+                fpCeilingDk: game.fpCeilingDk,
+                fpCeilingFd: game.fpCeilingFd
             )
         }}
 
@@ -2373,10 +2378,13 @@ private struct ProjectionPlayerDTO: Decodable {{
 private struct ProjectedGameDTO: Decodable {{
     let date: String
     let opponent: String
-    let isHome: Bool
-    let predictedFP: Double?
-    let fpFloor: Double?
-    let fpCeiling: Double?
+    let isHome: Bool?
+    let predictedFPDk: Double?
+    let predictedFPFd: Double?
+    let fpFloorDk: Double?
+    let fpFloorFd: Double?
+    let fpCeilingDk: Double?
+    let fpCeilingFd: Double?
     let confidenceBand: Double?
     let projectionScore: Double?
     let projectionTier: String?
@@ -2395,9 +2403,12 @@ private struct ProjectedGameDTO: Decodable {{
         case date
         case opponent
         case isHome = "is_home"
-        case predictedFP = "predicted_fp"
-        case fpFloor = "fp_floor"
-        case fpCeiling = "fp_ceiling"
+        case predictedFPDk = "predicted_fp_dk"
+        case predictedFPFd = "predicted_fp_fd"
+        case fpFloorDk = "fp_floor_dk"
+        case fpFloorFd = "fp_floor_fd"
+        case fpCeilingDk = "fp_ceiling_dk"
+        case fpCeilingFd = "fp_ceiling_fd"
         case confidenceBand = "confidence_band"
         case projectionScore = "projection_score"
         case projectionTier = "projection_tier"
@@ -3296,11 +3307,15 @@ struct BoardEntry: Identifiable, Equatable, Hashable, BoardEntryDisplayable {{
     let isPlayingTonight: Bool
 
     // Projection layer
-    let projectedScore: Double?
+    let projectedScore: Double?       // DK fantasy points
+    let projectedScoreFd: Double?     // FD fantasy points
     let fpFloor: Double?
     let fpCeiling: Double?
+    let fpFloorFd: Double?
+    let fpCeilingFd: Double?
     let projectionTier: TierLevel?
     let confidenceScore: Double?
+    let confidenceScoreFd: Double?
 
     // Opportunity layer
     let opportunityScore: Double?
