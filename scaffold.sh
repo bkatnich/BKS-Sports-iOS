@@ -3780,8 +3780,8 @@ struct BoardView: View {{
                     games: store.state.todayGames,
                     chipLabel: {{ game in
 {
-    "                        guard let series = store.state.series(for: game) else { return game.isDoubleheader ? \"Game \\(game.gameSequence)\" : nil }" if has_playoffs else
-    "                        game.isDoubleheader ? \"Game \\(game.gameSequence)\" : nil"
+    "                        guard let series = store.state.series(for: game) else { return game.isDoubleheader ? \"DH · Game \\(game.gameSequence)\" : nil }" if has_playoffs else
+    "                        game.isDoubleheader ? \"DH · Game \\(game.gameSequence)\" : nil"
 }
 {
     "                        return \"Game \\(series.gamesPlayed + 1)\"" if has_playoffs else ""
