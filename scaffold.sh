@@ -1692,8 +1692,8 @@ final class TrendingsService: TrendingsServiceProtocol {{
         category: "TrendingsService"
     )
 
-    private var cacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)trending_v1" }}
-    private var cacheDateKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)trending_v1_date" }}
+    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)trending_v1" }}
+    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)trending_v1_date" }}
 
     init(
         network: NetworkProtocol,
@@ -1727,14 +1727,14 @@ final class TrendingsService: TrendingsServiceProtocol {{
         let elapsed = Date.now.timeIntervalSince(fetchStart)
         logger
             .info(
-                "Fetched \\\\(sorted.count, privacy: .public) players in 1 call (\\\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
+                "Fetched \\(sorted.count, privacy: .public) players in 1 call (\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
             )
 
         do {{
             try storage.save(sorted, forKey: cacheKey, in: .file)
             try storage.save(Date.now, forKey: cacheDateKey, in: .file)
         }} catch {{
-            logger.warning("Failed to cache players: \\\\(error.diagnosticDescription)")
+            logger.warning("Failed to cache players: \\(error.diagnosticDescription, privacy: .public)")
         }}
 
         return sorted
@@ -1753,7 +1753,7 @@ final class TrendingsService: TrendingsServiceProtocol {{
     private func mapPlayer(_ dto: PlayerDTO) -> Player? {{
         Player(
             id: String(dto.id),
-            displayName: "\\\\(dto.firstName) \\\\(dto.lastName)",
+            displayName: "\\(dto.firstName) \\(dto.lastName)",
             team: dto.team,
             position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
             headshotURL: dto.headshotURL,
@@ -1997,9 +1997,9 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
         category: "OpportunitiesService"
     )
 
-    private var cacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)opportunities_v1" }}
-    private var cacheDateKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)opportunities_v1_date" }}
-    private var seasonModeCacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)season_mode_v1" }}
+    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v1" }}
+    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v1_date" }}
+    private var seasonModeCacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)season_mode_v1" }}
 
     init(
         network: NetworkProtocol,
@@ -2044,7 +2044,7 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
         let elapsed = Date.now.timeIntervalSince(fetchStart)
         logger
             .info(
-                "Fetched \\\\(mapped.count, privacy: .public) opportunities in 1 call (\\\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
+                "Fetched \\(mapped.count, privacy: .public) opportunities in 1 call (\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
             )
 
         do {{
@@ -2052,7 +2052,7 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
             try storage.save(Date.now, forKey: cacheDateKey, in: .file)
             try storage.save(seasonMode, forKey: seasonModeCacheKey, in: .file)
         }} catch {{
-            logger.warning("Failed to cache opportunities: \\\\(error.diagnosticDescription)")
+            logger.warning("Failed to cache opportunities: \\(error.diagnosticDescription, privacy: .public)")
         }}
 
         return (mapped, seasonMode)
@@ -2076,7 +2076,7 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
         guard let tier = FeatureTier(rawValue: dto.opportunityTier) else {{ return nil }}
         return Opportunity(
             id: String(dto.id),
-            displayName: "\\\\(dto.firstName) \\\\(dto.lastName)",
+            displayName: "\\(dto.firstName) \\(dto.lastName)",
             team: dto.team,
             position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
             opponentAbbr: dto.opponentAbbr,
@@ -2199,8 +2199,8 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
         category: "ProjectionsService"
     )
 
-    private var cacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)projections_v1" }}
-    private var cacheDateKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)projections_v1_date" }}
+    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v1" }}
+    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v1_date" }}
 
     init(
         network: NetworkProtocol,
@@ -2237,14 +2237,14 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
         let mapped = response.players.compactMap(mapProjection)
         let elapsed = Date.now.timeIntervalSince(fetchStart)
         logger.info(
-            "Fetched \\\\(mapped.count, privacy: .public) projections in 1 call (\\\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
+            "Fetched \\(mapped.count, privacy: .public) projections in 1 call (\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
         )
 
         do {{
             try storage.save(mapped, forKey: cacheKey, in: .file)
             try storage.save(Date.now, forKey: cacheDateKey, in: .file)
         }} catch {{
-            logger.warning("Failed to cache projections: \\\\(error.diagnosticDescription)")
+            logger.warning("Failed to cache projections: \\(error.diagnosticDescription, privacy: .public)")
         }}
 
         return mapped
@@ -2266,7 +2266,7 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
 
         let upcomingGames: [ProjectedGame] = dto.games.enumerated().compactMap {{ index, game in
             ProjectedGame(
-                id: "\\\\(dto.id)-game-\\\\(index)",
+                id: "\\(dto.id)-game-\\(index)",
                 gameDate: parseDate(game.date),
                 opponentAbbr: game.opponent,
                 isHome: game.isHome ?? false,
@@ -2282,7 +2282,7 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
 
         return Projection(
             id: String(dto.id),
-            displayName: "\\\\(dto.firstName) \\\\(dto.lastName)",
+            displayName: "\\(dto.firstName) \\(dto.lastName)",
             team: dto.team,
             position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
             headshotURL: dto.headshotURL,
@@ -2547,8 +2547,8 @@ final class GamesService: GamesServiceProtocol {{
     )
 
     private static let gameLogCachePrefix = "game_log_"
-    private var todayScheduleCacheKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1" }}
-    private var todayScheduleCacheDateKey: String {{ "\\\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1_date" }}
+    private var todayScheduleCacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1" }}
+    private var todayScheduleCacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1_date" }}
     private static let dateFormatter: DateFormatter = {{
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
@@ -2577,7 +2577,7 @@ final class GamesService: GamesServiceProtocol {{
         let season = currentSeason()
 
         let response: StatsResponse = try await network.get(
-            "\\\\(baseURL)/stats",
+            "\\(baseURL)/stats",
             parameters: [
                 "player_ids[]": playerID,
                 "seasons[]": season,
@@ -2617,7 +2617,7 @@ final class GamesService: GamesServiceProtocol {{
             }}
 
             let response: StatsResponse = try await network.get(
-                "\\\\(baseURL)/stats",
+                "\\(baseURL)/stats",
                 parameters: params
             )
 
@@ -2648,7 +2648,7 @@ final class GamesService: GamesServiceProtocol {{
         do {{
             try storage.save(log, forKey: Self.gameLogCachePrefix + log.playerID, in: .file)
         }} catch {{
-            logger.warning("Failed to cache game log for player \\\\(log.playerID): \\\\(error.diagnosticDescription)")
+            logger.warning("Failed to cache game log for player \\(log.playerID, privacy: .public): \\(error.diagnosticDescription, privacy: .public)")
         }}
     }}
 
@@ -2681,9 +2681,9 @@ final class GamesService: GamesServiceProtocol {{
             try storage.save(schedule, forKey: todayScheduleCacheKey, in: .file)
             try storage.save(Date.now, forKey: todayScheduleCacheDateKey, in: .file)
         }} catch {{
-            logger.warning("Failed to cache today schedule: \\\\(error.diagnosticDescription)")
+            logger.warning("Failed to cache today schedule: \\(error.diagnosticDescription, privacy: .public)")
         }}
-        logger.info("Fetched today schedule: \\\\(schedule.gameCount, privacy: .public) game(s) on \\\\(schedule.date, privacy: .public)")
+        logger.info("Fetched today schedule: \\(schedule.gameCount, privacy: .public) game(s) on \\(schedule.date, privacy: .public)")
         return schedule
     }}
 
@@ -2712,9 +2712,9 @@ final class GamesService: GamesServiceProtocol {{
         do {{
             try storage.save(series, forKey: "{slug}_playoff_bracket_v1", in: .file)
         }} catch {{
-            logger.warning("Failed to cache playoff bracket: \\\\(error.localizedDescription, privacy: .public)")
+            logger.warning("Failed to cache playoff bracket: \\(error.localizedDescription, privacy: .public)")
         }}
-        logger.info("Fetched playoff bracket: \\\\(series.count, privacy: .public) series")
+        logger.info("Fetched playoff bracket: \\(series.count, privacy: .public) series")
         return series
     }}
 
@@ -3102,9 +3102,9 @@ final class PlayoffService: PlayoffServiceProtocol {{
         do {{
             try storage.save(state, forKey: Self.leagueStateCacheKey, in: .file)
         }} catch {{
-            logger.warning("Failed to cache league state: \\\\(error.diagnosticDescription)")
+            logger.warning("Failed to cache league state: \\(error.diagnosticDescription, privacy: .public)")
         }}
-        logger.info("Fetched league state: \\\\(response.mode, privacy: .public)")
+        logger.info("Fetched league state: \\(response.mode, privacy: .public)")
         return state
     }}
 
@@ -3115,9 +3115,9 @@ final class PlayoffService: PlayoffServiceProtocol {{
         do {{
             try storage.save(series, forKey: Self.bracketCacheKey, in: .file)
         }} catch {{
-            logger.warning("Failed to cache playoff bracket: \\\\(error.diagnosticDescription)")
+            logger.warning("Failed to cache playoff bracket: \\(error.diagnosticDescription, privacy: .public)")
         }}
-        logger.info("Fetched playoff bracket: \\\\(series.count, privacy: .public) series")
+        logger.info("Fetched playoff bracket: \\(series.count, privacy: .public) series")
         return series
     }}
 
