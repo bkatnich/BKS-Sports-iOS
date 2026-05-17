@@ -197,7 +197,7 @@ gamelog_api      = api.get("gameLog", {})
 external_id_key  = api.get("externalPersonIDKey", "external_person_id")
 
 opp_params        = opps_api.get("params", {})
-ou_push_threshold = opp_params.get("ouPushThreshold", 0.5)
+ou_push_threshold = str(opp_params.get("ouPushThreshold", "0.5"))
 
 players_url      = players_api.get("url", "")
 opps_url         = opps_api.get("url", "")
@@ -236,7 +236,7 @@ extension ConfigurationKey where Value == String {{
     )
     static let ouPushThreshold = ConfigurationKey(
         name: "ouPushThreshold",
-        defaultValue: {ou_push_threshold}
+        defaultValue: "{ou_push_threshold}"
     )
     static let fcmGamedayTopic = ConfigurationKey(
         name: "fcmGamedayTopic",
@@ -641,7 +641,7 @@ opp_params        = opps_api.get("params", {})
 opp_limit         = opp_params.get("limit", 50)
 opp_platform      = opp_params.get("platform", "dk")
 opp_mode          = opp_params.get("mode", "balanced")
-ou_push_threshold = opp_params.get("ouPushThreshold", 0.5)
+ou_push_threshold = str(opp_params.get("ouPushThreshold", "0.5"))
 
 # Projection params
 proj_params  = proj_api.get("params", {})
@@ -942,9 +942,10 @@ write(os.path.join(out_dir, "App/Sources/Features/Board/Views/GameLogViews.swift
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8c. SportConfiguration.swift  (base struct — app-side, not in BKSCore)
-# ─────────────────────────────────────────────────────────────────────────────
+# 8c. SportConfiguration.swift (base struct)
+# NOTE: The concrete SportConfiguration struct now lives in BKSUICore
+# (Sources/UI/SportConfiguration.swift). Nothing is generated here.
+# Each sport only needs the +Sport extension generated in section 8b.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1398,32 +1399,12 @@ extension Container {{
 }}
 """
 
-bootstrap_analytics = header() + f"""\
-import BKSCore
-import FirebaseAnalytics
-
-struct FirebaseAnalyticsAdapter: AnalyticsConfigurable {{
-    static var detailedEnabled = false
-
-    func setDetailedCollectionEnabled(_ enabled: Bool) {{
-        Self.detailedEnabled = enabled
-    }}
-
-    func logEvent(_ name: String, parameters: [String: String]?) {{
-        Analytics.logEvent(name, parameters: parameters)
-    }}
-
-    func logDetailedEvent(_ name: String, parameters: [String: String]?) {{
-        guard Self.detailedEnabled else {{ return }}
-        Analytics.logEvent(name, parameters: parameters)
-    }}
-}}
-"""
+# FirebaseAnalyticsAdapter lives in BKSCore (Sources/Repositories/FirebaseAnalyticsAdapter.swift).
+# Do not generate a local copy — it would cause a duplicate symbol error.
 
 bootstrap_dir = os.path.join(out_dir, "App/Sources/App/Bootstrap")
 write(os.path.join(bootstrap_dir, f"{type_prefix}App.swift"), bootstrap_app)
 write(os.path.join(bootstrap_dir, "DependencyContainer.swift"), bootstrap_container)
-write(os.path.join(bootstrap_dir, "FirebaseAnalyticsAdapter.swift"), bootstrap_analytics)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9a. AppShell.swift
@@ -1523,8 +1504,9 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable, Oppo
 
     // Core scoring
     let opportunityScore: Double?
-    let opportunityTier: TierLevel
+    let opportunityTier: TierLevel?
     let playerTierDk: TierLevel?
+    let playerTierFd: TierLevel?
     let mode: String
     let platforms: [String]
 
@@ -1563,9 +1545,11 @@ struct Projection: Codable, Equatable, Hashable, Identifiable, Filterable {
     let externalPersonID: Int?
 
     // Core scoring
-    let projectionScore: Double
-    let projectionTier: TierLevel
+    let projectedScoreDk: Double?
+    let projectedScoreFd: Double?
+    let projectionTier: TierLevel?
     let playerTierDk: TierLevel?
+    let playerTierFd: TierLevel?
     let mode: String
     let platforms: [String]
 
@@ -1806,7 +1790,7 @@ private struct PlayerDTO: Decodable {{
     let position: String?
     let headshotURL: URL?
     let externalPersonID: Int?
-    let playerTier: PlayerTier?
+    let playerTier: String?
     let avgFantasyScore: Double?
     let avgFantasyScoreHome: Double?
     let avgFantasyScoreAway: Double?
@@ -1880,7 +1864,7 @@ private struct PlayerDTO: Decodable {{
         position = try container.decodeIfPresent(String.self, forKey: .position)
         headshotURL = try container.decodeIfPresent(URL.self, forKey: .headshotURL)
         externalPersonID = try container.decodeIfPresent(Int.self, forKey: .externalPersonID)
-        playerTier = try container.decodeIfPresent(PlayerTier.self, forKey: .playerTier)
+        playerTier = try container.decodeIfPresent(String.self, forKey: .playerTier)
         avgFantasyScore = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScore)
         avgFantasyScoreHome = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScoreHome)
         avgFantasyScoreAway = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScoreAway)
@@ -2073,7 +2057,6 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
     // MARK: - Mapping
 
     private func mapOpportunity(_ dto: OpportunityDTO) -> Opportunity? {{
-        guard let tier = FeatureTier(rawValue: dto.opportunityTier) else {{ return nil }}
         return Opportunity(
             id: String(dto.id),
             displayName: "\\(dto.firstName) \\(dto.lastName)",
@@ -2083,17 +2066,14 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
             headshotURL: dto.headshotURL,
             externalPersonID: dto.externalPersonID,
             opportunityScore: dto.opportunityScore,
-            opportunityTier: tier,
-            playerTier: dto.playerTier,
-            mode: dto.mode,
-            platform: dto.platform,
+            opportunityTier: dto.opportunityTier.flatMap {{ TierLevel(serverValue: $0) }},
+            playerTierDk: dto.playerTierDk.flatMap {{ TierLevel(serverValue: $0) }},
+            playerTierFd: dto.playerTierFd.flatMap {{ TierLevel(serverValue: $0) }},
+            mode: dto.mode ?? sportConfiguration.opportunityParams.mode,
+            platforms: dto.platforms,
             injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
             isSurging: dto.isSurging ?? false,
-            isHome: dto.isHome ?? false,
-            playoffRotationMultiplier: dto.playoffRotationMultiplier,
-            rotationTier: dto.rotationTier.flatMap {{ RotationTier(rawValue: $0) }},
-            playoffTrendTrust: dto.playoffTrendTrust,
-            playoffGamesPlayed: dto.playoffGamesPlayed
+            isHome: dto.isHome ?? false
         )
     }}
 }}
@@ -2120,11 +2100,12 @@ private struct OpportunityDTO: Decodable {{
     let headshotURL: URL?
     let externalPersonID: Int?
 
-    let opportunityScore: Double
-    let opportunityTier: String
-    let playerTier: PlayerTier?
-    let mode: String
-    let platform: String
+    let opportunityScore: Double?
+    let opportunityTier: String?
+    let playerTierDk: String?
+    let playerTierFd: String?
+    let mode: String?
+    let platforms: [String]
 
     let injuryStatus: String?
     let isSurging: Bool?
@@ -2146,9 +2127,10 @@ private struct OpportunityDTO: Decodable {{
         case externalPersonID = "{external_id_key}"
         case opportunityScore = "opportunity_score"
         case opportunityTier = "opportunity_tier"
-        case playerTier = "player_tier"
+        case playerTierDk = "player_tier_dk"
+        case playerTierFd = "player_tier_fd"
         case mode
-        case platform
+        case platforms
         case injuryStatus = "injury_status"
         case isSurging = "is_surging"
         case isHome = "is_home"
@@ -2287,11 +2269,13 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
             position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
             headshotURL: dto.headshotURL,
             externalPersonID: dto.externalPersonID,
-            projectionScore: projectionScore,
-            projectionTier: tier,
-            playerTier: dto.playerTier,
+            projectedScoreDk: dto.projectedScoreDk,
+            projectedScoreFd: dto.projectedScoreFd,
+            projectionTier: dto.projectionTier.flatMap {{ TierLevel(serverValue: $0) }},
+            playerTierDk: dto.playerTierDk.flatMap {{ TierLevel(serverValue: $0) }},
+            playerTierFd: dto.playerTierFd.flatMap {{ TierLevel(serverValue: $0) }},
             mode: sportConfiguration.projectionParams.mode,
-            platform: sportConfiguration.projectionParams.platform,
+            platforms: sportConfiguration.projectionParams.mode == "gpp" ? ["dk", "fd"] : ["dk"],
             injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
             isSurging: (dto.hotStreak ?? 0) > 0,
             upcomingGames: upcomingGames.isEmpty ? nil : upcomingGames,
@@ -2304,18 +2288,10 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
         )
     }}
 
-    private func bestTier(from games: [ProjectedGameDTO]) -> FeatureTier? {{
-        let tiers = games.compactMap {{ mapFeatureTier($0.projectionTier) }}
-        return tiers.min {{ $0.sortOrder < $1.sortOrder }}
-    }}
-
-    private func mapFeatureTier(_ raw: String?) -> FeatureTier? {{
-        switch raw?.lowercased() {{
-        case "elite": return .elite
-        case "good": return .good
-        case "solid": return .solid
-        case "low": return .low
-        default: return nil
+    private func bestTier(from tiers: [TierLevel?]) -> TierLevel? {{
+        tiers.compactMap {{ $0 }}.min {{
+            (TierLevel.allCases.firstIndex(of: $0) ?? Int.max) <
+            (TierLevel.allCases.firstIndex(of: $1) ?? Int.max)
         }}
     }}
 
@@ -2352,7 +2328,8 @@ private struct ProjectionPlayerDTO: Decodable {{
     let hotStreak: Int?
     let coldStreak: Int?
     let injuryStatus: String?
-    let playerTier: PlayerTier?
+    let playerTierDk: String?
+    let playerTierFd: String?
     let games: [ProjectedGameDTO]
 
     enum CodingKeys: String, CodingKey {{
@@ -2370,7 +2347,8 @@ private struct ProjectionPlayerDTO: Decodable {{
         case hotStreak = "hot_streak"
         case coldStreak = "cold_streak"
         case injuryStatus = "injury_status"
-        case playerTier = "player_tier"
+        case playerTierDk = "player_tier_dk"
+        case playerTierFd = "player_tier_fd"
         case games
     }}
 }}
@@ -5379,8 +5357,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSCore.git",
       "state" : {
-        "revision" : "fed7ab20d32237bda628bb6ead5cae7b9a831d4f",
-        "version" : "2.1.6"
+        "revision" : "45acc9e9f520d73e8ddfbe62cdf8f1d2b3763a87",
+        "version" : "2.1.21"
       }
     },
     {
@@ -5388,8 +5366,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSUICore.git",
       "state" : {
-        "revision" : "0bfd44ea9ed616fff691d8548c1e2ba216977032",
-        "version" : "1.5.16"
+        "revision" : "d8e083c9e51c58d6c6b0aba7f8088ceb025e933a",
+        "version" : "1.5.34"
       }
     },
     {
