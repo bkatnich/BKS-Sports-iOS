@@ -1385,16 +1385,23 @@ extension Container {{
             let analysisService = resolver.require(DailyAnalysisServiceProtocol.self)
             let positionMap = resolver.require((any SportConfigurationProtocol).self).positionMap
             return MainActor.assumeIsolated {{
-                Store(
+                // StoreRef breaks the chicken-and-egg: makeReduce needs to dispatch
+                // .analysisLoaded back to the store, but the store doesn't exist yet.
+                // We create the ref first, pass it in, then wire it after construction.
+                let storeRef = StoreRef<BoardState, BoardIntent>()
+                let store = Store(
                     initial: BoardState(),
                     reduce: BoardState.makeReduce(
                         projectionService: projectionService,
                         opportunityService: opportunityService,
                         gamesService: gamesService,
                         analysisService: analysisService,
-                        positionMap: positionMap
+                        positionMap: positionMap,
+                        storeRef: storeRef
                     )
                 )
+                storeRef.store = store
+                return store
             }}
         }}
     }}
@@ -3446,12 +3453,14 @@ enum BoardIntent: CancellableIntent {{
     case pushNotificationTapped(String)
     case deepLinkHandled
     case refreshBannerExpired
+    case analysisLoaded(DailyAnalysis)
 
     var cancelsInFlightWork: Bool {{
         switch self {{
         case .navigationPathChanged, .searchTextChanged, .positionFilterChanged,
              .tierFilterChanged, .viewModeChanged, .pushNotificationTapped,
-             .deepLinkHandled, .refreshBannerExpired, .backgroundRefreshRequested:
+             .deepLinkHandled, .refreshBannerExpired, .backgroundRefreshRequested,
+             .analysisLoaded:
             false
         default:
             true
@@ -3466,6 +3475,15 @@ board_state_swift = header() + f"""import BKSCore
 import BKSUICore
 import OSLog
 import SwiftUI
+
+// MARK: - StoreRef
+
+/// Weak-reference box used to break the chicken-and-egg between makeReduce
+/// and the Store it dispatches back into.
+@MainActor
+final class StoreRef<State, Intent> {{
+    weak var store: Store<State, Intent>?
+}}
 
 // MARK: - BoardState
 
@@ -3496,13 +3514,14 @@ struct BoardState {{
         category: "BoardState"
     )
 
-    // swiftlint:disable:next function_body_length cyclomatic_complexity
+    // swiftlint:disable:next function_body_length cyclomatic_complexity function_parameter_count
     static func makeReduce(
         projectionService: ProjectionsServiceProtocol,
         opportunityService: OpportunitiesServiceProtocol,
         gamesService: GamesServiceProtocol,
         analysisService: DailyAnalysisServiceProtocol,
-        positionMap: SportPositionMap
+        positionMap: SportPositionMap,
+        storeRef: StoreRef<Self, BoardIntent>
     ) -> Reduce<Self, BoardIntent> {{
         {{ state, intent in
             switch intent {{
@@ -3519,7 +3538,8 @@ struct BoardState {{
                     projectionService: projectionService,
                     opportunityService: opportunityService,
                     gamesService: gamesService,
-                    analysisService: analysisService
+                    analysisService: analysisService,
+                    storeRef: storeRef
                 )
 
             case .refreshRequested:
@@ -3528,7 +3548,8 @@ struct BoardState {{
                     projectionService: projectionService,
                     opportunityService: opportunityService,
                     gamesService: gamesService,
-                    analysisService: analysisService
+                    analysisService: analysisService,
+                    storeRef: storeRef
                 )
 
             case .backgroundRefreshRequested:
@@ -3540,7 +3561,8 @@ struct BoardState {{
                     projectionService: projectionService,
                     opportunityService: opportunityService,
                     gamesService: gamesService,
-                    analysisService: analysisService
+                    analysisService: analysisService,
+                    storeRef: storeRef
                 )
 
             case let .entriesLoaded(result):
@@ -3590,6 +3612,10 @@ struct BoardState {{
 
             case .refreshBannerExpired:
                 return nil
+
+            case let .analysisLoaded(analysis):
+                state.dailyAnalysis = analysis
+                return nil
             }}
         }}
     }}
@@ -3601,8 +3627,24 @@ struct BoardState {{
         projectionService: ProjectionsServiceProtocol,
         opportunityService: OpportunitiesServiceProtocol,
         gamesService: GamesServiceProtocol,
-        analysisService: DailyAnalysisServiceProtocol
+        analysisService: DailyAnalysisServiceProtocol,
+        storeRef: StoreRef<Self, BoardIntent>
     ) async -> BoardIntent {{
+        // Analysis is slow (pipeline-dependent) — fire it independently so it never
+        // blocks the board render. It dispatches .analysisLoaded when it arrives.
+        Task {{ @MainActor in
+            do {{
+                let analysis = try await analysisService.fetchDailyAnalysis()
+                storeRef.store?.send(.analysisLoaded(analysis))
+            }} catch {{
+                if case NetworkError.httpError(statusCode: 404, _) = error {{
+                    logger.info("Board: no daily analysis available yet")
+                }} else {{
+                    logger.warning("Board: analysis fetch failed: \\(error.diagnosticDescription, privacy: .public)")
+                }}
+            }}
+        }}
+
         async let projectionsTask: [Projection] = {{
             do {{ return try await projectionService.fetchProjections() }} catch {{
                 logger.warning("Board: projections fetch failed: \\(error.diagnosticDescription, privacy: .public)")
@@ -3624,17 +3666,6 @@ struct BoardState {{
             }}
         }}()
 
-        async let analysisTask: DailyAnalysis? = {{
-            do {{ return try await analysisService.fetchDailyAnalysis() }} catch {{
-                if case NetworkError.httpError(statusCode: 404, _) = error {{
-                    logger.info("Board: no daily analysis available yet")
-                }} else {{
-                    logger.warning("Board: analysis fetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-                return nil
-            }}
-        }}()
-
         async let playoffTask: [PlayoffSeries] = {{
             do {{ return try await gamesService.fetchPlayoffBracket() }} catch {{
                 logger.warning("Board: playoff bracket fetch failed: \\(error.diagnosticDescription, privacy: .public)")
@@ -3645,7 +3676,6 @@ struct BoardState {{
         let projections = await projectionsTask
         let opportunitiesResult = await opportunitiesTask
         let schedule = await scheduleTask
-        let dailyAnalysis = await analysisTask
         let playoffSeries = await playoffTask
 
         let entries = BoardEntryBuilder.build(
@@ -3671,7 +3701,7 @@ struct BoardState {{
             seasonMode: opportunitiesResult.seasonMode,
             gameOdds: gameOdds,
             serverDateString: schedule?.date,
-            dailyAnalysis: dailyAnalysis,
+            dailyAnalysis: nil,
             playoffSeries: playoffSeries
         ))
     }}
