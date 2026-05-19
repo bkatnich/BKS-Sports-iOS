@@ -1143,7 +1143,9 @@ struct {type_prefix}App: App {{
             .onReceive(
                 NotificationCenter.default.publisher(for: DataRefreshTask.dataDidRefreshNotification)
             ) {{ _ in
-                boardStore.send(.refreshRequested)
+                // Use .backgroundRefreshRequested (cancelsInFlightWork = false) so that a
+                // silent push arriving during app launch does not cancel the in-flight board fetch.
+                boardStore.send(.backgroundRefreshRequested)
             }}
             .onReceive(
                 NotificationCenter.default.publisher(for: PushNotificationNames.visiblePushTapped)
@@ -2303,6 +2305,37 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
     }}
 }}
 
+// MARK: - FlexDouble
+//
+// Decodes a Double from either a JSON number or a numeric string.
+// Some backend stat fields (e.g. season_avg, woba_proxy, OBP/SLG/OPS/WAR, trend slopes)
+// may arrive as strings like ".333" instead of a JSON number. Using FlexDouble? on those
+// fields prevents a single malformed value from failing the entire projections response.
+//
+// Usage in DTOs:  let seasonAvg: FlexDouble?
+// Usage at mapping site:  seasonAvg: dto.seasonAvg?.value
+
+private struct FlexDouble: Decodable {{
+    let value: Double
+
+    init(from decoder: Decoder) throws {{
+        let container = try decoder.singleValueContainer()
+        if let num = try? container.decode(Double.self) {{
+            value = num
+        }} else if let str = try? container.decode(String.self), let num = Double(str) {{
+            value = num
+        }} else {{
+            throw DecodingError.typeMismatch(
+                Double.self,
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Expected Double or numeric String"
+                )
+            )
+        }}
+    }}
+}}
+
 // MARK: - DTOs
 
 private struct ProjectionsResponse: Decodable {{
@@ -2328,6 +2361,14 @@ private struct ProjectionPlayerDTO: Decodable {{
     let hotStreak: Int?
     let coldStreak: Int?
     let injuryStatus: String?
+    // MARK: Sport-specific stat fields
+    // Add FlexDouble? fields here for any numeric stat that the backend may send as a string.
+    // Example (MLB baseball):
+    //   let trendHits: FlexDouble?
+    //   let seasonAvg: FlexDouble?
+    //   let seasonOBP: FlexDouble?
+    //   let wobaProxy: FlexDouble?
+    // At the mapping site use: trendHits: dto.trendHits?.value
     let playerTierDk: String?
     let playerTierFd: String?
     let games: [ProjectedGameDTO]
@@ -3391,6 +3432,10 @@ enum BoardViewMode: String {{
 enum BoardIntent: CancellableIntent {{
     case onAppear
     case refreshRequested
+    /// Triggered by a background data refresh (silent push / BGTask).
+    /// Does NOT cancel an in-flight fetch — the existing request is already running
+    /// and its result will be fresher than anything we could start now.
+    case backgroundRefreshRequested
     case entriesLoaded(BoardLoadResult)
     case loadFailed(Error)
     case searchTextChanged(String)
@@ -3406,7 +3451,7 @@ enum BoardIntent: CancellableIntent {{
         switch self {{
         case .navigationPathChanged, .searchTextChanged, .positionFilterChanged,
              .tierFilterChanged, .viewModeChanged, .pushNotificationTapped,
-             .deepLinkHandled, .refreshBannerExpired:
+             .deepLinkHandled, .refreshBannerExpired, .backgroundRefreshRequested:
             false
         default:
             true
@@ -3478,6 +3523,18 @@ struct BoardState {{
                 )
 
             case .refreshRequested:
+                state.loadState = .loading
+                return await fetchAll(
+                    projectionService: projectionService,
+                    opportunityService: opportunityService,
+                    gamesService: gamesService,
+                    analysisService: analysisService
+                )
+
+            case .backgroundRefreshRequested:
+                // Skip if a fetch is already in flight — the in-flight result will be fresher.
+                if case .loading = state.loadState {{ return nil }}
+                if case .loaded = state.loadState {{ state.isBackgroundRefreshing = true }}
                 state.loadState = .loading
                 return await fetchAll(
                     projectionService: projectionService,
