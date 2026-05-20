@@ -162,6 +162,23 @@ else
     fi
 fi
 
+# Check: the disk-hit branch of BoardState.onAppear must apply dailyAnalysis from diskResult.
+# loadFromDisk returns a cached DailyAnalysis, but the inline disk branch only copies
+# specific fields — if dailyAnalysis is not explicitly assigned, the card flashes
+# "not yet available" between the disk render and the network analysisLoaded dispatch.
+# (Bug first found in BKSBasketballApp.swift and BKSBaseballApp.swift, 2026-05-19.)
+BOARD_STATE_SWIFT="$(find "$APP_DIR/App/Sources/Features/Board/Store" -name "BoardState.swift" 2>/dev/null | head -1)"
+if [[ -z "$BOARD_STATE_SWIFT" ]]; then
+    printf "  %-8s %s\n" "SKIP" "disk-hit analysis check (no BoardState.swift found)"
+else
+    if grep -q 'diskResult.dailyAnalysis' "$BOARD_STATE_SWIFT"; then
+        printf "  %-8s %s\n" "PASS" "BoardState.swift: disk-hit branch applies dailyAnalysis"
+    else
+        printf "  %-8s %s\n" "FAIL" "BoardState.swift: disk-hit branch does not apply diskResult.dailyAnalysis — slate analysis card will flash 'not yet available' on every load. Add: if let analysis = diskResult.dailyAnalysis { state.dailyAnalysis = analysis }"
+        (( FAIL_COUNT++ )) || true
+    fi
+fi
+
 # ── summary ───────────────────────────────────────────────────────────────────
 
 echo ""
