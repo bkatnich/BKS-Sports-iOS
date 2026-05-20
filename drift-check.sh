@@ -120,11 +120,47 @@ while IFS= read -r -d '' generated_file; do
         diff -u "$generated_file" "$app_file" \
             --label "scaffold/$rel" \
             --label "app/$rel" \
-            | head -40
+            | head -40 || true
         echo ""
         (( DRIFT_COUNT++ )) || true
     fi
 done < <(find "$TMP_DIR" -type f -name "*.swift" -print0 | sort -z)
+
+# ── bootstrap anti-pattern checks ────────────────────────────────────────────
+#
+# These checks scan hand-authored files that the scaffold does not generate.
+# A non-zero FAIL_COUNT causes a non-zero exit alongside any scaffold drift.
+
+FAIL_COUNT=0
+
+echo ""
+echo "Bootstrap checks"
+echo ""
+
+# Check: the root .task in *App.swift must not call Self.prefetch().
+# BoardState.onAppear already fires disk+network concurrently; a prefetch call
+# in the launch task races against it and doubles every network request.
+# (Bug first found in BKSBasketballApp.swift and BKSBaseballApp.swift, 2026-05-19.)
+APP_SWIFT="$(find "$APP_DIR/App/Sources/App/Bootstrap" -name "*App.swift" 2>/dev/null | head -1)"
+if [[ -z "$APP_SWIFT" ]]; then
+    printf "  %-8s %s\n" "SKIP" "bootstrap prefetch check (no *App.swift found)"
+else
+    # A prefetch call inside the launch .task looks like:
+    #   await Perf.measure("PrefetchAll") { ... }   OR
+    #   await Self.prefetch(                         (direct call)
+    # Both share "PrefetchAll" or a Self.prefetch call in the launch task context.
+    # We detect either form by grepping for Self.prefetch — the sign-in and consent
+    # call sites are fine (they fire before the board is visible); only the one
+    # inside the WindowGroup .task block is the anti-pattern. We distinguish it by
+    # requiring "PrefetchAll" on a nearby line, which is the Perf.measure label used
+    # exclusively in the launch task.
+    if grep -q 'PrefetchAll' "$APP_SWIFT"; then
+        printf "  %-8s %s\n" "FAIL" "$(basename "$APP_SWIFT"): launch .task calls Self.prefetch() — races with BoardState.fetchAll and doubles every network request. Remove the PrefetchAll block; BoardState.onAppear handles warm-up."
+        (( FAIL_COUNT++ )) || true
+    else
+        printf "  %-8s %s\n" "PASS" "$(basename "$APP_SWIFT"): no launch-task prefetch"
+    fi
+fi
 
 # ── summary ───────────────────────────────────────────────────────────────────
 
@@ -133,10 +169,11 @@ echo "────────────────────────�
 echo "  Match:   $MATCH_COUNT"
 echo "  Drift:   $DRIFT_COUNT"
 echo "  Missing: $MISSING_COUNT"
+echo "  Fails:   $FAIL_COUNT"
 echo "────────────────────────────────────────"
 
-if [[ $DRIFT_COUNT -gt 0 ]] || [[ $MISSING_COUNT -gt 0 ]]; then
-    echo "  ⚠️  Drift detected."
+if [[ $DRIFT_COUNT -gt 0 ]] || [[ $MISSING_COUNT -gt 0 ]] || [[ $FAIL_COUNT -gt 0 ]]; then
+    echo "  ⚠️  Issues detected."
     exit 1
 else
     echo "  ✅ No drift — scaffold and app are in sync."
