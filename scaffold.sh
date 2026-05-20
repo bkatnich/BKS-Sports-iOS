@@ -1037,10 +1037,7 @@ struct {type_prefix}App: App {{
             container: container,
             authStore: resolvedAuth
         ) {{
-            Task {{
-                await Self.prefetch(opps: opps, projs: projs, games: games)
-                await langService.syncLanguage()
-            }}
+            Task {{ await langService.syncLanguage() }}
         }}
 
         Self.registerDataRefresh(opps: opps, projs: projs, games: games)
@@ -1120,11 +1117,6 @@ struct {type_prefix}App: App {{
             .task {{
                 authStore.send(.checkStoredCredential)
                 profileStore.send(.onAppear)
-                await Self.prefetch(
-                    opps: opportunitiesService,
-                    projs: projectionsService,
-                    games: gamesService
-                )
                 await BKSAppScaffold.registerForPushNotifications()
                 await subscriptionService.refreshEntitlement()
                 await subscriptionService.fetchProducts()
@@ -1162,45 +1154,6 @@ struct {type_prefix}App: App {{
         }}
     }}
 
-    // MARK: - Prefetch
-
-    private static func prefetch(
-        opps: OpportunitiesServiceProtocol,
-        projs: ProjectionsServiceProtocol,
-        games: GamesServiceProtocol
-    ) async {{
-        let log = Logger(
-            subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-            category: "AppLifecycle"
-        )
-        await withTaskGroup(of: Void.self) {{ group in
-            group.addTask {{
-                do {{
-                    let result = try await opps.fetchOpportunities()
-                    log.info("Prefetched \\(result.opportunities.count, privacy: .public) opportunities")
-                }} catch {{
-                    log.error("Opportunities prefetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-            group.addTask {{
-                do {{
-                    let projections = try await projs.fetchProjections()
-                    log.info("Prefetched \\(projections.count, privacy: .public) projections")
-                }} catch {{
-                    log.error("Projections prefetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-            group.addTask {{
-                do {{
-                    let schedule = try await games.fetchTodaySchedule()
-                    log.info("Prefetched today schedule: \\(schedule.gameCount, privacy: .public) game(s)")
-                }} catch {{
-                    log.error("Today schedule prefetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-        }}
-    }}
-
     // MARK: - Cache erase
 
     private func eraseCachedData() {{
@@ -1232,10 +1185,6 @@ struct {type_prefix}App: App {{
                 saveConsentAccepted(to: storage)
                 authStore.send(.signInSucceeded(result))
                 pendingConsentResult = nil
-                let opps = opportunitiesService
-                let projs = projectionsService
-                let games = gamesService
-                Task {{ await Self.prefetch(opps: opps, projs: projs, games: games) }}
             }},
             termContent: {{ consentTermRows }}
         )
@@ -1993,6 +1942,8 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
     private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v1" }}
     private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v1_date" }}
     private var seasonModeCacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)season_mode_v1" }}
+    /// Coalesces concurrent fetches so only one Cloud Run cold-start fires at a time.
+    private var inflightFetch: Task<(opportunities: [Opportunity], seasonMode: SeasonMode), Error>?
 
     init(
         network: NetworkProtocol,
@@ -2011,6 +1962,24 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
         platform: String? = nil,
         mode: String? = nil,
         fields: [String]? = nil
+    ) async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode) {{
+        if let existing = inflightFetch {{
+            logger.debug("fetchOpportunities — joining in-flight request")
+            return try await existing.value
+        }}
+        let task = Task<(opportunities: [Opportunity], seasonMode: SeasonMode), Error> {{
+            try await _fetchOpportunities(limit: limit, platform: platform, mode: mode, fields: fields)
+        }}
+        inflightFetch = task
+        defer {{ inflightFetch = nil }}
+        return try await task.value
+    }}
+
+    private func _fetchOpportunities(
+        limit: Int?,
+        platform: String?,
+        mode: String?,
+        fields: [String]?
     ) async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode) {{
         let url = configuration.value(for: .getOpportunitiesURL)
         let params = sportConfiguration.opportunityParams
@@ -2192,6 +2161,8 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
 
     private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v1" }}
     private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v1_date" }}
+    /// Coalesces concurrent fetches so only one Cloud Run cold-start fires at a time.
+    private var inflightFetch: Task<[Projection], Error>?
 
     init(
         network: NetworkProtocol,
@@ -2206,6 +2177,19 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
     }}
 
     func fetchProjections(fields: [String]? = nil) async throws -> [Projection] {{
+        if let existing = inflightFetch {{
+            logger.debug("fetchProjections — joining in-flight request")
+            return try await existing.value
+        }}
+        let task = Task<[Projection], Error> {{
+            try await _fetchProjections(fields: fields)
+        }}
+        inflightFetch = task
+        defer {{ inflightFetch = nil }}
+        return try await task.value
+    }}
+
+    private func _fetchProjections(fields: [String]?) async throws -> [Projection] {{
         let url = configuration.value(for: .getProjectionsURL)
 
         let params = sportConfiguration.projectionParams
@@ -3533,6 +3517,9 @@ struct BoardState {{
                 {{
                     return nil
                 }}
+                // A fetch is already in flight (e.g. refreshRequested fired before onAppear) —
+                // don't spawn a second concurrent fetchAll that races and doubles network load.
+                if case .loading = state.loadState {{ return nil }}
                 state.loadState = .loading
                 return await fetchAll(
                     projectionService: projectionService,
@@ -3566,13 +3553,14 @@ struct BoardState {{
                 )
 
             case let .entriesLoaded(result):
+                state.isBackgroundRefreshing = false
                 state.allEntries       = result.entries
                 state.todayGames       = result.games
                 state.lockTime         = result.lockTime
                 state.seasonMode       = result.seasonMode
                 state.gameOdds         = result.gameOdds
                 state.serverDateString = result.serverDateString
-                state.dailyAnalysis    = result.dailyAnalysis
+                if let analysis = result.dailyAnalysis {{ state.dailyAnalysis = analysis }}
                 state.playoffSeries    = result.playoffSeries
                 state.gameCount        = result.games.count
                 state.lastUpdated      = .now
