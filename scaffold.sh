@@ -497,6 +497,208 @@ actor FetchCoalescer<Value: Sendable> {{
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", "FetchCoalescer.swift"), fetch_coalescer_swift)
 
+diagnostic_logger_swift = f"""\
+{header()}
+import Foundation
+import OSLog
+
+// MARK: - DiagnosticEntry
+
+/// A single structured log entry written to `diagnostic_log.json`.
+struct DiagnosticEntry: Codable {{
+    enum Level: String, Codable {{
+        case debug, info, warning, error, fault
+    }}
+
+    let date: Date
+    let level: Level
+    /// Matches the `os.Logger` category at the same call site.
+    let category: String
+    let message: String
+    /// Last path component of the source file.
+    let file: String
+    let function: String
+    let line: Int
+    let build: String
+}}
+
+// MARK: - DiagnosticLogger
+
+/// Writes structured log entries to a rolling JSON file readable by Claude Code.
+///
+/// - File: `~/Library/Application Support/<bundleID>/Storage/diagnostic_log.json`
+/// - Capacity: last 1000 entries (oldest evicted when full). Only warning/error/fault
+///   by default — debug and info are filtered out to keep the file signal-rich.
+/// - All I/O is dispatched to a private serial queue; never touches the main thread.
+///
+/// Usage — mirror every `os.Logger` call you want persisted:
+///
+///     logger.warning("something broke")
+///     DiagnosticLogger.warning("something broke", category: "BoardState")
+///
+final class DiagnosticLogger: @unchecked Sendable {{
+
+    static let shared = DiagnosticLogger()
+
+    /// Minimum level written to file. Change to `.debug` to capture everything.
+    var minimumLevel: DiagnosticEntry.Level = .warning
+
+    private let queue = DispatchQueue(label: "{bundle_id}.diaglog", qos: .utility)
+    private let maxEntries = 1000
+    private let fileURL: URL
+    private let encoder: JSONEncoder
+    private let decoder: JSONDecoder
+    private let buildLabel: String
+
+    private init() {{
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let bundleID = Bundle.main.bundleIdentifier ?? "{bundle_id}"
+        fileURL = appSupport
+            .appendingPathComponent(bundleID)
+            .appendingPathComponent("Storage")
+            .appendingPathComponent("diagnostic_log.json")
+
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder = enc
+
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        decoder = dec
+
+        buildLabel = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
+    }}
+
+    // MARK: - Static convenience API
+
+    static func debug(
+        _ msg: String,
+        category: String,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) {{ shared.log(.debug, msg, category, file, function, line) }}
+
+    static func info(
+        _ msg: String,
+        category: String,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) {{ shared.log(.info, msg, category, file, function, line) }}
+
+    static func warning(
+        _ msg: String,
+        category: String,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) {{ shared.log(.warning, msg, category, file, function, line) }}
+
+    static func error(
+        _ msg: String,
+        category: String,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) {{ shared.log(.error, msg, category, file, function, line) }}
+
+    static func fault(
+        _ msg: String,
+        category: String,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) {{ shared.log(.fault, msg, category, file, function, line) }}
+
+    // swiftlint:disable:next function_parameter_count
+    private func log(
+        _ level: DiagnosticEntry.Level,
+        _ msg: String,
+        _ category: String,
+        _ file: String,
+        _ function: String,
+        _ line: Int
+    ) {{
+        append(Context(
+            level: level,
+            message: msg,
+            category: category,
+            file: file,
+            function: function,
+            line: line
+        ))
+    }}
+
+    // MARK: - Internal append
+
+    private struct Context {{
+        let level: DiagnosticEntry.Level
+        let message: String
+        let category: String
+        let file: String
+        let function: String
+        let line: Int
+    }}
+
+    private func append(_ ctx: Context) {{
+        guard ctx.level >= minimumLevel else {{ return }}
+        let entry = DiagnosticEntry(
+            date: Date(),
+            level: ctx.level,
+            category: ctx.category,
+            message: ctx.message,
+            file: (ctx.file as NSString).lastPathComponent,
+            function: ctx.function,
+            line: ctx.line,
+            build: buildLabel
+        )
+        let url = fileURL
+        let enc = encoder
+        let dec = decoder
+        let max = maxEntries
+        queue.async {{
+            var entries = Self.load(from: url, decoder: dec)
+            entries.append(entry)
+            if entries.count > max {{
+                entries.removeFirst(entries.count - max)
+            }}
+            Self.save(entries, to: url, encoder: enc)
+        }}
+    }}
+
+    // MARK: - File I/O (queue-confined)
+
+    private static func load(from url: URL, decoder: JSONDecoder) -> [DiagnosticEntry] {{
+        guard
+            FileManager.default.fileExists(atPath: url.path),
+            let data = try? Data(contentsOf: url),
+            let entries = try? decoder.decode([DiagnosticEntry].self, from: data)
+        else {{ return [] }}
+        return entries
+    }}
+
+    private static func save(_ entries: [DiagnosticEntry], to url: URL, encoder: JSONEncoder) {{
+        guard let data = try? encoder.encode(entries) else {{ return }}
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
+    }}
+}}
+
+// MARK: - Level ordering
+
+extension DiagnosticEntry.Level: Comparable {{
+    static func < (lhs: Self, rhs: Self) -> Bool {{
+        let order: [Self] = [.debug, .info, .warning, .error, .fault]
+        return (order.firstIndex(of: lhs) ?? 0) < (order.firstIndex(of: rhs) ?? 0)
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Utilities", "DiagnosticLogger.swift"), diagnostic_logger_swift)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. SportPositionMap extension
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3629,7 +3831,7 @@ struct BoardState {{
     // MARK: - Async fetch
 
     // swiftlint:disable:next function_body_length
-    private static func fetchAll(
+    nonisolated private static func fetchAll(
         projectionService: ProjectionsServiceProtocol,
         opportunityService: OpportunitiesServiceProtocol,
         gamesService: GamesServiceProtocol,
