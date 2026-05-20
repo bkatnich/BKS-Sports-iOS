@@ -463,6 +463,40 @@ extension NotificationPreferenceKey {{
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", "NotificationPreferenceKey+FCM.swift"), notif_fcm_swift)
 
+fetch_coalescer_swift = f"""\
+{header()}
+
+import OSLog
+
+// MARK: - FetchCoalescer
+
+/// Actor that coalesces concurrent async fetch calls into a single in-flight Task.
+///
+/// When a second caller arrives while a fetch is already running, it awaits the
+/// existing Task's result rather than spawning a new network request. This prevents
+/// duplicate Cloud Run cold-starts when a silent push and the board's onAppear race.
+actor FetchCoalescer<Value: Sendable> {{
+    private var inflight: Task<Value, Error>?
+
+    func run(
+        logger: os.Logger,
+        label: StaticString,
+        work: @Sendable @escaping () async throws -> Value
+    ) async throws -> Value {{
+        if let existing = inflight {{
+            logger.debug("\\(label, privacy: .public) — joining in-flight request")
+            return try await existing.value
+        }}
+        let task = Task<Value, Error> {{ try await work() }}
+        inflight = task
+        defer {{ inflight = nil }}
+        return try await task.value
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Utilities", "FetchCoalescer.swift"), fetch_coalescer_swift)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. SportPositionMap extension
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1942,8 +1976,7 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
     private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v1" }}
     private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v1_date" }}
     private var seasonModeCacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)season_mode_v1" }}
-    /// Coalesces concurrent fetches so only one Cloud Run cold-start fires at a time.
-    private var inflightFetch: Task<(opportunities: [Opportunity], seasonMode: SeasonMode), Error>?
+    private let coalescer = FetchCoalescer<(opportunities: [Opportunity], seasonMode: SeasonMode)>()
 
     init(
         network: NetworkProtocol,
@@ -1963,16 +1996,9 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
         mode: String? = nil,
         fields: [String]? = nil
     ) async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode) {{
-        if let existing = inflightFetch {{
-            logger.debug("fetchOpportunities — joining in-flight request")
-            return try await existing.value
+        try await coalescer.run(logger: logger, label: "fetchOpportunities") {{
+            try await self._fetchOpportunities(limit: limit, platform: platform, mode: mode, fields: fields)
         }}
-        let task = Task<(opportunities: [Opportunity], seasonMode: SeasonMode), Error> {{
-            try await _fetchOpportunities(limit: limit, platform: platform, mode: mode, fields: fields)
-        }}
-        inflightFetch = task
-        defer {{ inflightFetch = nil }}
-        return try await task.value
     }}
 
     private func _fetchOpportunities(
@@ -2161,8 +2187,7 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
 
     private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v1" }}
     private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v1_date" }}
-    /// Coalesces concurrent fetches so only one Cloud Run cold-start fires at a time.
-    private var inflightFetch: Task<[Projection], Error>?
+    private let coalescer = FetchCoalescer<[Projection]>()
 
     init(
         network: NetworkProtocol,
@@ -2177,16 +2202,9 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
     }}
 
     func fetchProjections(fields: [String]? = nil) async throws -> [Projection] {{
-        if let existing = inflightFetch {{
-            logger.debug("fetchProjections — joining in-flight request")
-            return try await existing.value
+        try await coalescer.run(logger: logger, label: "fetchProjections") {{
+            try await self._fetchProjections(fields: fields)
         }}
-        let task = Task<[Projection], Error> {{
-            try await _fetchProjections(fields: fields)
-        }}
-        inflightFetch = task
-        defer {{ inflightFetch = nil }}
-        return try await task.value
     }}
 
     private func _fetchProjections(fields: [String]?) async throws -> [Projection] {{
