@@ -1208,10 +1208,10 @@ struct {type_prefix}App: App {{
         category: "AppLifecycle"
     )
 
-    @ObservedObject private var boardStore: Store<BoardState, BoardIntent>
-    @ObservedObject private var authStore: Store<AuthState, AuthIntent>
-    @ObservedObject private var profileStore: Store<ProfileState, ProfileIntent>
-    @ObservedObject private var signInStore: Store<SignInState, SignInIntent>
+    private var boardStore: Store<BoardState, BoardIntent>
+    private var authStore: Store<AuthState, AuthIntent>
+    private var profileStore: Store<ProfileState, ProfileIntent>
+    private var signInStore: Store<SignInState, SignInIntent>
 
     @StateObject private var networkMonitor = NetworkMonitor()
 
@@ -1230,8 +1230,12 @@ struct {type_prefix}App: App {{
     @State private var splashDismissed = false
     @State private var pendingConsentResult: AuthResult?
     @State private var isErasingCache = false
+    #if DEBUG
+    @State private var frameMonitor = FrameDropMonitor()
+    #endif
 
     init() {{
+        Perf.event("AppInitBegin")
         BKSAppScaffold.logLaunchDiagnostics(logger: Self.logger)
 
         let appDelegate = UIApplication.shared.delegate as? AppDelegate
@@ -1251,8 +1255,11 @@ struct {type_prefix}App: App {{
         promoCodeService = container.require(PromoCodeServiceProtocol.self)
         activityService = container.require(ActivityFeedServiceProtocol.self)
         metricsCollector = container.require(MetricsCollectorProtocol.self)
-        subscriptionService = container.require(SubscriptionService.self)
-        Self.startServices(metrics: metricsCollector, subscription: subscriptionService)
+        metricsCollector.startCollecting()
+
+        let resolvedSubscription = container.require(SubscriptionService.self)
+        subscriptionService = resolvedSubscription
+        subscriptionService.startTransactionListener()
 
         let opps = opportunitiesService
         let projs = projectionsService
@@ -1277,14 +1284,6 @@ struct {type_prefix}App: App {{
         }}
 
         Self.registerDataRefresh(opps: opps, projs: projs, games: games)
-    }}
-
-    private static func startServices(
-        metrics: MetricsCollectorProtocol,
-        subscription: SubscriptionService
-    ) {{
-        metrics.startCollecting()
-        subscription.startTransactionListener()
     }}
 
     private static func registerDataRefresh(
@@ -1551,14 +1550,6 @@ extension Container {{
                 sportConfiguration: resolver.require((any SportConfigurationProtocol).self)
             )
         }}
-        // PlayoffService has been merged into GamesService.
-        // register(PlayoffServiceProtocol.self) {{ resolver in
-        //     PlayoffService(
-        //         network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
-        //         storage: resolver.require(StorageProtocol.self),
-        //         configuration: resolver.require(ConfigurationProtocol.self)
-        //     )
-        // }}.inObjectScope(.container)
     }}
 
     @MainActor
@@ -1610,8 +1601,8 @@ import BKSCore
 import BKSUICore
 
 struct {swift_name}AppShell: View {{
-    @ObservedObject var boardStore: Store<BoardState, BoardIntent>
-    @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    var boardStore: Store<BoardState, BoardIntent>
+    var profileStore: Store<ProfileState, ProfileIntent>
     let credential: StoredCredential
     let promoCodeService: PromoCodeServiceProtocol
     let activityService: any ActivityFeedServiceProtocol
