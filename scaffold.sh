@@ -5362,6 +5362,18 @@ Each agent owns a distinct set of files. Two agents must never edit the same fil
 write(os.path.join(out_dir, "CLAUDE.md"), claude_md)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# .claude/skills/ios-advisor.md  (iOS Architect advisor skill for Claude Code)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ios_advisor_skill_path = os.path.join(SCRIPT_DIR, ".claude", "skills", "ios-advisor.md")
+if os.path.exists(ios_advisor_skill_path):
+    with open(ios_advisor_skill_path) as f:
+        ios_advisor_skill = f.read()
+    write(os.path.join(out_dir, ".claude", "skills", "ios-advisor.md"), ios_advisor_skill)
+else:
+    print(f"  warning: {ios_advisor_skill_path} not found — skipping ios-advisor skill")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # workspace.yml  (xcodegen workspace config)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5507,6 +5519,7 @@ print(f"  .swiftlint.yml")
 print(f"  .swiftformat")
 print(f"  .gitignore")
 print(f"  CLAUDE.md")
+print(f"  .claude/skills/ios-advisor.md")
 print(f"  workspace.yml")
 print(f"  generate.sh")
 print()
