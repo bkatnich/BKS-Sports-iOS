@@ -1394,10 +1394,10 @@ struct {type_prefix}App: App {{
 
     private func eraseCachedData() {{
         isErasingCache = true
-        do {{
-            try storage.deleteAll(from: .file)
-        }} catch {{}}
         boardStore.send(.refreshRequested)
+        Task.detached(priority: .userInitiated) {{ [storage] in
+            try? storage.deleteAll(from: .file)
+        }}
     }}
 
     // MARK: - Subscription consent
