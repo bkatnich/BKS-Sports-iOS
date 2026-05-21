@@ -1559,6 +1559,7 @@ extension Container {{
             let opportunityService = resolver.require(OpportunitiesServiceProtocol.self)
             let gamesService = resolver.require(GamesServiceProtocol.self)
             let analysisService = resolver.require(DailyAnalysisServiceProtocol.self)
+            let activityService = resolver.require(ActivityFeedServiceProtocol.self)
             let positionMap = resolver.require((any SportConfigurationProtocol).self).positionMap
             return MainActor.assumeIsolated {{
                 // StoreRef breaks the chicken-and-egg: makeReduce needs to dispatch
@@ -1572,6 +1573,7 @@ extension Container {{
                         opportunityService: opportunityService,
                         gamesService: gamesService,
                         analysisService: analysisService,
+                        activityService: activityService,
                         positionMap: positionMap,
                         storeRef: storeRef
                     )
