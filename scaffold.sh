@@ -4187,18 +4187,26 @@ struct BoardView: View {{
         }}
     }}
 
+    private static let dateParseFormatter: DateFormatter = {{
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        return fmt
+    }}()
+
+    private static let weekdayFormatter: DateFormatter = {{
+        let fmt = DateFormatter()
+        fmt.dateFormat = "EEEE"
+        fmt.locale = .current
+        return fmt
+    }}()
+
     private func weekdayName(from serverDateString: String?) -> String {{
-        let parseFormatter = DateFormatter()
-        parseFormatter.dateFormat = "yyyy-MM-dd"
-        parseFormatter.locale = Locale(identifier: "en_US_POSIX")
-        let displayFormatter = DateFormatter()
-        displayFormatter.dateFormat = "EEEE"
-        displayFormatter.locale = Locale.current
         guard let dateString = serverDateString,
-              let date = parseFormatter.date(from: dateString) else {{
-            return displayFormatter.string(from: Date.now)
+              let date = Self.dateParseFormatter.date(from: dateString) else {{
+            return Self.weekdayFormatter.string(from: Date.now)
         }}
-        return displayFormatter.string(from: date)
+        return Self.weekdayFormatter.string(from: date)
     }}
 }}
 """
