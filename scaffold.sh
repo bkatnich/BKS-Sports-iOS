@@ -4003,58 +4003,19 @@ struct BoardView: View {{
         }}
     }}
 
-    private var customNavBar: some View {{
-        AppCustomNavBar(
-            title: String(localized: "board.title", defaultValue: "Today's Blackboard"),
-            subtitle: subtitleText,
-            slotWidth: 60,
-            leading: {{
-                if case .loaded = store.state.loadState {{
-                    Image("InAppIcon")
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 48, height: 48)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                }} else {{
-                    Color.clear.frame(width: 48, height: 48)
-                }}
-            }},
-            trailing: {{
-                HStack(spacing: 16) {{
-                    Button {{ showInbox = true }} label: {{
-                        ZStack(alignment: .topTrailing) {{
-                            Image(systemName: "bell.fill")
-                                .font(.system(size: 20))
-                                .foregroundStyle(.white)
-                            if notificationLogger.unreadCount > 0 {{
-                                Circle()
-                                    .fill(Color.red)
-                                    .frame(width: 8, height: 8)
-                                    .offset(x: 4, y: -4)
-                            }}
-                        }}
-                    }}
-                    .accessibilityLabel(
-                        notificationLogger.unreadCount > 0
-                            ? String(localized: "a11y.label.alertsUnread",
-                                     defaultValue: "Alerts, \\(notificationLogger.unreadCount) unread")
-                            : String(localized: "a11y.label.alerts", defaultValue: "Alerts")
-                    )
-                    Button {{ showProfile = true }} label: {{
-                        Image(systemName: "person")
-                            .font(.system(size: 20))
-                            .foregroundStyle(.white)
-                    }}
-                    .accessibilityLabel(String(localized: "a11y.label.profile", defaultValue: "Profile"))
-                }}
-            }}
-        )
-    }}
-
     private var boardList: some View {{
         VStack(spacing: 0) {{
-            customNavBar
-                .skeletonPulse(delay: 0, active: isLoading)
+            BoardNavBar(
+                subtitle: subtitleText,
+                isLoaded: {{
+                    if case .loaded = store.state.loadState {{ return true }}
+                    return false
+                }}(),
+                unreadCount: notificationLogger.unreadCount,
+                onInbox: {{ showInbox = true }},
+                onProfile: {{ showProfile = true }}
+            )
+            .skeletonPulse(delay: 0, active: isLoading)
 
             if !store.state.todayGames.isEmpty {{
                 GamesStrip(
@@ -4107,83 +4068,20 @@ struct BoardView: View {{
                 tipsContent: SearchTipsView.init
             )
 
-            let allCount = store.state.filteredEntries.count
-            let topPicksCount = store.state.groupedEntries.reduce(0) {{ $0 + $1.picks.count }}
-            let allLabel = "\\(String(localized: "board.view.all", defaultValue: "All Players")) (\\(allCount))"
-            let topPicksLabel = "\\(String(localized: "board.view.byPosition", defaultValue: "BlackKatt Instinct")) (\\(topPicksCount))"
-            Picker(String(localized: "board.picker.label", defaultValue: "View mode"), selection: viewModeBinding) {{
-                Text(topPicksLabel).tag(BoardViewMode.byPosition)
-                Text(allLabel).tag(BoardViewMode.flat)
-            }}
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.bottom, 8)
+            BoardViewModePicker(
+                allCount: store.state.filteredEntries.count,
+                topPicksCount: store.state.groupedEntries.reduce(0) {{ $0 + $1.picks.count }},
+                viewMode: viewModeBinding
+            )
 
-            ScrollView {{
-                switch store.state.loadState {{
-                case .idle, .loading:
-                    BoardSkeletonView()
-                        .padding(.bottom, 16)
-
-                case .failed:
-                    VStack(spacing: 12) {{
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.system(size: 36))
-                            .foregroundStyle(.white.opacity(AppOpacity.muted))
-                        Text(String(localized: "board.error", defaultValue: "Unable to load board"))
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(AppOpacity.muted))
-                            .multilineTextAlignment(.center)
-                        Button(String(localized: "board.retry", defaultValue: "Try again")) {{
-                            store.send(.refreshRequested)
-                        }}
-                        .buttonStyle(.borderedProminent)
-                    }}
-                    .padding(.top, 40)
-                    .padding(.horizontal, 24)
-
-                case .loaded:
-                    if store.state.filteredEntries.isEmpty {{
-                        VStack(spacing: 12) {{
-                            Image(systemName: "sportscourt")
-                                .font(.system(size: 36))
-                                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                            Text(String(localized: "board.empty", defaultValue: "No picks today"))
-                                .font(.subheadline)
-                                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                                .multilineTextAlignment(.center)
-                        }}
-                        .padding(.top, 40)
-                        .padding(.horizontal, 24)
-                    }} else {{
-                        LazyVStack(spacing: 0) {{
-                            ForEach(store.state.filteredEntries, id: \\.id) {{ entry in
-                                NavigationLink(value: entry) {{
-                                    // TODO: replace with sport-specific card view
-                                    VStack(alignment: .leading, spacing: 2) {{
-                                        Text(entry.displayName)
-                                            .font(.headline)
-                                            .foregroundStyle(.white)
-                                        if let score = entry.projectedScore {{
-                                            Text(String(format: "%.1f DK pts", score))
-                                                .font(.caption)
-                                                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                                        }}
-                                    }}
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 12)
-                                }}
-                                .buttonStyle(.plain)
-                                Divider().overlay(.white.opacity(0.1))
-                            }}
-                        }}
-                        .padding(.bottom, 16)
-                    }}
-                }}
-            }}
-            .refreshable {{ store.send(.refreshRequested) }}
-            .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+            BoardScrollContent(
+                loadState: store.state.loadState,
+                filteredEntries: store.state.filteredEntries,
+                groupedEntries: store.state.groupedEntries,
+                viewMode: store.state.viewMode,
+                onRetry: {{ store.send(.refreshRequested) }},
+                onRefresh: {{ store.send(.refreshRequested) }}
+            )
         }}
     }}
 
@@ -4279,6 +4177,215 @@ struct NotificationsDetailView: View {{
 }}
 """
 
+# ── BoardNavBar.swift ────────────────────────────────────────────────────────────────────────
+
+board_nav_bar_swift = header() + f"""import BKSUICore
+import SwiftUI
+
+// MARK: - BoardNavBar
+
+struct BoardNavBar: View {{
+    let subtitle: String
+    let isLoaded: Bool
+    let unreadCount: Int
+    let onInbox: () -> Void
+    let onProfile: () -> Void
+
+    var body: some View {{
+        AppCustomNavBar(
+            title: String(localized: "board.title", defaultValue: "Today's Blackboard"),
+            subtitle: subtitle,
+            slotWidth: 60,
+            leading: {{
+                if isLoaded {{
+                    Image("InAppIcon")
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 48, height: 48)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }} else {{
+                    Color.clear.frame(width: 48, height: 48)
+                }}
+            }},
+            trailing: {{
+                HStack(spacing: 16) {{
+                    Button(action: onInbox) {{
+                        ZStack(alignment: .topTrailing) {{
+                            Image(systemName: "bell.fill")
+                                .font(.system(size: 20))
+                                .foregroundStyle(.white)
+                            if unreadCount > 0 {{
+                                Circle()
+                                    .fill(Color.red)
+                                    .frame(width: 8, height: 8)
+                                    .offset(x: 4, y: -4)
+                            }}
+                        }}
+                    }}
+                    .accessibilityLabel(
+                        unreadCount > 0
+                            ? String(localized: "a11y.label.alertsUnread",
+                                     defaultValue: "Alerts, \\(unreadCount) unread")
+                            : String(localized: "a11y.label.alerts", defaultValue: "Alerts")
+                    )
+                    Button(action: onProfile) {{
+                        Image(systemName: "person")
+                            .font(.system(size: 20))
+                            .foregroundStyle(.white)
+                    }}
+                    .accessibilityLabel(String(localized: "a11y.label.profile", defaultValue: "Profile"))
+                }}
+            }}
+        )
+    }}
+}}
+"""
+
+# ── BoardViewModePicker.swift ────────────────────────────────────────────────────────────────
+
+board_view_mode_picker_swift = header() + f"""import BKSCore
+import SwiftUI
+
+// MARK: - BoardViewModePicker
+
+struct BoardViewModePicker: View {{
+    let allCount: Int
+    let topPicksCount: Int
+    let viewMode: Binding<BoardViewMode>
+
+    var body: some View {{
+        let allLabel = "\\(String(localized: "board.view.all", defaultValue: "All Players")) (\\(allCount))"
+        let topPicksBase = String(localized: "board.view.byPosition", defaultValue: "BlackKatt Instinct")
+        let topPicksLabel = "\\(topPicksBase) (\\(topPicksCount))"
+        Picker(String(localized: "board.picker.label", defaultValue: "View mode"), selection: viewMode) {{
+            Text(topPicksLabel).tag(BoardViewMode.byPosition)
+            Text(allLabel).tag(BoardViewMode.flat)
+        }}
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
+    }}
+}}
+"""
+
+# ── BoardScrollContent.swift ─────────────────────────────────────────────────────────────────
+
+board_scroll_content_swift = header() + f"""import BKSCore
+import BKSUICore
+import SwiftUI
+
+// MARK: - BoardScrollContent
+
+struct BoardScrollContent: View {{
+    let loadState: ViewState<[BoardEntry]>
+    let filteredEntries: [BoardEntry]
+    let groupedEntries: [(position: String, picks: [BoardEntry])]
+    let viewMode: BoardViewMode
+    let onRetry: () -> Void
+    let onRefresh: () -> Void
+
+    var body: some View {{
+        ScrollView {{
+            switch loadState {{
+            case .idle, .loading:
+                BoardSkeletonView()
+                    .padding(.bottom, 16)
+
+            case .failed:
+                VStack(spacing: 12) {{
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.white.opacity(AppOpacity.muted))
+                    Text(String(localized: "board.error", defaultValue: "Unable to load board"))
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(AppOpacity.muted))
+                        .multilineTextAlignment(.center)
+                    Button(String(localized: "board.retry", defaultValue: "Try again")) {{
+                        onRetry()
+                    }}
+                    .buttonStyle(.borderedProminent)
+                }}
+                .padding(.top, 40)
+                .padding(.horizontal, 24)
+
+            case .loaded:
+                if filteredEntries.isEmpty {{
+                    VStack(spacing: 12) {{
+                        Image(systemName: "sportscourt")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.white.opacity(AppOpacity.muted))
+                        Text(String(localized: "board.empty", defaultValue: "No picks today"))
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(AppOpacity.muted))
+                            .multilineTextAlignment(.center)
+                    }}
+                    .padding(.top, 40)
+                    .padding(.horizontal, 24)
+                }} else {{
+                    switch viewMode {{
+                    case .flat:
+                        LazyVStack(spacing: 0) {{
+                            ForEach(filteredEntries, id: \\.id) {{ entry in
+                                NavigationLink(value: entry) {{
+                                    // TODO: replace with sport-specific card view
+                                    VStack(alignment: .leading, spacing: 2) {{
+                                        Text(entry.displayName)
+                                            .font(.headline)
+                                            .foregroundStyle(.white)
+                                        if let score = entry.projectedScore {{
+                                            Text(String(format: "%.1f DK pts", score))
+                                                .font(.caption)
+                                                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                                        }}
+                                    }}
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 12)
+                                }}
+                                .buttonStyle(.plain)
+                                Divider().overlay(.white.opacity(0.1))
+                            }}
+                        }}
+                        .padding(.bottom, 16)
+
+                    case .byPosition:
+                        VStack(spacing: 0) {{
+                            ForEach(groupedEntries, id: \\.position) {{ group in
+                                HStack {{
+                                    Text(group.position)
+                                        .font(AppFonts.sectionHeader)
+                                        .foregroundStyle(.white.opacity(AppOpacity.primary))
+                                        .tracking(1.2)
+                                        .accessibilityAddTraits(.isHeader)
+                                    Spacer()
+                                }}
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(.white.opacity(0.07))
+                                ForEach(group.picks, id: \\.id) {{ entry in
+                                    NavigationLink(value: entry) {{
+                                        // TODO: replace with sport-specific card view
+                                        Text(entry.displayName)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(.horizontal, 16)
+                                            .padding(.vertical, 12)
+                                    }}
+                                    .buttonStyle(.plain)
+                                    Divider().overlay(.white.opacity(0.1))
+                                }}
+                            }}
+                        }}
+                        .padding(.bottom, 16)
+                    }}
+                }}
+            }}
+        }}
+        .refreshable {{ onRefresh() }}
+        .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+    }}
+}}
+"""
+
 # ── Write all files ─────────────────────────────────────────────────────────────────────────
 
 write(os.path.join(board_models_dir,  "BoardEntry.swift"),               board_entry_swift)
@@ -4286,6 +4393,9 @@ write_if_absent(os.path.join(board_models_dir,  "BoardEntryBuilder.swift"), boar
 write(os.path.join(board_store_dir,   "BoardIntent.swift"),              board_intent_swift)
 write(os.path.join(board_store_dir,   "BoardState.swift"),               board_state_swift)
 write_if_absent(os.path.join(board_views_dir,   "BoardView.swift"),                board_view_swift)
+write_if_absent(os.path.join(board_views_dir,   "BoardNavBar.swift"),              board_nav_bar_swift)
+write_if_absent(os.path.join(board_views_dir,   "BoardViewModePicker.swift"),      board_view_mode_picker_swift)
+write_if_absent(os.path.join(board_views_dir,   "BoardScrollContent.swift"),       board_scroll_content_swift)
 write(os.path.join(profile_views_dir, "ProfileContainerView.swift"),     profile_container_swift)
 write(os.path.join(profile_views_dir, "NotificationsDetailView.swift"),  notifications_detail_swift)
 
