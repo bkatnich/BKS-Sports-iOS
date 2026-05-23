@@ -192,7 +192,7 @@ def header(year=2026):
 players_api      = api.get("players", {})
 opps_api         = api.get("opportunities", {})
 proj_api         = api.get("projections", {})
-today_api        = api.get("todayGames", {})
+board_api        = api.get("board", {})
 gamelog_api      = api.get("gameLog", {})
 external_id_key  = api.get("externalPersonIDKey", "external_person_id")
 
@@ -202,7 +202,6 @@ ou_push_threshold = str(opp_params.get("ouPushThreshold", "0.5"))
 players_url      = players_api.get("url", "")
 opps_url         = opps_api.get("url", "")
 proj_url         = proj_api.get("url", "")
-today_url        = today_api.get("url", "")
 gamelog_base     = gamelog_api.get("baseURL", "")
 api_key_needed   = gamelog_api.get("apiKeyRequired", False)
 
@@ -270,10 +269,10 @@ config_keys += f"""\
         defaultValue: "UNCONFIGURED_GET_OPPORTUNITIES_URL",
         infoPlistKey: "GetOpportunitiesURL"
     )
-    static let getTodayGamesURL = ConfigurationKey(
-        name: "getTodayGamesURL",
-        defaultValue: "UNCONFIGURED_GET_TODAY_GAMES_URL",
-        infoPlistKey: "GetTodayGamesURL"
+    static let getBoardURL = ConfigurationKey(
+        name: "getBoardURL",
+        defaultValue: "UNCONFIGURED_GET_BOARD_URL",
+        infoPlistKey: "GetBoardURL"
     )
     static let getProjectionsURL = ConfigurationKey(
         name: "getProjectionsURL",
@@ -1218,7 +1217,7 @@ struct {type_prefix}App: App {{
     private let auth: AuthenticationProtocol
     private let opportunitiesService: OpportunitiesServiceProtocol
     private let projectionsService: ProjectionsServiceProtocol
-    private let gamesService: GamesServiceProtocol
+    private let gamesService: any GamesServiceProtocol
     private let promoCodeService: PromoCodeServiceProtocol
     private let activityService: any ActivityFeedServiceProtocol
     private let configuration: ConfigurationProtocol
@@ -1263,7 +1262,6 @@ struct {type_prefix}App: App {{
 
         let opps = opportunitiesService
         let projs = projectionsService
-        let games = gamesService
 
         profileStore = BKSAppScaffold.makeProfileStore(
             container: container,
@@ -1283,25 +1281,24 @@ struct {type_prefix}App: App {{
             Task {{ await langService.syncLanguage() }}
         }}
 
-        Self.registerDataRefresh(opps: opps, projs: projs, games: games)
+        Self.registerDataRefresh(opps: opps, projs: projs)
     }}
 
     private static func registerDataRefresh(
         opps: OpportunitiesServiceProtocol,
-        projs: ProjectionsServiceProtocol,
-        games: GamesServiceProtocol
+        projs: ProjectionsServiceProtocol
     ) {{
         DataRefreshTask.register(
             identifier: DataRefreshTaskID.identifier,
             fetchOpportunities: {{ _ = try await opps.fetchOpportunities() }},
             fetchProjections: {{ _ = try await projs.fetchProjections() }},
-            fetchSchedule: {{ _ = try await games.fetchTodaySchedule() }}
+            fetchSchedule: {{ }}
         )
     }}
 
     private static func resolveSportServices(
         from container: Container
-    ) -> (OpportunitiesServiceProtocol, ProjectionsServiceProtocol, GamesServiceProtocol) {{
+    ) -> (OpportunitiesServiceProtocol, ProjectionsServiceProtocol, any GamesServiceProtocol) {{
         (
             container.require(OpportunitiesServiceProtocol.self),
             container.require(ProjectionsServiceProtocol.self),
@@ -1465,15 +1462,14 @@ final class AppDelegate: BKSAppDelegate {{
         guard
             let storage = container?.resolve(StorageProtocol.self),
             let opps = container?.resolve(OpportunitiesServiceProtocol.self),
-            let projs = container?.resolve(ProjectionsServiceProtocol.self),
-            let games = container?.resolve(GamesServiceProtocol.self)
+            let projs = container?.resolve(ProjectionsServiceProtocol.self)
         else {{ return }}
         await DataRefreshTask.handleSilentPush(
             userInfo: userInfo,
             storage: storage,
             fetchOpportunities: {{ _ = try await opps.fetchOpportunities() }},
             fetchProjections: {{ _ = try await projs.fetchProjections() }},
-            fetchSchedule: {{ _ = try await games.fetchTodaySchedule() }}
+            fetchSchedule: {{ }}
         )
     }}
 }}
@@ -1510,7 +1506,16 @@ extension Container {{
         register((any SportConfigurationProtocol).self) {{ _ in SportConfiguration.{slug} }}.inObjectScope(.container)
     }}
 
+    // swiftlint:disable:next function_body_length
     private func registerSportServices() {{
+        register(BoardServiceProtocol.self) {{ resolver in
+            BoardService(
+                network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
+                storage: resolver.require(StorageProtocol.self),
+                configuration: resolver.require(ConfigurationProtocol.self),
+                sportConfiguration: resolver.require((any SportConfigurationProtocol).self)
+            )
+        }}.inObjectScope(.container)
         register(NetworkProtocol.self, name: "apiKey") {{ resolver in
             let config = resolver.require(ConfigurationProtocol.self)
             let apiKeyInterceptor = APIKeyInterceptor(apiKey: config.value(for: .gameLogAPIKey))
@@ -1555,9 +1560,9 @@ extension Container {{
     @MainActor
     private func registerBoardStore() {{
         register(Store<BoardState, BoardIntent>.self) {{ resolver in
+            let boardService = resolver.require(BoardServiceProtocol.self)
             let projectionService = resolver.require(ProjectionsServiceProtocol.self)
             let opportunityService = resolver.require(OpportunitiesServiceProtocol.self)
-            let gamesService = resolver.require(GamesServiceProtocol.self)
             let analysisService = resolver.require(DailyAnalysisServiceProtocol.self)
             let activityService = resolver.require(ActivityFeedServiceProtocol.self)
             let positionMap = resolver.require((any SportConfigurationProtocol).self).positionMap
@@ -1569,9 +1574,9 @@ extension Container {{
                 let store = Store(
                     initial: BoardState(),
                     reduce: BoardState.makeReduce(
+                        boardService: boardService,
                         projectionService: projectionService,
                         opportunityService: opportunityService,
-                        gamesService: gamesService,
                         analysisService: analysisService,
                         activityService: activityService,
                         positionMap: positionMap,
@@ -2770,8 +2775,6 @@ final class GamesService: GamesServiceProtocol {{
     )
 
     private static let gameLogCachePrefix = "game_log_"
-    private var todayScheduleCacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1" }}
-    private var todayScheduleCacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1_date" }}
     private static let dateFormatter: DateFormatter = {{
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
@@ -2879,39 +2882,15 @@ final class GamesService: GamesServiceProtocol {{
         try storage.load(forKey: Self.gameLogCachePrefix + playerID, from: .file)
     }}
 
+    // Schedule data is now owned by BoardService (get-board). This stub satisfies the
+    // BKSCore protocol requirement; callers should use BoardServiceProtocol.loadCachedTodaySchedule().
     func fetchTodaySchedule() async throws -> TodaySchedule {{
-        let url = configuration.value(for: .getTodayGamesURL)
-        try Task.checkCancellation()
-        let response: TodayScheduleResponse = try await firebaseNetwork.get(url, parameters: nil)
-        let schedule = TodaySchedule(
-            date: response.date,
-            gameCount: response.gameCount,
-            noGamesToday: response.message?.lowercased().contains("no games") ?? false,
-            games: response.games.map {{ dto in
-                ScheduledGame(
-                    id: dto.gameID,
-                    homeTeamAbbr: dto.homeTeamAbbr,
-                    visitorTeamAbbr: dto.visitorTeamAbbr,
-                    status: dto.status,
-                    gameType: dto.gameType,
-                    gameDatetime: dto.gameDatetime.flatMap {{ parseDate($0) }} ?? parseDateOnly(response.date),
-                    isDoubleheader: dto.isDoubleheader,
-                    gameSequence: dto.gameSequence
-                )
-            }}
-        )
-        do {{
-            try storage.save(schedule, forKey: todayScheduleCacheKey, in: .file)
-            try storage.save(Date.now, forKey: todayScheduleCacheDateKey, in: .file)
-        }} catch {{
-            logger.warning("Failed to cache today schedule: \\(error.diagnosticDescription, privacy: .public)")
-        }}
-        logger.info("Fetched today schedule: \\(schedule.gameCount, privacy: .public) game(s) on \\(schedule.date, privacy: .public)")
-        return schedule
+        throw GamesServiceError.noScheduleFound
     }}
 
     func loadCachedTodaySchedule() throws -> TodaySchedule? {{
-        try storage.load(forKey: todayScheduleCacheKey, from: .file)
+        let key = "\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1"
+        return try storage.load(forKey: key, from: .file)
     }}
 
     func fetchPlayoffBracket() async throws -> [PlayoffSeries] {{
@@ -3140,82 +3119,6 @@ private struct StatsMetaDTO: Decodable {{
     enum CodingKeys: String, CodingKey {{
         case nextCursor = "next_cursor"
         case perPage = "per_page"
-    }}
-}}
-
-// MARK: - Today Schedule DTOs
-
-private struct TodayScheduleResponse: Decodable {{
-    let date: String
-    let gameCount: Int
-    let games: [ScheduledGameDTO]
-    let message: String?
-
-    enum CodingKeys: String, CodingKey {{
-        case date
-        case gameCount = "game_count"
-        case games
-        case message
-    }}
-}}
-
-private struct ScheduledGameDTO: Decodable {{
-    let gameID: Int
-    let homeTeamAbbr: String
-    let visitorTeamAbbr: String
-    let status: String
-    let gameType: String
-    let gameDatetime: String?
-    let homeOdds: GameSideOddsDTO?
-    let visitorOdds: GameSideOddsDTO?
-    let homeProjTotal: Double?
-    let visitorProjTotal: Double?
-    let projTotal: Double?
-    let bkWinner: String?
-    let bkWinnerConfidence: Double?
-    let bkSpreadPick: String?
-    let bkSpreadPickCovers: Bool?
-    let bkSpreadConfidence: Double?
-    let isDoubleheader: Bool
-    let gameSequence: Int
-
-    enum CodingKeys: String, CodingKey {{
-        case gameID = "game_id"
-        case homeTeamAbbr = "home_team_abbr"
-        case visitorTeamAbbr = "visitor_team_abbr"
-        case status
-        case gameType = "game_type"
-        case gameDatetime = "game_datetime"
-        case homeOdds = "home_odds"
-        case visitorOdds = "visitor_odds"
-        case homeProjTotal = "home_proj_total"
-        case visitorProjTotal = "visitor_proj_total"
-        case projTotal = "proj_total"
-        case bkWinner = "bk_winner"
-        case bkWinnerConfidence = "bk_winner_confidence"
-        case bkSpreadPick = "bk_spread_pick"
-        case bkSpreadPickCovers = "bk_spread_pick_covers"
-        case bkSpreadConfidence = "bk_spread_confidence"
-        case isDoubleheader = "is_doubleheader"
-        case gameSequence = "game_sequence"
-    }}
-}}
-
-private struct GameSideOddsDTO: Decodable {{
-    let impliedTeamTotal: Double
-    let overUnder: Double
-    let spread: Double
-    let isFavorite: Bool
-    let marketWinProb: Double?
-    let divergence: Double?
-
-    enum CodingKeys: String, CodingKey {{
-        case impliedTeamTotal = "implied_team_total"
-        case overUnder = "over_under"
-        case spread
-        case isFavorite = "is_favorite"
-        case marketWinProb = "market_win_prob"
-        case divergence
     }}
 }}
 
@@ -3713,10 +3616,11 @@ struct BoardState {{
 
     // swiftlint:disable:next function_body_length cyclomatic_complexity function_parameter_count
     static func makeReduce(
+        boardService: BoardServiceProtocol,
         projectionService: ProjectionsServiceProtocol,
         opportunityService: OpportunitiesServiceProtocol,
-        gamesService: GamesServiceProtocol,
         analysisService: DailyAnalysisServiceProtocol,
+        activityService: ActivityFeedServiceProtocol,
         positionMap: SportPositionMap,
         storeRef: StoreRef<Self, BoardIntent>
     ) -> Reduce<Self, BoardIntent> {{
@@ -3735,9 +3639,9 @@ struct BoardState {{
                 if case .loading = state.loadState {{ return nil }}
                 state.loadState = .loading
                 return await fetchAll(
+                    boardService: boardService,
                     projectionService: projectionService,
                     opportunityService: opportunityService,
-                    gamesService: gamesService,
                     analysisService: analysisService,
                     storeRef: storeRef
                 )
@@ -3745,9 +3649,9 @@ struct BoardState {{
             case .refreshRequested:
                 state.loadState = .loading
                 return await fetchAll(
+                    boardService: boardService,
                     projectionService: projectionService,
                     opportunityService: opportunityService,
-                    gamesService: gamesService,
                     analysisService: analysisService,
                     storeRef: storeRef
                 )
@@ -3758,9 +3662,9 @@ struct BoardState {{
                 if case .loaded = state.loadState {{ state.isBackgroundRefreshing = true }}
                 state.loadState = .loading
                 return await fetchAll(
+                    boardService: boardService,
                     projectionService: projectionService,
                     opportunityService: opportunityService,
-                    gamesService: gamesService,
                     analysisService: analysisService,
                     storeRef: storeRef
                 )
@@ -3825,9 +3729,9 @@ struct BoardState {{
 
     // swiftlint:disable:next function_body_length
     nonisolated private static func fetchAll(
+        boardService: BoardServiceProtocol,
         projectionService: ProjectionsServiceProtocol,
         opportunityService: OpportunitiesServiceProtocol,
-        gamesService: GamesServiceProtocol,
         analysisService: DailyAnalysisServiceProtocol,
         storeRef: StoreRef<Self, BoardIntent>
     ) async -> BoardIntent {{
@@ -3846,47 +3750,23 @@ struct BoardState {{
             }}
         }}
 
-        async let projectionsTask: [Projection] = {{
-            do {{ return try await projectionService.fetchProjections() }} catch {{
-                logger.warning("Board: projections fetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                return []
-            }}
-        }}()
-
-        async let opportunitiesTask: (opportunities: [Opportunity], seasonMode: SeasonMode) = {{
-            do {{ return try await opportunityService.fetchOpportunities() }} catch {{
-                logger.warning("Board: opportunities fetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                return ([], .regularSeason)
-            }}
-        }}()
-
-        async let scheduleTask: TodaySchedule? = {{
-            do {{ return try await gamesService.fetchTodaySchedule() }} catch {{
-                logger.warning("Board: schedule fetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                return nil
-            }}
-        }}()
-
-        async let playoffTask: [PlayoffSeries] = {{
-            do {{ return try await gamesService.fetchPlayoffBracket() }} catch {{
-                logger.warning("Board: playoff bracket fetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                return []
-            }}
-        }}()
-
-        let projections = await projectionsTask
-        let opportunitiesResult = await opportunitiesTask
-        let schedule = await scheduleTask
-        let playoffSeries = await playoffTask
+        // Phase 1 — get-board is the critical path. Returns schedule + players + odds.
+        let page: BoardPageResult
+        do {{
+            page = try await boardService.fetchBoard()
+        }} catch {{
+            logger.warning("Board: get_board fetch failed: \\(error.diagnosticDescription, privacy: .public)")
+            return .loadFailed(error)
+        }}
 
         let entries = BoardEntryBuilder.build(
             players: [],
-            projections: projections,
-            opportunities: opportunitiesResult.opportunities,
-            todayDateString: schedule?.date
+            projections: [],
+            opportunities: page.players,
+            todayDateString: page.date.isEmpty ? nil : page.date
         )
 
-        let games = schedule?.games ?? []
+        let games = page.games
         let gameOdds = Dictionary(
             uniqueKeysWithValues: games.map {{ game in
                 let key = "\\(game.visitorTeamAbbr)@\\(game.homeTeamAbbr):\\(game.gameSequence)"
@@ -3899,11 +3779,11 @@ struct BoardState {{
             entries: entries,
             games: games,
             lockTime: lockTime,
-            seasonMode: opportunitiesResult.seasonMode,
+            seasonMode: page.seasonMode,
             gameOdds: gameOdds,
-            serverDateString: schedule?.date,
+            serverDateString: page.date.isEmpty ? nil : page.date,
             dailyAnalysis: nil,
-            playoffSeries: playoffSeries
+            playoffSeries: []
         ))
     }}
 }}
@@ -4646,7 +4526,7 @@ GET_PLAYOFF_BRACKET_URL = https:$(SLASH)/<your-dev-host>/get_playoff_bracket
 // Cloud Run URLs
 GET_PLAYERS_URL = https:$(SLASH)/<your-dev-host>/get_players
 GET_OPPORTUNITIES_URL = https:$(SLASH)/<your-dev-host>/get_opportunities
-GET_TODAY_GAMES_URL = https:$(SLASH)/<your-dev-host>/get_today_games
+GET_BOARD_URL = https:$(SLASH)/<your-dev-host>/get_board
 GET_PROJECTIONS_URL = https:$(SLASH)/<your-dev-host>/get_projections
 """
 
@@ -4685,7 +4565,7 @@ GET_PLAYOFF_BRACKET_URL = https:$(SLASH)/<your-prod-host>/get_playoff_bracket
 // Cloud Run URLs
 GET_PLAYERS_URL = https:$(SLASH)/<your-prod-host>/get_players
 GET_OPPORTUNITIES_URL = https:$(SLASH)/<your-prod-host>/get_opportunities
-GET_TODAY_GAMES_URL = https:$(SLASH)/<your-prod-host>/get_today_games
+GET_BOARD_URL = https:$(SLASH)/<your-prod-host>/get_board
 GET_PROJECTIONS_URL = https:$(SLASH)/<your-prod-host>/get_projections
 """
 
@@ -4757,8 +4637,8 @@ info_plist = f"""\
 \t<string>$(GET_PLAYERS_URL)</string>
 \t<key>GetOpportunitiesURL</key>
 \t<string>$(GET_OPPORTUNITIES_URL)</string>
-\t<key>GetTodayGamesURL</key>
-\t<string>$(GET_TODAY_GAMES_URL)</string>
+\t<key>GetBoardURL</key>
+\t<string>$(GET_BOARD_URL)</string>
 \t<key>GetProjectionsURL</key>
 \t<string>$(GET_PROJECTIONS_URL)</string>
 \t<key>GetLeagueStateURL</key>
@@ -5413,7 +5293,8 @@ The generator takes `sports/{slug}.yaml` and produces the sport-specific Swift f
 Sources/
 ├── App/           — Composition root ({type_prefix}App, AppShell, DependencyContainer)
 ├── Core/
-│   ├── Services/  — Sport-specific implementations (OpportunitiesService, ProjectionsService, GamesService)
+│   ├── Services/  — Sport-specific implementations (BoardService, OpportunitiesService, ProjectionsService, GamesService)
+│   │              — BoardService owns get-board (schedule + players + odds); GamesService owns game logs + playoff bracket
 │   ├── Models/    — Domain models (Player, Opportunity, Projection, PlayoffSeries, LeagueState)
 │   ├── Sport/     — Sport extensions (SportConfiguration+<Sport>, SportPositionMap+<Sport>, <Calc>)
 │   │              — Base types (SportConfiguration, SportPositionMap, ScoringCalculator) live in BKSCore

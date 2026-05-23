@@ -253,8 +253,10 @@ api:
       platform: dk
       mode: gpp
 
-  todayGames:
+  board:
     url: ""
+    # Returns schedule + players + odds in a single call.
+    # Replaces the former get-today-games + get-opportunities split.
 
   redeemPromoCode:
     url: ""
