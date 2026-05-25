@@ -116,7 +116,9 @@ scoring     = spec.get("scoring", {})
 packages    = spec.get("packages", {})
 api         = spec.get("api", {})
 gamelog         = spec.get("gamelog", {})
-dnp_condition   = gamelog.get("isDNPCondition", "false")
+# isDNPCondition from YAML is intentionally not used in code generation.
+# isDNP is hardcoded in the GameEntry+Sport template using raw dict access
+# because atBats is a computed property, not a stored stat key.
 season       = spec.get("season", {})
 has_playoffs = season.get("hasPlayoffs", False)
 season_modes = season.get("modes", ["regular_season", "playoffs", "offseason"])
@@ -2664,11 +2666,18 @@ def stat_dict_line(s):
 
 stats_dict_lines = "\n".join(stat_dict_line(s) for s in gamelog_stats if not s.get("isPlayingTime"))
 
-# Build GameEntry+Sport extension accessors
+# Build GameEntry+Sport extension accessors.
+# inningsPitched is stored as tenths-of-inning (Int) to avoid Float precision
+# issues in Firestore; the accessor divides by 10.0 to restore the conventional value.
 def stat_accessor_line(s):
     key = s["key"]
     typ = s.get("type", "Int")
-    return f'    var {key}: {typ}           {{ stats["{key}"] ?? 0 }}'
+    if key == "inningsPitched":
+        return f'    var {key}: Double           {{ Double(stats["{key}"] ?? 0) / 10.0 }}'
+    elif typ == "Double":
+        return f'    var {key}: Double           {{ stats["{key}"] ?? 0.0 }}'
+    else:
+        return f'    var {key}: {typ}           {{ stats["{key}"] ?? 0 }}'
 
 stat_accessor_lines = "\n".join(stat_accessor_line(s) for s in gamelog_stats if not s.get("isPlayingTime"))
 
@@ -3352,8 +3361,17 @@ import BKSCore
 public extension GameEntry {{
 {stat_accessor_lines}
 
-    /// Sport-specific DNP check. Overrides the BKSCore default.
-    var isDNP: Bool {{ {dnp_condition} }}
+    /// Total official at-bats (1B + 2B + 3B + HR). Derived from hit components
+    /// because the server does not store atBats directly in the stats dict.
+    var atBats: Int {{
+        (stats["single"] ?? 0) + (stats["double"] ?? 0) + (stats["triple"] ?? 0) + (stats["homeRun"] ?? 0)
+    }}
+
+    var hits: Int {{ single + double + triple + homeRun }}
+
+    /// Sport-specific DNP check. A hitter with zero at-bats and a pitcher with zero
+    /// innings pitched did not play. Uses raw dict access because `atBats` is computed.
+    var isDNP: Bool {{ (stats["single"] ?? 0) == 0 && inningsPitched == 0.0 }}
 }}
 
 // MARK: - PlayerGameLog {swift_name} averages
