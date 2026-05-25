@@ -49,6 +49,30 @@
         }
       }
     },
+    "%@HR · %@RBI": {
+      "comment": "Game log summary: home runs and RBIs. First arg is HR count, second is RBI count.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@HR · %2$@RBI"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@HR · %2$@RBI"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@HR · %2$@RBI"
+          }
+        }
+      }
+    },
     "3P%": {
       "extractionState": "manual",
       "localizations": {
@@ -1110,6 +1134,29 @@
         }
       }
     },
+    "a11y.board.confirmedStarter": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Confirmed starter"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Titular confirmado"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Partant confirmé"
+          }
+        }
+      }
+    },
     "a11y.boardDetail.confirmedStarter": {
       "extractionState": "manual",
       "localizations": {
@@ -1612,6 +1659,29 @@
           "stringUnit": {
             "state": "translated",
             "value": "Afficher ou masquer le mot de passe"
+          }
+        }
+      }
+    },
+    "a11y.label.viewProjections": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "View projections for %@"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ver proyecciones de %@"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Voir les projections de %@"
           }
         }
       }
@@ -2381,6 +2451,52 @@
         }
       }
     },
+    "board.badge.topCeiling": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "🔥 Ceiling #%lld"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "🔥 Techo #%lld"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "🔥 Plafond #%lld"
+          }
+        }
+      }
+    },
+    "board.badge.topValue": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "💎 Value #%lld"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "💎 Valor #%lld"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "💎 Valeur #%lld"
+          }
+        }
+      }
+    },
     "board.badge.toughMatchup": {
       "extractionState": "manual",
       "localizations": {
@@ -2818,6 +2934,75 @@
           "stringUnit": {
             "state": "translated",
             "value": "Joueurs"
+          }
+        }
+      }
+    },
+    "board.subscriptionRequired.body": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your trial has ended. Subscribe to keep getting daily picks."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tu prueba ha finalizado. Suscríbete para seguir recibiendo selecciones diarias."
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Votre essai est terminé. Abonnez-vous pour continuer à recevoir vos sélections quotidiennes."
+          }
+        }
+      }
+    },
+    "board.subscriptionRequired.cta": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "View Plans"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ver planes"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Voir les forfaits"
+          }
+        }
+      }
+    },
+    "board.subscriptionRequired.title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Subscription Required"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Suscripción requerida"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abonnement requis"
           }
         }
       }
@@ -4093,6 +4278,98 @@
         }
       }
     },
+    "boardProjections.fade": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fade"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Evitar"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Éviter"
+          }
+        }
+      }
+    },
+    "boardProjections.lowConfidence": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Low confidence — projections may be less reliable"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Baja confianza — las proyecciones pueden ser menos confiables"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Faible confiance — les projections peuvent être moins fiables"
+          }
+        }
+      }
+    },
+    "boardProjections.neutral": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Neutral"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Neutral"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Neutre"
+          }
+        }
+      }
+    },
+    "boardProjections.play": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Play"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Jugar"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Jouer"
+          }
+        }
+      }
+    },
     "consent.cta": {
       "extractionState": "manual",
       "localizations": {
@@ -4852,6 +5129,29 @@
         }
       }
     },
+    "gameDetail.bkRunLinePick": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Run Line Pick"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Elección de línea de carreras"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choix ligne de points"
+          }
+        }
+      }
+    },
     "gameDetail.bkSpreadPick": {
       "extractionState": "manual",
       "localizations": {
@@ -5286,6 +5586,29 @@
           "stringUnit": {
             "state": "translated",
             "value": "Total projeté du match"
+          }
+        }
+      }
+    },
+    "gameDetail.runLine": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Run Line"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Línea de carreras"
+          }
+        },
+        "fr-CA": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ligne de points"
           }
         }
       }

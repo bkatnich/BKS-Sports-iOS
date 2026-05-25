@@ -237,11 +237,12 @@ api:
       - injury_status
       - is_surging
       - is_home
+      - game_datetime
       - probable_pitcher
       - batting_order
       - park_factor
     params:
-      limit: 25
+      limit: 20   # explicit — server default changed; Board lazy-loads subsequent pages
       platform: dk
       mode: balanced
 
@@ -249,7 +250,7 @@ api:
     url: ""
     fields: []
     params:
-      lookahead: 5
+      lookahead: 1   # server returns today-only projections; lookahead > 1 is ignored
       platform: dk
       mode: gpp
 
