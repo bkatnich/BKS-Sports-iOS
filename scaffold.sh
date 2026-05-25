@@ -1514,6 +1514,35 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable, Oppo
 
     // MARK: - Sport-specific fields
     // Add fields here that are unique to this sport's opportunity data.
+
+    // MARK: - Prop lines
+    // PropLine and RotationTier must be defined here (or in a companion file) because
+    // the generated view layer (PropLinesCard, rotationTierPill) references them directly.
+    // Remove or replace these for sports that don't use prop lines / rotation tiers.
+}
+
+// MARK: - PropLine
+
+struct PropLine: Codable, Equatable, Hashable {
+    let stat: String
+    let line: Double
+    let overOdds: Int
+    let underOdds: Int
+    /// Platt-calibrated model probability (0–1). Multiply by 100 for display %.
+    let calibratedProbOver: Double
+    let hasEdge: Bool
+    let displayLabel: String
+}
+
+// MARK: - RotationTier
+// Sport-specific: remove for sports without pitching rotation tiers.
+
+enum RotationTier: String, Codable, Equatable, Hashable {
+    case ace
+    case rotation
+    case bullpen
+    case closer
+    case swingman
 }
 """
 
@@ -2322,27 +2351,33 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
             position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
             headshotURL: dto.headshotURL,
             externalPersonID: dto.externalPersonID,
-            projectedScoreDk: dto.projectedScoreDk,
-            projectedScoreFd: dto.projectedScoreFd,
-            projectionTier: dto.projectionTier.flatMap {{ TierLevel(serverValue: $0) }},
+            projectionScore: projectionScore,
+            projectedScoreFd: dto.games.compactMap(\\.predictedFPFd).max(),
+            projectionTier: tier,
             playerTierDk: dto.playerTierDk.flatMap {{ TierLevel(serverValue: $0) }},
             playerTierFd: dto.playerTierFd.flatMap {{ TierLevel(serverValue: $0) }},
             mode: sportConfiguration.projectionParams.mode,
-            platforms: sportConfiguration.projectionParams.mode == "gpp" ? ["dk", "fd"] : ["dk"],
+            platforms: dto.games.compactMap(\\.predictedFPFd).isEmpty ? ["dk"] : ["dk", "fd"],
+            playFadeRecommendation: dto.playFadeRecommendation,
             injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
             isSurging: (dto.hotStreak ?? 0) > 0,
             upcomingGames: upcomingGames.isEmpty ? nil : upcomingGames,
             homeGameCount: upcomingGames.filter(\\.isHome).count,
             awayGameCount: upcomingGames.filter {{ !$0.isHome }}.count,
             avgOpponentStrength: upcomingGames.compactMap(\\.opponentStrength).average,
+            hotStreak: dto.hotStreak,
+            coldStreak: dto.coldStreak,
             trendDirection: dto.trendDirection,
-            confidenceScore: dto.confidenceScore,
-            consistencyScore: nil
+            confidenceScoreDk: dto.confidenceScore,
+            confidenceScoreFd: dto.confidenceScoreFd,
+            consistencyScore: nil,
+            usageEfficiencySignal: nil
         )
     }}
 
-    private func bestTier(from tiers: [TierLevel?]) -> TierLevel? {{
-        tiers.compactMap {{ $0 }}.min {{
+    private func bestTier(from games: [ProjectedGameDTO]) -> TierLevel? {{
+        let tiers = games.compactMap {{ TierLevel(serverValue: $0.projectionTier ?? "") }}
+        return tiers.min {{
             (TierLevel.allCases.firstIndex(of: $0) ?? Int.max) <
             (TierLevel.allCases.firstIndex(of: $1) ?? Int.max)
         }}
@@ -2409,9 +2444,11 @@ private struct ProjectionPlayerDTO: Decodable {{
     let trendDirection: TrendDirection?
     let trendScore: Double?
     let confidenceScore: Double?
+    let confidenceScoreFd: Double?
     let hotStreak: Int?
     let coldStreak: Int?
     let injuryStatus: String?
+    let playFadeRecommendation: PlayFadeRecommendation?
     // MARK: Sport-specific stat fields
     // Add FlexDouble? fields here for any numeric stat that the backend may send as a string.
     // Example (MLB baseball):
@@ -2436,9 +2473,11 @@ private struct ProjectionPlayerDTO: Decodable {{
         case trendDirection = "trend_direction"
         case trendScore = "trend_score"
         case confidenceScore = "confidence_score"
+        case confidenceScoreFd = "confidence_score_fd"
         case hotStreak = "hot_streak"
         case coldStreak = "cold_streak"
         case injuryStatus = "injury_status"
+        case playFadeRecommendation = "play_fade_recommendation"
         case playerTierDk = "player_tier_dk"
         case playerTierFd = "player_tier_fd"
         case games
