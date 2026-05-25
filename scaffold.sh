@@ -2133,24 +2133,36 @@ enum TrendingsServiceError: LocalizedError {{
 opportunities_service_swift = header() + f"""\
 import Alamofire
 import BKSCore
+import BKSUICore
 import Foundation
 import OSLog
 
 // MARK: - OpportunitiesServiceProtocol
 
 protocol OpportunitiesServiceProtocol {{
-    func fetchOpportunities(
-        limit: Int?, platform: String?, mode: String?, fields: [String]?
-    ) async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode)
+    /// Fetches a single page and returns the raw page result including server total.
+    func fetchOpportunitiesPage(
+        limit: Int?, offset: Int?, platform: String?, mode: String?, fields: [String]?
+    ) async throws -> OpportunitiesPageResult
     func loadCachedOpportunities() throws -> [Opportunity]?
     func loadCachedOpportunitiesFetchDate() throws -> Date?
     func loadCachedSeasonMode() throws -> SeasonMode?
 }}
 
 extension OpportunitiesServiceProtocol {{
-    func fetchOpportunities() async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode) {{
-        try await fetchOpportunities(limit: nil, platform: nil, mode: nil, fields: nil)
+    func fetchOpportunitiesPage() async throws -> OpportunitiesPageResult {{
+        try await fetchOpportunitiesPage(limit: nil, offset: nil, platform: nil, mode: nil, fields: nil)
     }}
+}}
+
+// MARK: - OpportunitiesPageResult
+
+struct OpportunitiesPageResult {{
+    let opportunities: [Opportunity]
+    let seasonMode: SeasonMode
+    let total: Int
+    let offset: Int
+    let limit: Int
 }}
 
 // MARK: - OpportunitiesService
@@ -2168,11 +2180,28 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
         subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
         category: "OpportunitiesService"
     )
+    private let coalescer = FetchCoalescer<OpportunitiesPageResult>()
 
-    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v1" }}
-    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v1_date" }}
+    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v3" }}
+    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v3_date" }}
     private var seasonModeCacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)season_mode_v1" }}
-    private let coalescer = FetchCoalescer<(opportunities: [Opportunity], seasonMode: SeasonMode)>()
+
+    private static let iso8601Full: ISO8601DateFormatter = {{
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fmt
+    }}()
+
+    private static let iso8601Plain: ISO8601DateFormatter = {{
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        return fmt
+    }}()
+
+    private static func parseISO8601(_ string: String?) -> Date? {{
+        guard let string else {{ return nil }}
+        return iso8601Full.date(from: string) ?? iso8601Plain.date(from: string)
+    }}
 
     init(
         network: NetworkProtocol,
@@ -2186,60 +2215,74 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
         self.sportConfiguration = sportConfiguration
     }}
 
-    func fetchOpportunities(
+    func fetchOpportunitiesPage(
         limit: Int? = nil,
+        offset: Int? = nil,
         platform: String? = nil,
         mode: String? = nil,
         fields: [String]? = nil
-    ) async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode) {{
-        try await coalescer.run(logger: logger, label: "fetchOpportunities") {{
-            try await self._fetchOpportunities(limit: limit, platform: platform, mode: mode, fields: fields)
+    ) async throws -> OpportunitiesPageResult {{
+        let currentOffset = offset ?? 0
+        // Coalesce concurrent page-0 calls so only one Cloud Run cold-start fires.
+        if currentOffset == 0 {{
+            return try await coalescer.run(logger: logger, label: "fetchOpportunitiesPage") {{
+                try await self._fetchPage(limit: limit, offset: 0, platform: platform, mode: mode, fields: fields)
+            }}
         }}
+        return try await _fetchPage(limit: limit, offset: currentOffset, platform: platform, mode: mode, fields: fields)
     }}
 
-    private func _fetchOpportunities(
+    private func _fetchPage(
         limit: Int?,
+        offset: Int,
         platform: String?,
         mode: String?,
         fields: [String]?
-    ) async throws -> (opportunities: [Opportunity], seasonMode: SeasonMode) {{
-        let url = configuration.value(for: .getOpportunitiesURL)
+    ) async throws -> OpportunitiesPageResult {{
+        let url = configuration.checkedURL(for: .getOpportunitiesURL)
         let params = sportConfiguration.opportunityParams
-
+        let pageSize = limit ?? params.limit
         let requestFields = fields ?? sportConfiguration.opportunityFields
-        var parameters: Parameters = [
-            "limit": limit ?? params.limit,
-            "platform": platform ?? params.platform,
-            "mode": mode ?? params.mode,
-        ]
-        if !requestFields.isEmpty {{
-            parameters["fields"] = requestFields.joined(separator: ",")
-        }}
 
-        let fetchStart = Date.now
-        let fetchInterval = signposter.beginInterval("fetchOpportunities")
-        defer {{ signposter.endInterval("fetchOpportunities", fetchInterval) }}
+        let fetchInterval = signposter.beginInterval("fetchOpportunitiesPage")
+        defer {{ signposter.endInterval("fetchOpportunitiesPage", fetchInterval) }}
 
         try Task.checkCancellation()
-        let response: OpportunitiesResponse = try await network.get(url, parameters: parameters)
 
+        var parameters: Parameters = [
+            "limit": pageSize,
+            "offset": offset,
+            "mode": mode ?? params.mode,
+        ]
+        if let platform {{ parameters["platform"] = platform }}
+        if !requestFields.isEmpty {{ parameters["fields"] = requestFields.joined(separator: ",") }}
+
+        let response: OpportunitiesResponse = try await network.get(url, parameters: parameters)
         let mapped = response.data.compactMap(mapOpportunity)
         let seasonMode = response.seasonMode ?? .regularSeason
-        let elapsed = Date.now.timeIntervalSince(fetchStart)
-        logger
-            .info(
-                "Fetched \\(mapped.count, privacy: .public) opportunities in 1 call (\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
-            )
+        let total = response.total ?? mapped.count
 
-        do {{
-            try storage.save(mapped, forKey: cacheKey, in: .file)
-            try storage.save(Date.now, forKey: cacheDateKey, in: .file)
-            try storage.save(seasonMode, forKey: seasonModeCacheKey, in: .file)
-        }} catch {{
-            logger.warning("Failed to cache opportunities: \\(error.diagnosticDescription, privacy: .public)")
+        logger.info("Fetched \\(mapped.count, privacy: .public) opportunities at offset \\(offset, privacy: .public) (total: \\(total, privacy: .public))")
+
+        if offset == 0 {{
+            do {{
+                try storage.save(mapped, forKey: cacheKey, in: .file)
+                try storage.save(Date.now, forKey: cacheDateKey, in: .file)
+                try storage.save(seasonMode, forKey: seasonModeCacheKey, in: .file)
+            }} catch {{
+                let msg = "Failed to cache opportunities: \\(error.diagnosticDescription)"
+                logger.warning("\\(msg, privacy: .public)")
+                DiagnosticLogger.error(msg, category: "OpportunitiesService")
+            }}
         }}
 
-        return (mapped, seasonMode)
+        return OpportunitiesPageResult(
+            opportunities: mapped,
+            seasonMode: seasonMode,
+            total: total,
+            offset: offset,
+            limit: pageSize
+        )
     }}
 
     func loadCachedOpportunities() throws -> [Opportunity]? {{
@@ -2256,7 +2299,15 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
 
     // MARK: - Mapping
 
+    // swiftlint:disable:next function_body_length
     private func mapOpportunity(_ dto: OpportunityDTO) -> Opportunity? {{
+        let tier: TierLevel
+        if let tierStr = dto.opportunityTier, let mapped = TierLevel(serverValue: tierStr) {{
+            tier = mapped
+        }} else {{
+            logger.warning("Unknown opportunity tier '\\(dto.opportunityTier ?? "nil", privacy: .public)' for \\(dto.firstName, privacy: .public) \\(dto.lastName, privacy: .public) — defaulting to .bottom")
+            tier = .bottom
+        }}
         return Opportunity(
             id: String(dto.id),
             displayName: "\\(dto.firstName) \\(dto.lastName)",
@@ -2266,14 +2317,20 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
             headshotURL: dto.headshotURL,
             externalPersonID: dto.externalPersonID,
             opportunityScore: dto.opportunityScore,
-            opportunityTier: dto.opportunityTier.flatMap {{ TierLevel(serverValue: $0) }},
-            playerTierDk: dto.playerTierDk.flatMap {{ TierLevel(serverValue: $0) }},
-            playerTierFd: dto.playerTierFd.flatMap {{ TierLevel(serverValue: $0) }},
-            mode: dto.mode ?? sportConfiguration.opportunityParams.mode,
-            platforms: dto.platforms,
+            opportunityTier: tier,
+            playerTierDk: dto.playerTier.flatMap {{ TierLevel(serverValue: $0) }},
+            mode: dto.mode ?? "",
+            platforms: dto.platform.map {{ [$0] }} ?? ["dk"],
             injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
             isSurging: dto.isSurging ?? false,
-            isHome: dto.isHome ?? false
+            isHome: dto.isHome ?? false,
+            gameDateTime: Self.parseISO8601(dto.gameDateTime),
+            playoffRotationMultiplier: dto.playoffRotationMultiplier,
+            rotationTier: dto.rotationTier.flatMap {{ RotationTier(rawValue: $0) }},
+            playoffTrendTrust: dto.playoffTrendTrust,
+            playoffGamesPlayed: dto.playoffGamesPlayed
+            // Sport-specific fields: add additional Opportunity init args here
+            // to match your sport's API fields (see OpportunityDTO below).
         )
     }}
 }}
@@ -2283,10 +2340,16 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
 private struct OpportunitiesResponse: Decodable {{
     let data: [OpportunityDTO]
     let seasonMode: SeasonMode?
+    let total: Int?
+    let offset: Int?
+    let limit: Int?
 
     enum CodingKeys: String, CodingKey {{
         case data
         case seasonMode = "season_mode"
+        case total
+        case offset
+        case limit
     }}
 }}
 
@@ -2302,19 +2365,24 @@ private struct OpportunityDTO: Decodable {{
 
     let opportunityScore: Double?
     let opportunityTier: String?
-    let playerTierDk: String?
-    let playerTierFd: String?
+    // Single platform field (API returns "dk" or "fd" as a string, not an array).
+    let playerTier: String?
     let mode: String?
-    let platforms: [String]
+    let platform: String?
 
     let injuryStatus: String?
     let isSurging: Bool?
     let isHome: Bool?
+    let gameDateTime: String?
 
     let playoffRotationMultiplier: Double?
     let rotationTier: String?
     let playoffTrendTrust: Double?
     let playoffGamesPlayed: Int?
+
+    // MARK: - Sport-specific DTO fields
+    // Add fields here that your sport's opportunity API returns.
+    // Remove any that your API does not provide.
 
     enum CodingKeys: String, CodingKey {{
         case id
@@ -2327,13 +2395,13 @@ private struct OpportunityDTO: Decodable {{
         case externalPersonID = "{external_id_key}"
         case opportunityScore = "opportunity_score"
         case opportunityTier = "opportunity_tier"
-        case playerTierDk = "player_tier_dk"
-        case playerTierFd = "player_tier_fd"
+        case playerTier = "player_tier"
         case mode
-        case platforms
+        case platform
         case injuryStatus = "injury_status"
         case isSurging = "is_surging"
         case isHome = "is_home"
+        case gameDateTime = "game_datetime"
         case playoffRotationMultiplier = "playoff_rotation_multiplier"
         case rotationTier = "rotation_tier"
         case playoffTrendTrust = "playoff_trend_trust"
