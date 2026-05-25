@@ -3452,12 +3452,26 @@ public extension PlayerGameLog {{
 }}
 """
 
+# proj_accessor_lines drives the legacy camelCase group (locally-computed stat lines,
+# matching GameEntry stat keys). The snake_case API group below must be maintained
+# manually per sport — keys come from the server projected_stats schema, not YAML.
 projected_stat_line_basketball_swift = header() + f"""\
 import BKSCore
 
 // MARK: - ProjectedStatLine {swift_name} stat accessors
 
 public extension ProjectedStatLine {{
+    // MARK: - Server projected_stats keys (snake_case from API response)
+    // Sport-specific: replace with this sport's server-side projected_stats field names.
+    var hits: Double?              {{ stats["hits"] }}
+    var homeRuns: Double?          {{ stats["home_runs"] }}
+    var rbis: Double?              {{ stats["rbis"] }}
+    var runs: Double?              {{ stats["runs"] }}
+    var stolenBases: Double?       {{ stats["stolen_bases"] }}
+    var walks: Double?             {{ stats["walks"] }}
+
+    // MARK: - Legacy camelCase accessors (locally-computed stat lines)
+    // These match GameEntry stat keys. Generated from gamelog.display YAML.
 {proj_accessor_lines}
 }}
 """
