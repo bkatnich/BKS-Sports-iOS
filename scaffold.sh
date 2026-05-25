@@ -5112,6 +5112,979 @@ struct BoardScrollContent: View {{
 }}
 """
 
+# ── BoardDetailView.swift ────────────────────────────────────────────────────────────────────
+
+board_detail_view_swift = header() + f"""import BKSCore
+import BKSUICore
+import SwiftUI
+
+// MARK: - BoardDetailView
+
+struct BoardDetailView: View {{
+    let entry: BoardEntry
+    let sportConfig: any SportConfigurationProtocol
+
+    @Environment(\\.gamesService) private var gamesServiceBox
+    @State private var regularSeasonLog: PlayerGameLog?
+    @State private var expandedPlatform: String?
+
+    var body: some View {{
+        ScrollView {{
+            VStack(spacing: 12) {{
+                UnifiedHeaderCard(entry: entry, log: regularSeasonLog)
+
+                if entry.playFadeRecommendation != nil {{
+                    PlayFadeCard(entry: entry)
+                }}
+
+                DetailSectionHeader(
+                    String(localized: "boardDetail.section.recentGames", defaultValue: "Recent Games")
+                )
+
+                GameLogCard(entry: entry, log: regularSeasonLog)
+
+                if let propLines = entry.propLines, !propLines.isEmpty {{
+                    DetailSectionHeader(
+                        String(localized: "boardDetail.section.propLines", defaultValue: "Prop Lines")
+                    )
+                    PropLinesCard(propLines: propLines)
+                }}
+
+                DetailSectionHeader(
+                    String(localized: "boardDetail.section.projections", defaultValue: "Projections")
+                )
+
+                ProjectionSection(entry: entry, expandedPlatform: $expandedPlatform)
+            }}
+            .padding(.horizontal, 14)
+            .padding(.top, 6)
+            .padding(.bottom, 20)
+        }}
+        .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+        .appBackground()
+        .appNavigationBar(
+            title: String(localized: "boardDetail.title", defaultValue: "Player")
+        )
+        .task {{
+            guard !entry.id.isEmpty, let service = gamesServiceBox?.service else {{ return }}
+            let cached = try? service.loadCachedGameLog(playerID: entry.id)
+            let cacheAge = cached.map {{ Date().timeIntervalSince($0.fetchedAt) }}
+            let isFresh = cacheAge.map {{ $0 < 4 * 3600 }} ?? false
+            if let cached {{
+                regularSeasonLog = cached
+            }}
+            if !isFresh {{
+                regularSeasonLog = try? await service.fetchGameLog(
+                    playerID: entry.id,
+                    teamID: entry.team,
+                    postseason: false
+                )
+            }}
+        }}
+    }}
+}}
+"""
+
+# ── BoardDetailSubviews.swift ─────────────────────────────────────────────────────────────────
+#
+# Sport-specific sections are marked with MARK comments. When scaffolding a new sport:
+#   - BKInstinctCard.batterStatLine: replace stat columns with sport-relevant categories
+#   - BKInstinctCard.pitcherStatLine: keep for baseball/softball, remove for non-pitching sports
+#   - PropLinesCard.sortedLines: update the key ordering for sport-specific market keys
+#   - GameLogCard.lastGameSummary: update the summary stat labels
+#
+board_detail_subviews_swift = header() + f"""// swiftlint:disable file_length
+import BKSCore
+import BKSUICore
+import SwiftUI
+
+// MARK: - ProjectionSection
+
+struct ProjectionSection: View {{
+    let entry: BoardEntry
+    @Binding var expandedPlatform: String?
+
+    var body: some View {{
+        VStack(spacing: 8) {{
+            ProjectionCardView(
+                platformID: "dk",
+                abbreviation: "DK",
+                name: String(localized: "projection.platform.dk", defaultValue: "DraftKings"),
+                color: AppColors.dkGreen,
+                score: entry.projectedScore,
+                floor: entry.fpFloor,
+                ceiling: entry.fpCeiling,
+                confidence: entry.confidenceScore,
+                playoffDataConfidence: entry.playoffDataConfidence,
+                projectionTier: entry.projectionTier,
+                isExpanded: expandedPlatform == "dk"
+            ) {{
+                withAnimation(.easeInOut(duration: 0.3)) {{
+                    expandedPlatform = expandedPlatform == "dk" ? nil : "dk"
+                }}
+            }}
+
+            if entry.projectedScoreFd != nil {{
+                ProjectionCardView(
+                    platformID: "fd",
+                    abbreviation: "FD",
+                    name: String(localized: "projection.platform.fd", defaultValue: "FanDuel"),
+                    color: Color(red: 0.11, green: 0.51, blue: 0.85),
+                    score: entry.projectedScoreFd,
+                    floor: entry.fpFloorFd,
+                    ceiling: entry.fpCeilingFd,
+                    confidence: entry.confidenceScoreFd,
+                    playoffDataConfidence: entry.playoffDataConfidence,
+                    projectionTier: entry.projectionTier,
+                    isExpanded: expandedPlatform == "fd"
+                ) {{
+                    withAnimation(.easeInOut(duration: 0.3)) {{
+                        expandedPlatform = expandedPlatform == "fd" ? nil : "fd"
+                    }}
+                }}
+            }}
+
+            BKInstinctCard(
+                entry: entry,
+                isExpanded: expandedPlatform == "bk"
+            ) {{
+                withAnimation(.easeInOut(duration: 0.3)) {{
+                    expandedPlatform = expandedPlatform == "bk" ? nil : "bk"
+                }}
+            }}
+
+            if expandedPlatform == nil {{
+                Text(String(localized: "projection.hint.tapToExpand", defaultValue: "Tap a card to expand"))
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.35))
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 2)
+            }}
+        }}
+    }}
+}}
+
+// MARK: - ProjectionCardView
+
+struct ProjectionCardView: View {{
+    let platformID: String
+    let abbreviation: String
+    let name: String
+    let color: Color
+    let score: Double?
+    let floor: Double?
+    let ceiling: Double?
+    let confidence: Double?
+    let playoffDataConfidence: Double?
+    let projectionTier: TierLevel?
+    let isExpanded: Bool
+    let onTap: () -> Void
+
+    private var isLowConfidence: Bool {{
+        (confidence.map {{ $0 < 0.4 }} ?? false)
+            || (playoffDataConfidence.map {{ $0 < 0.15 }} ?? false)
+    }}
+
+    var body: some View {{
+        VStack(spacing: 0) {{
+            Button(action: onTap) {{
+                HStack(spacing: 0) {{
+                    HStack(spacing: 9) {{
+                        PlatformBadge(label: abbreviation, background: color, size: 26, fontSize: 10)
+                        Text(name)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .lineLimit(1)
+                    }}
+                    Spacer(minLength: 8)
+                    HStack(alignment: .center, spacing: 8) {{
+                        Text(String(localized: "projection.label.projScore", defaultValue: "Projected Score"))
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .tracking(0.5)
+                        Text(score.map {{ "\\(Int($0))" }} ?? "—")
+                            .font(.system(size: 20, weight: .bold).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .tracking(-0.5)
+                    }}
+                    .frame(minWidth: 68, alignment: .trailing)
+                    .padding(.leading, 8)
+                    .opacity(isExpanded ? 0 : 1)
+                    .animation(.easeOut(duration: 0.2), value: isExpanded)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(.easeOut(duration: 0.25), value: isExpanded)
+                        .padding(.leading, 12)
+                }}
+                .padding(.horizontal, 12)
+                .frame(height: 46)
+            }}
+            .buttonStyle(.plain)
+            .accessibilityLabel({{
+                let scoreStr = score.map {{ String(format: "%.1f", $0) }}
+                    ?? String(localized: "a11y.unavailable", defaultValue: "unavailable")
+                let action = isExpanded
+                    ? String(localized: "a11y.doubleTapCollapse", defaultValue: "Double tap to collapse")
+                    : String(localized: "a11y.doubleTapExpand", defaultValue: "Double tap to expand")
+                return "\\(name) projected score: \\(scoreStr). \\(action)"
+            }}())
+
+            if isExpanded {{
+                VStack(alignment: .leading, spacing: 12) {{
+                    if let projScore = score {{
+                        FloorCeilingBar(
+                            floor: floor,
+                            ceiling: ceiling,
+                            score: projScore,
+                            tier: projectionTier,
+                            isLowConfidence: isLowConfidence,
+                            showFloorCeilingLabels: true,
+                            showScoreLabel: true,
+                            showEndLabels: true
+                        )
+                        .padding(.horizontal, 2)
+                    }}
+
+                    if isLowConfidence {{
+                        HStack(spacing: 4) {{
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.yellow)
+                                .accessibilityHidden(true)
+                            Text(String(localized: "boardProjections.lowConfidence",
+                                        defaultValue: "Low confidence — projections may be less reliable"))
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                        }}
+                    }}
+                }}
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }}
+        }}
+        .background(.white.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }}
+}}
+
+// MARK: - BKInstinctCard
+
+struct BKInstinctCard: View {{
+    let entry: BoardEntry
+    let isExpanded: Bool
+    let onTap: () -> Void
+
+    private var projectedStats: ProjectedStatLine? {{
+        entry.upcomingGames?.first?.projectedStats
+    }}
+
+    private var confidence: Double? {{ projectedStats?.confidence }}
+    private var isLowConfidence: Bool {{ (confidence ?? 1) < 0.5 }}
+
+    // MARK: - Sport-specific: update isPitcher for sports without pitchers
+    private var isPitcher: Bool {{
+        entry.rotationTier != nil || entry.position?.lowercased() == "p"
+    }}
+
+    var body: some View {{
+        VStack(spacing: 0) {{
+            Button(action: onTap) {{
+                HStack(spacing: 0) {{
+                    HStack(spacing: 9) {{
+                        Image("InAppIcon")
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 26, height: 26)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .accessibilityHidden(true)
+                        Text(String(localized: "projection.platform.bk", defaultValue: "BlackKatt Instinct"))
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .lineLimit(1)
+                    }}
+                    Spacer(minLength: 8)
+                    HStack(alignment: .center, spacing: 8) {{
+                        Text(String(localized: "projection.label.projPts", defaultValue: "Projected Pts"))
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .tracking(0.5)
+                        Text(entry.projectedScore.map {{ "\\(Int($0))" }} ?? "—")
+                            .font(.system(size: 20, weight: .bold).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .tracking(-0.5)
+                    }}
+                    .frame(minWidth: 68, alignment: .trailing)
+                    .padding(.leading, 8)
+                    .opacity(isExpanded ? 0 : 1)
+                    .animation(.easeOut(duration: 0.2), value: isExpanded)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(.easeOut(duration: 0.25), value: isExpanded)
+                        .padding(.leading, 12)
+                }}
+                .padding(.horizontal, 12)
+                .frame(height: 46)
+            }}
+            .buttonStyle(.plain)
+
+            if isExpanded {{
+                VStack(alignment: .leading, spacing: 12) {{
+                    if let stats = projectedStats {{
+                        statLineRow(stats: stats)
+                            .opacity(isLowConfidence ? AppOpacity.muted : 1)
+                        if isLowConfidence {{ lowConfidenceWarning }}
+                    }} else {{
+                        Text(String(
+                            localized: "detail.proj.bk.unavailable",
+                            defaultValue: "Stat breakdown not yet available"
+                        ))
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(AppOpacity.muted))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    }}
+                }}
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }}
+        }}
+        .background(.white.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }}
+
+    @ViewBuilder
+    private func statLineRow(stats: ProjectedStatLine) -> some View {{
+        if isPitcher {{ pitcherStatLine(stats: stats) }} else {{ batterStatLine(stats: stats) }}
+    }}
+
+    // MARK: - Sport-specific: replace columns with sport-relevant stat categories
+    private func batterStatLine(stats: ProjectedStatLine) -> some View {{
+        HStack(spacing: 0) {{
+            bkStatCol(label: "H", value: stats.hits.map {{ String(format: "%.1f", $0) }})
+            bkDivider
+            bkStatCol(label: "HR", value: stats.homeRuns.map {{ String(format: "%.1f", $0) }})
+            bkDivider
+            bkStatCol(label: "RBI", value: stats.rbis.map {{ String(format: "%.1f", $0) }})
+            bkDivider
+            bkStatCol(label: "R", value: stats.runs.map {{ String(format: "%.1f", $0) }})
+            bkDivider
+            bkStatCol(label: "SB", value: stats.stolenBases.map {{ String(format: "%.1f", $0) }})
+        }}
+        .frame(maxWidth: .infinity)
+    }}
+
+    // MARK: - Sport-specific: remove for non-pitching sports
+    private func pitcherStatLine(stats: ProjectedStatLine) -> some View {{
+        HStack(spacing: 0) {{
+            bkStatCol(label: "IP", value: stats.inningsPitched.map {{ String(format: "%.1f", $0) }})
+            bkDivider
+            bkStatCol(label: "K", value: stats.strikeoutPitching.map {{ String(format: "%.0f", $0) }})
+            bkDivider
+            bkStatCol(label: "ER", value: stats.earnedRunAllowed.map {{ String(format: "%.0f", $0) }})
+        }}
+        .frame(maxWidth: .infinity)
+    }}
+
+    private func bkStatCol(label: String, value: String?) -> some View {{
+        VStack(spacing: 3) {{
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            Text(value ?? "—")
+                .font(AppFonts.statValue.monospacedDigit())
+                .foregroundStyle(.white)
+        }}
+        .frame(maxWidth: .infinity)
+    }}
+
+    private var bkDivider: some View {{
+        Rectangle()
+            .fill(.white.opacity(AppOpacity.divider))
+            .frame(width: 1, height: 28)
+    }}
+
+    private var lowConfidenceWarning: some View {{
+        HStack(spacing: 4) {{
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(.yellow)
+                .accessibilityHidden(true)
+            Text(String(localized: "boardProjections.lowConfidence",
+                        defaultValue: "Low confidence — projections may be less reliable"))
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+        }}
+    }}
+}}
+
+// MARK: - GameLogCard
+
+struct GameLogCard: View {{
+    let entry: BoardEntry
+    let log: PlayerGameLog?
+
+    @State private var isExpanded = false
+
+    private var recentEntries: [GameEntry] {{
+        guard let log else {{ return [] }}
+        return Array(log.entries.filter {{ !$0.isDNP }}.prefix(10))
+    }}
+
+    var body: some View {{
+        VStack(spacing: 0) {{
+            Button {{
+                withAnimation(.easeOut(duration: 0.25)) {{ isExpanded.toggle() }}
+            }} label: {{
+                HStack {{
+                    if let last = recentEntries.first {{
+                        lastGameSummary(last)
+                    }} else if log == nil {{
+                        Text(String(localized: "detail.gamelog.loading", defaultValue: "Loading…"))
+                            .font(.system(size: 14))
+                            .foregroundStyle(.white.opacity(AppOpacity.muted))
+                    }} else {{
+                        Text(String(localized: "detail.gamelog.empty", defaultValue: "No games available"))
+                            .font(.system(size: 14))
+                            .foregroundStyle(.white.opacity(AppOpacity.muted))
+                    }}
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(.easeOut(duration: 0.25), value: isExpanded)
+                        .padding(.leading, 12)
+                }}
+                .padding(.horizontal, 12)
+                .frame(height: 46)
+            }}
+            .buttonStyle(.plain)
+
+            if isExpanded {{
+                if recentEntries.isEmpty {{
+                    Text(String(localized: "detail.gamelog.empty", defaultValue: "No games available"))
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(AppOpacity.muted))
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 12)
+                }} else {{
+                    GameLogTableView(entries: recentEntries)
+                        .padding(.bottom, 8)
+                }}
+            }}
+        }}
+        .background(.white.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }}
+
+    // MARK: - Sport-specific: update summary stat labels for this sport
+    private func lastGameSummary(_ game: GameEntry) -> some View {{
+        HStack(spacing: 8) {{
+            Text(game.opponentAbbreviation.isEmpty ? "—" : game.opponentAbbreviation)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+            Text("\\(game.homeRun)HR · \\(game.rbi)RBI")
+                .font(.system(size: 13))
+                .foregroundStyle(.white.opacity(AppOpacity.secondary))
+        }}
+    }}
+}}
+
+// MARK: - PropLinesCard
+
+struct PropLinesCard: View {{
+    let propLines: [String: PropLine]
+
+    // MARK: - Sport-specific: update key ordering for this sport's market keys
+    private var sortedLines: [(key: String, value: PropLine)] {{
+        let order = [
+            "hits_0.5", "total_bases_1.5", "total_bases_2.5",
+            "home_runs_0.5", "rbi_0.5", "strikeouts_4.5", "strikeouts_5.5"
+        ]
+        return propLines.sorted {{ lhs, rhs in
+            let li = order.firstIndex(of: lhs.key) ?? Int.max
+            let ri = order.firstIndex(of: rhs.key) ?? Int.max
+            return li == ri ? lhs.key < rhs.key : li < ri
+        }}
+    }}
+
+    var body: some View {{
+        VStack(spacing: 0) {{
+            ForEach(Array(sortedLines.enumerated()), id: \\.element.key) {{ index, item in
+                if index > 0 {{
+                    Divider()
+                        .background(.white.opacity(AppOpacity.hairline))
+                        .padding(.leading, 12)
+                }}
+                propRow(item.value)
+            }}
+        }}
+        .background(.white.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }}
+
+    private func propRow(_ prop: PropLine) -> some View {{
+        HStack(spacing: 8) {{
+            if prop.hasEdge {{
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.yellow)
+                    .frame(width: 14)
+                    .accessibilityLabel(String(localized: "a11y.propLine.edge", defaultValue: "Edge pick"))
+            }} else {{
+                Spacer().frame(width: 14)
+            }}
+
+            Text(prop.displayLabel)
+                .font(.system(size: 13, weight: prop.hasEdge ? .semibold : .regular))
+                .foregroundStyle(prop.hasEdge ? .white : .white.opacity(AppOpacity.secondary))
+                .lineLimit(1)
+
+            Spacer()
+
+            HStack(spacing: 4) {{
+                oddsChip(
+                    label: String(localized: "propLine.over", defaultValue: "O"),
+                    odds: prop.overOdds,
+                    isHighlighted: prop.hasEdge
+                )
+                oddsChip(
+                    label: String(localized: "propLine.under", defaultValue: "U"),
+                    odds: prop.underOdds,
+                    isHighlighted: false
+                )
+            }}
+        }}
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+    }}
+
+    private func oddsChip(label: String, odds: Int, isHighlighted: Bool) -> some View {{
+        let formatted = odds > 0 ? "+\\(odds)" : "\\(odds)"
+        return HStack(spacing: 2) {{
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+            Text(formatted)
+                .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                .foregroundStyle(isHighlighted ? .yellow : .white.opacity(AppOpacity.secondary))
+        }}
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(.white.opacity(isHighlighted ? 0.12 : 0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+    }}
+}}
+
+// MARK: - RotationTier display helpers
+// Sport-specific: remove or replace this extension for non-baseball sports
+
+extension RotationTier {{
+    var displayLabel: String {{
+        switch self {{
+        case .ace: "ACE"
+        case .rotation: "ROTATION"
+        case .bullpen: "BULLPEN"
+        case .closer: "CLOSER"
+        case .swingman: "SWINGMAN"
+        }}
+    }}
+
+    var pillColor: Color {{
+        switch self {{
+        case .ace: Color(red: 1.0, green: 0.84, blue: 0.0)
+        case .rotation: Color(red: 0.4, green: 0.8, blue: 1.0)
+        case .bullpen: .white.opacity(0.6)
+        case .closer: Color(red: 0.95, green: 0.6, blue: 0.2)
+        case .swingman: Color(red: 0.7, green: 0.7, blue: 0.7)
+        }}
+    }}
+}}
+"""
+
+# ── BoardDetailHeaderCard.swift ───────────────────────────────────────────────────────────────
+#
+# Sport-specific sections:
+#   - batterStatRow: replace label/value pairs with this sport's per-game averages
+#   - pitcherStatRow: remove for non-pitching sports
+#   - seasonMetricsRow: replace fields with this sport's season metrics (avoidingAvg/OBP/SLG)
+#   - hasSeasonMetrics: update the nil-checks to match actual BoardEntry season fields
+#
+board_detail_header_card_swift = header() + f"""import BKSCore
+import BKSUICore
+import SwiftUI
+
+// MARK: - UnifiedHeaderCard
+
+struct UnifiedHeaderCard: View {{
+    let entry: BoardEntry
+    let log: PlayerGameLog?
+
+    // MARK: - Sport-specific: update isPitcher for sports without pitchers
+    private var isPitcher: Bool {{
+        entry.rotationTier != nil || entry.position?.lowercased() == "p"
+    }}
+
+    private static let timeFormatter: DateFormatter = {{
+        let formatter = DateFormatter()
+        formatter.dateFormat = "h:mm a"
+        formatter.locale = Locale.current
+        return formatter
+    }}()
+
+    var body: some View {{
+        VStack(alignment: .leading, spacing: 10) {{
+            HStack(alignment: .top, spacing: 12) {{
+                avatarView
+                VStack(alignment: .leading, spacing: 4) {{
+                    Text(entry.displayName)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
+                    matchupLine
+                    if entry.isConfirmedStarter == true {{
+                        Label(
+                            String(localized: "detail.confirmed", defaultValue: "Confirmed"),
+                            systemImage: "checkmark.circle.fill"
+                        )
+                        .font(.system(size: 12))
+                        .foregroundStyle(.green)
+                    }}
+                    rotationTierPill
+                }}
+                Spacer()
+            }}
+
+            if let activeLog = log, !activeLog.entries.isEmpty {{
+                Divider().overlay(.white.opacity(AppOpacity.divider))
+                if isPitcher {{
+                    pitcherStatRow(log: activeLog)
+                }} else {{
+                    batterStatRow(log: activeLog)
+                }}
+            }} else if log == nil {{
+                ProgressView()
+                    .tint(.white.opacity(AppOpacity.muted))
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 4)
+            }}
+
+            if hasSeasonMetrics {{
+                Divider().overlay(.white.opacity(AppOpacity.divider))
+                seasonMetricsRow
+            }}
+        }}
+        .padding(AppPadding.cardInner)
+        .appCard()
+    }}
+
+    private var avatarView: some View {{
+        ZStack(alignment: .topLeading) {{
+            CachedAsyncImage(url: entry.headshotURL) {{ phase in
+                switch phase {{
+                case .success(let image):
+                    image.resizable().scaledToFill()
+                default:
+                    Circle().fill(entry.avatarColor)
+                        .overlay(
+                            Text(entry.initials)
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.white)
+                        )
+                }}
+            }}
+            .frame(width: 56, height: 56)
+            .clipShape(Circle())
+
+            if let injury = entry.injuryStatus {{
+                InjuryBadge(status: injury, compact: true)
+                    .offset(x: -4, y: -4)
+            }}
+        }}
+    }}
+
+    private var matchupLine: some View {{
+        HStack(spacing: 4) {{
+            if let pos = entry.position {{
+                Text(pos)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(AppOpacity.secondary))
+                Text("·").foregroundStyle(.white.opacity(AppOpacity.muted))
+            }}
+            if let opp = entry.opponentAbbr {{
+                let prefix = entry.isHome == true
+                    ? String(localized: "detail.home", defaultValue: "vs")
+                    : String(localized: "detail.away", defaultValue: "@")
+                Text("\\(prefix) \\(opp)")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(AppOpacity.secondary))
+            }}
+            if let dt = entry.gameDateTime {{
+                Text("·").foregroundStyle(.white.opacity(AppOpacity.muted))
+                Text(Self.timeFormatter.string(from: dt))
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(AppOpacity.muted))
+            }}
+        }}
+    }}
+
+    @ViewBuilder
+    private var rotationTierPill: some View {{
+        if let tier = entry.rotationTier {{
+            Text(tier.displayLabel)
+                .font(.system(size: 11, weight: .semibold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(tier.pillColor.opacity(0.25))
+                .foregroundStyle(tier.pillColor)
+                .clipShape(Capsule())
+        }}
+    }}
+
+    // MARK: - Sport-specific: replace per-game average labels/values
+    private func batterStatRow(log: PlayerGameLog) -> some View {{
+        HStack(spacing: 0) {{
+            statCell(label: "AVG", value: String(format: ".%03d", Int(log.averageBattingAverage * 1000)))
+            statDivider
+            statCell(label: "H/G", value: String(format: "%.1f", log.averageHits))
+            statDivider
+            statCell(label: "HR", value: String(format: "%.1f", log.averageHomeRuns))
+            statDivider
+            statCell(label: "RBI", value: String(format: "%.1f", log.averageRBI))
+        }}
+    }}
+
+    // MARK: - Sport-specific: remove for non-pitching sports
+    private func pitcherStatRow(log: PlayerGameLog) -> some View {{
+        HStack(spacing: 0) {{
+            statCell(label: "IP", value: String(format: "%.1f", log.averageInningsPitched))
+            statDivider
+            statCell(label: "K", value: String(format: "%.1f", log.averageStrikeouts))
+            statDivider
+            statCell(label: "ERA", value: String(format: "%.2f", log.averageERA))
+            statDivider
+            statCell(label: "WIN%", value: String(format: "%.0f%%", log.winPercentage * 100))
+        }}
+    }}
+
+    private var statDivider: some View {{
+        Rectangle().fill(.white.opacity(AppOpacity.divider)).frame(width: 1, height: 28)
+    }}
+
+    private func statCell(label: String, value: String) -> some View {{
+        VStack(spacing: 2) {{
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                .lineLimit(1)
+            Text(value)
+                .font(AppFonts.statValue)
+                .foregroundStyle(.white)
+        }}
+        .frame(maxWidth: .infinity)
+    }}
+
+    // MARK: - Sport-specific: update nil-checks to match this sport's BoardEntry season fields
+    private var hasSeasonMetrics: Bool {{
+        entry.seasonAvg != nil || entry.seasonOBP != nil ||
+        entry.seasonSLG != nil || entry.seasonOPS != nil
+    }}
+
+    // MARK: - Sport-specific: replace with this sport's season metric columns
+    private var seasonMetricsRow: some View {{
+        HStack(spacing: 0) {{
+            if let avg = entry.seasonAvg {{
+                statCell(label: "AVG", value: String(format: ".%03d", Int(avg * 1000)))
+            }}
+            if let obp = entry.seasonOBP {{
+                if entry.seasonAvg != nil {{ statDivider }}
+                statCell(label: "OBP", value: String(format: ".%03d", Int(obp * 1000)))
+            }}
+            if let slg = entry.seasonSLG {{
+                if entry.seasonAvg != nil || entry.seasonOBP != nil {{ statDivider }}
+                statCell(label: "SLG", value: String(format: ".%03d", Int(slg * 1000)))
+            }}
+            if let ops = entry.seasonOPS {{
+                if entry.seasonAvg != nil || entry.seasonOBP != nil || entry.seasonSLG != nil {{
+                    statDivider
+                }}
+                statCell(label: "OPS", value: String(format: ".%03d", Int(ops * 1000)))
+            }}
+        }}
+    }}
+}}
+
+// MARK: - PlayFadeCard
+
+struct PlayFadeCard: View {{
+    let entry: BoardEntry
+
+    private var recommendation: PlayFadeRecommendation {{ entry.playFadeRecommendation ?? .neutral }}
+
+    private var recColor: Color {{
+        switch recommendation {{
+        case .play: .green
+        case .fade: Color(red: 0.95, green: 0.35, blue: 0.35)
+        case .neutral: .gray
+        }}
+    }}
+
+    private var icon: String {{
+        switch recommendation {{
+        case .play: "arrow.up"
+        case .fade: "arrow.down"
+        case .neutral: "minus"
+        }}
+    }}
+
+    private var recLabel: String {{
+        switch recommendation {{
+        case .play: String(localized: "boardProjections.play", defaultValue: "Play").uppercased()
+        case .fade: String(localized: "boardProjections.fade", defaultValue: "Fade").uppercased()
+        case .neutral: String(localized: "boardProjections.neutral", defaultValue: "Neutral").uppercased()
+        }}
+    }}
+
+    var body: some View {{
+        VStack(alignment: .leading, spacing: 8) {{
+            HStack(alignment: .center) {{
+                VStack(alignment: .leading, spacing: 2) {{
+                    HStack(spacing: 6) {{
+                        Image(systemName: icon)
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(recColor)
+                            .accessibilityHidden(true)
+                        Text(recLabel)
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(.white)
+                    }}
+                    if let confidence = entry.confidenceScore {{
+                        Text(String(format: "%.0f%% ", confidence * 100) + String(
+                            localized: "boardDetail.recommendation.confidence",
+                            defaultValue: "Confidence"
+                        ))
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(AppOpacity.primary))
+                    }}
+                }}
+
+                Spacer()
+
+                if let parkFactor = entry.parkFactor {{
+                    dmsColumn(
+                        title: String(localized: "detail.playfade.parkfactor", defaultValue: "Park Factor"),
+                        value: String(format: "%.0f", parkFactor * 100)
+                    )
+                }} else if let opp = entry.opportunityScore {{
+                    dmsColumn(
+                        title: String(localized: "boardDetail.recommendation.dms", defaultValue: "DMS"),
+                        value: "\\(Int(opp))"
+                    )
+                }}
+            }}
+        }}
+        .padding(10)
+        .background(recColor.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.md))
+        .overlay(
+            RoundedRectangle(cornerRadius: AppRadius.md)
+                .stroke(recColor.opacity(0.3), lineWidth: 1)
+        )
+    }}
+
+    private func dmsColumn(title: String, value: String) -> some View {{
+        VStack(alignment: .trailing, spacing: 2) {{
+            Text(title)
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.white)
+            Text(value)
+                .font(.system(size: 18, weight: .bold, design: .rounded).monospacedDigit())
+                .foregroundStyle(recColor)
+        }}
+    }}
+}}
+
+// MARK: - TrendSlopesCard
+// Sport-specific: update trendItems pairs to match this sport's BoardEntry trend fields
+
+struct TrendSlopesCard: View {{
+    let entry: BoardEntry
+
+    struct TrendItem: Identifiable {{
+        let id: String
+        let label: String
+        let slope: Double
+    }}
+
+    var trendItems: [TrendItem] {{
+        var result: [TrendItem] = []
+        let pairs: [(Double?, String, String)] = [
+            (entry.trendHits, "hits", "Hits"),
+            (entry.trendHR, "hr", "HR"),
+            (entry.trendRBI, "rbi", "RBI"),
+            (entry.trendRuns, "r", "R"),
+            (entry.trendSB, "sb", "SB"),
+            (entry.trendDoubles, "2b", "2B"),
+            (entry.trendTB, "tb", "TB")
+        ]
+        for (slope, identifier, label) in pairs {{
+            if let slope {{ result.append(.init(id: identifier, label: label, slope: slope)) }}
+        }}
+        return result
+    }}
+
+    var body: some View {{
+        if trendItems.isEmpty {{
+            EmptyView()
+        }} else {{
+            VStack(alignment: .leading, spacing: 8) {{
+                DetailSectionHeader(
+                    String(localized: "detail.section.trends", defaultValue: "RECENT TRENDS")
+                )
+                BadgeFlowLayout(spacing: 6) {{
+                    ForEach(trendItems) {{ item in TrendPill(item: item) }}
+                }}
+            }}
+            .padding(AppPadding.cardInner)
+            .appCard()
+        }}
+    }}
+}}
+
+struct TrendPill: View {{
+    let item: TrendSlopesCard.TrendItem
+
+    private static let threshold = 0.05
+
+    private var pillColor: Color {{
+        if item.slope > Self.threshold {{ return .green }}
+        if item.slope < -Self.threshold {{ return Color(red: 0.95, green: 0.35, blue: 0.35) }}
+        return .white.opacity(AppOpacity.muted)
+    }}
+
+    private var arrow: String {{
+        if item.slope > Self.threshold {{ return "↑" }}
+        if item.slope < -Self.threshold {{ return "↓" }}
+        return "→"
+    }}
+
+    var body: some View {{
+        HStack(spacing: 3) {{
+            Text(arrow).font(.system(size: 11, weight: .bold)).foregroundStyle(pillColor)
+            Text(item.label).font(.system(size: 11, weight: .medium)).foregroundStyle(.white)
+        }}
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(pillColor.opacity(0.15))
+        .clipShape(Capsule())
+    }}
+}}
+"""
+
 # ── Write all files ─────────────────────────────────────────────────────────────────────────
 
 write(os.path.join(board_models_dir,  "BoardEntry.swift"),               board_entry_swift)
@@ -5122,6 +6095,9 @@ write_if_absent(os.path.join(board_views_dir,   "BoardView.swift"),             
 write_if_absent(os.path.join(board_views_dir,   "BoardNavBar.swift"),              board_nav_bar_swift)
 write_if_absent(os.path.join(board_views_dir,   "BoardViewModePicker.swift"),      board_view_mode_picker_swift)
 write_if_absent(os.path.join(board_views_dir,   "BoardScrollContent.swift"),       board_scroll_content_swift)
+write_if_absent(os.path.join(board_views_dir,   "BoardDetailView.swift"),          board_detail_view_swift)
+write_if_absent(os.path.join(board_views_dir,   "BoardDetailSubviews.swift"),      board_detail_subviews_swift)
+write_if_absent(os.path.join(board_views_dir,   "BoardDetailHeaderCard.swift"),    board_detail_header_card_swift)
 write(os.path.join(profile_views_dir, "ProfileContainerView.swift"),     profile_container_swift)
 write(os.path.join(profile_views_dir, "NotificationsDetailView.swift"),  notifications_detail_swift)
 
