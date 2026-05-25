@@ -1327,6 +1327,7 @@ struct {type_prefix}App: App {{
                     credential: credential,
                     promoCodeService: promoCodeService,
                     activityService: activityService,
+                    sportConfig: SportConfiguration.{slug},
                     isErasingCache: $isErasingCache,
                     onEraseCachedData: eraseCachedData
                 )
@@ -1606,6 +1607,7 @@ struct {swift_name}AppShell: View {{
     let credential: StoredCredential
     let promoCodeService: PromoCodeServiceProtocol
     let activityService: any ActivityFeedServiceProtocol
+    let sportConfig: any SportConfigurationProtocol
     @Binding var isErasingCache: Bool
     let onEraseCachedData: () -> Void
     @EnvironmentObject var networkMonitor: NetworkMonitor
@@ -1622,6 +1624,7 @@ struct {swift_name}AppShell: View {{
                 profileStore: profileStore,
                 promoCodeService: promoCodeService,
                 activityService: activityService,
+                sportConfig: sportConfig,
                 onEraseCachedData: onEraseCachedData
             )
         }}
@@ -4533,15 +4536,17 @@ import SwiftUI
 // MARK: - BoardView
 
 struct BoardView: View {{
-    @ObservedObject var store: Store<BoardState, BoardIntent>
+    var store: Store<BoardState, BoardIntent>
     let credential: StoredCredential
-    @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    var profileStore: Store<ProfileState, ProfileIntent>
     let promoCodeService: PromoCodeServiceProtocol
     let activityService: any ActivityFeedServiceProtocol
+    let sportConfig: any SportConfigurationProtocol
     let onEraseCachedData: () -> Void
 
     @State private var showProfile = false
     @State private var showInbox = false
+    @State private var showPaywall = false
     @State private var selectedGame: ScheduledGame?
     private let notificationLogger = PushNotificationLogger.shared
 
@@ -4566,6 +4571,12 @@ struct BoardView: View {{
         }}
     }}
 
+    private var isSubscriptionRequired: Bool {{
+        if case let .failed(error) = store.state.loadState,
+           case NetworkError.httpError(statusCode: 402, _) = error {{ return true }}
+        return false
+    }}
+
     private var subtitleText: String {{
         let weekday = weekdayName(from: store.state.serverDateString)
         let count = store.state.gameCount
@@ -4586,24 +4597,41 @@ struct BoardView: View {{
                         credential: credential,
                         profileStore: profileStore,
                         promoCodeService: promoCodeService,
-                        onEraseCachedData: onEraseCachedData
+                        onEraseCachedData: {{ // swiftlint:disable:this trailing_closure
+                            showProfile = false
+                            onEraseCachedData()
+                        }}
                     )
                 }}
                 .navigationDestination(for: BoardEntry.self) {{ entry in
-                    // TODO: replace with sport-specific detail view
-                    Text(entry.displayName)
-                        .appBackground()
-                        .navigationBarHidden(false)
+                    BoardDetailView(
+                        entry: entry,
+                        sportConfig: sportConfig
+                    )
+                    .appBackground()
+                }}
+                .navigationDestination(for: DailyAnalysis.self) {{ analysis in
+                    SlateAnalysisView(analysis: analysis)
                 }}
         }}
-        .task {{ store.send(.onAppear) }}
+        .task {{
+            Perf.event("BoardViewTask")
+            store.send(.onAppear)
+        }}
+        .onChange(of: store.state.isBackgroundRefreshing) {{ _, isRefreshing in
+            guard isRefreshing else {{ return }}
+            Task {{
+                try? await Task.sleep(for: .seconds(3))
+                store.send(.refreshBannerExpired)
+            }}
+        }}
         .sheet(item: $selectedGame) {{ game in
             let oddsKey = "\\(game.visitorTeamAbbr)@\\(game.homeTeamAbbr):\\(game.gameSequence)"
             GameDetailSheet(
                 game: game,
                 odds: store.state.gameOdds[oddsKey],
-                spreadLabel: String(localized: "gameDetail.spread", defaultValue: "Spread"),
-                spreadPickLabel: String(localized: "gameDetail.bkSpreadPick", defaultValue: "Spread Pick")
+                spreadLabel: String(localized: "gameDetail.spreadLine", defaultValue: "Spread Line"),
+                spreadPickLabel: String(localized: "gameDetail.bkSpreadPick", defaultValue: "BK Pick")
             )
             .presentationDetents([.medium, .large])
         }}
@@ -4613,10 +4641,17 @@ struct BoardView: View {{
                 activityService: activityService
             ) {{ _ in EmptyView() }}
         }}
+        .sheet(isPresented: $showPaywall) {{
+            SubscriptionPaywallView(groupID: SubscriptionProductID.subscriptionGroupID) {{
+                EmptyView()
+            }}
+        }}
         .onReceive(NotificationCenter.default.publisher(for: PushNotificationNames.openInboxRequested)) {{ _ in
             showInbox = true
         }}
     }}
+
+    // MARK: - Board list
 
     private var boardList: some View {{
         VStack(spacing: 0) {{
@@ -4633,24 +4668,23 @@ struct BoardView: View {{
             .skeletonPulse(delay: 0, active: isLoading)
 
             if !store.state.todayGames.isEmpty {{
-                GamesStrip(
-                    games: store.state.todayGames,
-                    chipLabel: {{ game in
-{
-    "                        guard let series = store.state.series(for: game) else { return game.isDoubleheader ? \"DH · Game \\(game.gameSequence)\" : nil }" if has_playoffs else
-    "                        game.isDoubleheader ? \"DH · Game \\(game.gameSequence)\" : nil"
-}
-{
-    "                        return \"Game \\(series.gamesPlayed + 1)\"" if has_playoffs else ""
-}
-                    }},
-                    onSelect: {{ selectedGame = $0 }}
-                )
-                .padding(.top, 8)
-                .skeletonPulse(delay: 0.1, active: isLoading)
+                GamesStrip(games: store.state.todayGames) {{ game in
+                    game.isDoubleheader ? "DH · Game \\(game.gameSequence)" : nil
+                }} onSelect: {{ selectedGame = $0 }}
+                    .padding(.top, 8)
+                    .skeletonPulse(delay: 0.1, active: isLoading)
             }}
 
-            SlateAnalysisCard(analysis: store.state.dailyAnalysis)
+            SlateAnalysisCard(analysis: store.state.dailyAnalysis ?? store.state.analysisPreview.map {{
+                DailyAnalysis(
+                    date: store.state.serverDateString ?? "",
+                    cached: true,
+                    slateNarrative: $0,
+                    topProjections: [],
+                    keyTrends: [],
+                    generatedAt: Date()
+                )
+            }})
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
                 .skeletonPulse(delay: 0.2, active: isLoading)
@@ -4684,21 +4718,30 @@ struct BoardView: View {{
             )
 
             BoardViewModePicker(
-                allCount: store.state.filteredEntries.count,
+                allCount: store.state.totalOpportunities > 0
+                    ? store.state.totalOpportunities
+                    : store.state.filteredEntries.count,
                 topPicksCount: store.state.groupedEntries.reduce(0) {{ $0 + $1.picks.count }},
                 viewMode: viewModeBinding
             )
 
             BoardScrollContent(
                 loadState: store.state.loadState,
+                isSubscriptionRequired: isSubscriptionRequired,
                 filteredEntries: store.state.filteredEntries,
                 groupedEntries: store.state.groupedEntries,
                 viewMode: store.state.viewMode,
+                hasMorePages: store.state.hasMorePages,
+                isLoadingNextPage: store.state.isLoadingNextPage,
                 onRetry: {{ store.send(.refreshRequested) }},
+                onShowPaywall: {{ showPaywall = true }},
+                onLoadNextPage: {{ store.send(.loadNextPage) }},
                 onRefresh: {{ store.send(.refreshRequested) }}
             )
         }}
     }}
+
+    // MARK: - Helpers
 
     private static let dateParseFormatter: DateFormatter = {{
         let fmt = DateFormatter()
