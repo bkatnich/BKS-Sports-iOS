@@ -498,207 +498,9 @@ actor FetchCoalescer<Value: Sendable> {{
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", "FetchCoalescer.swift"), fetch_coalescer_swift)
 
-diagnostic_logger_swift = f"""\
-{header()}
-import Foundation
-import OSLog
-
-// MARK: - DiagnosticEntry
-
-/// A single structured log entry written to `diagnostic_log.json`.
-struct DiagnosticEntry: Codable {{
-    enum Level: String, Codable {{
-        case debug, info, warning, error, fault
-    }}
-
-    let date: Date
-    let level: Level
-    /// Matches the `os.Logger` category at the same call site.
-    let category: String
-    let message: String
-    /// Last path component of the source file.
-    let file: String
-    let function: String
-    let line: Int
-    let build: String
-}}
-
-// MARK: - DiagnosticLogger
-
-/// Writes structured log entries to a rolling JSON file readable by Claude Code.
-///
-/// - File: `~/Library/Application Support/<bundleID>/Storage/diagnostic_log.json`
-/// - Capacity: last 1000 entries (oldest evicted when full). Only warning/error/fault
-///   by default — debug and info are filtered out to keep the file signal-rich.
-/// - All I/O is dispatched to a private serial queue; never touches the main thread.
-///
-/// Usage — mirror every `os.Logger` call you want persisted:
-///
-///     logger.warning("something broke")
-///     DiagnosticLogger.warning("something broke", category: "BoardState")
-///
-final class DiagnosticLogger: @unchecked Sendable {{
-
-    static let shared = DiagnosticLogger()
-
-    /// Minimum level written to file. Change to `.debug` to capture everything.
-    var minimumLevel: DiagnosticEntry.Level = .warning
-
-    private let queue = DispatchQueue(label: "{bundle_id}.diaglog", qos: .utility)
-    private let maxEntries = 1000
-    private let fileURL: URL
-    private let encoder: JSONEncoder
-    private let decoder: JSONDecoder
-    private let buildLabel: String
-
-    private init() {{
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let bundleID = Bundle.main.bundleIdentifier ?? "{bundle_id}"
-        fileURL = appSupport
-            .appendingPathComponent(bundleID)
-            .appendingPathComponent("Storage")
-            .appendingPathComponent("diagnostic_log.json")
-
-        let enc = JSONEncoder()
-        enc.dateEncodingStrategy = .iso8601
-        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder = enc
-
-        let dec = JSONDecoder()
-        dec.dateDecodingStrategy = .iso8601
-        decoder = dec
-
-        buildLabel = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
-    }}
-
-    // MARK: - Static convenience API
-
-    static func debug(
-        _ msg: String,
-        category: String,
-        file: String = #file,
-        function: String = #function,
-        line: Int = #line
-    ) {{ shared.log(.debug, msg, category, file, function, line) }}
-
-    static func info(
-        _ msg: String,
-        category: String,
-        file: String = #file,
-        function: String = #function,
-        line: Int = #line
-    ) {{ shared.log(.info, msg, category, file, function, line) }}
-
-    static func warning(
-        _ msg: String,
-        category: String,
-        file: String = #file,
-        function: String = #function,
-        line: Int = #line
-    ) {{ shared.log(.warning, msg, category, file, function, line) }}
-
-    static func error(
-        _ msg: String,
-        category: String,
-        file: String = #file,
-        function: String = #function,
-        line: Int = #line
-    ) {{ shared.log(.error, msg, category, file, function, line) }}
-
-    static func fault(
-        _ msg: String,
-        category: String,
-        file: String = #file,
-        function: String = #function,
-        line: Int = #line
-    ) {{ shared.log(.fault, msg, category, file, function, line) }}
-
-    // swiftlint:disable:next function_parameter_count
-    private func log(
-        _ level: DiagnosticEntry.Level,
-        _ msg: String,
-        _ category: String,
-        _ file: String,
-        _ function: String,
-        _ line: Int
-    ) {{
-        append(Context(
-            level: level,
-            message: msg,
-            category: category,
-            file: file,
-            function: function,
-            line: line
-        ))
-    }}
-
-    // MARK: - Internal append
-
-    private struct Context {{
-        let level: DiagnosticEntry.Level
-        let message: String
-        let category: String
-        let file: String
-        let function: String
-        let line: Int
-    }}
-
-    private func append(_ ctx: Context) {{
-        guard ctx.level >= minimumLevel else {{ return }}
-        let entry = DiagnosticEntry(
-            date: Date(),
-            level: ctx.level,
-            category: ctx.category,
-            message: ctx.message,
-            file: (ctx.file as NSString).lastPathComponent,
-            function: ctx.function,
-            line: ctx.line,
-            build: buildLabel
-        )
-        let url = fileURL
-        let enc = encoder
-        let dec = decoder
-        let max = maxEntries
-        queue.async {{
-            var entries = Self.load(from: url, decoder: dec)
-            entries.append(entry)
-            if entries.count > max {{
-                entries.removeFirst(entries.count - max)
-            }}
-            Self.save(entries, to: url, encoder: enc)
-        }}
-    }}
-
-    // MARK: - File I/O (queue-confined)
-
-    private static func load(from url: URL, decoder: JSONDecoder) -> [DiagnosticEntry] {{
-        guard
-            FileManager.default.fileExists(atPath: url.path),
-            let data = try? Data(contentsOf: url),
-            let entries = try? decoder.decode([DiagnosticEntry].self, from: data)
-        else {{ return [] }}
-        return entries
-    }}
-
-    private static func save(_ entries: [DiagnosticEntry], to url: URL, encoder: JSONEncoder) {{
-        guard let data = try? encoder.encode(entries) else {{ return }}
-        let dir = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try? data.write(to: url, options: .atomic)
-    }}
-}}
-
-// MARK: - Level ordering
-
-extension DiagnosticEntry.Level: Comparable {{
-    static func < (lhs: Self, rhs: Self) -> Bool {{
-        let order: [Self] = [.debug, .info, .warning, .error, .fault]
-        return (order.firstIndex(of: lhs) ?? 0) < (order.firstIndex(of: rhs) ?? 0)
-    }}
-}}
-"""
-
-write(os.path.join(out_dir, "App/Sources/Core/Utilities", "DiagnosticLogger.swift"), diagnostic_logger_swift)
+# DiagnosticLogger lives in BKSCore (Sources/Utilities/DiagnosticLogger.swift) as a public class.
+# Do NOT generate a local copy — it would cause a duplicate symbol error.
+# All call sites (DiagnosticLogger.error/warning) work via the BKSCore public API.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. SportPositionMap extension
@@ -1721,10 +1523,12 @@ import BKSCore
 
 // MARK: - Projection
 //
-// Sport-specific projection model. Add fields matching your get_projections API response.
-// MANUAL IMPLEMENTATION REQUIRED — this stub is not overwritten on re-scaffold.
+// Sport-specific projection model conforming to ProjectionProtocol.
+// Required protocol fields are pre-populated — add sport-specific fields below the marker.
+// This stub is not overwritten on re-scaffold (write_if_absent).
 
-struct Projection: Codable, Equatable, Hashable, Identifiable, Filterable {
+struct Projection: Codable, Equatable, Hashable, Identifiable,
+                   Filterable, ProjectionProtocol, InjuryTracking {
     let id: String
     let displayName: String
     let team: String
@@ -1732,25 +1536,36 @@ struct Projection: Codable, Equatable, Hashable, Identifiable, Filterable {
     let headshotURL: URL?
     let externalPersonID: Int?
 
-    // Core scoring
-    let projectedScoreDk: Double?
+    // Core scoring — required by ProjectionProtocol
+    let projectionScore: Double          // DK fantasy points (non-optional per protocol)
     let projectedScoreFd: Double?
-    let projectionTier: TierLevel?
+    let projectionTier: TierLevel        // non-optional per protocol
     let playerTierDk: TierLevel?
     let playerTierFd: TierLevel?
     let mode: String
     let platforms: [String]
+    let playFadeRecommendation: PlayFadeRecommendation?
 
-    // Key signals
+    // Key signals — required by ProjectionProtocol
     let injuryStatus: InjuryStatus?
     let isSurging: Bool
 
-    // Schedule
+    // Schedule — required by ProjectionProtocol
     let upcomingGames: [ProjectedGame]?
+    let homeGameCount: Int?
+    let awayGameCount: Int?
+    let avgOpponentStrength: Double?
 
-    // Trend
+    // Streak signals — required by ProjectionProtocol
+    let hotStreak: Int?
+    let coldStreak: Int?
+
+    // Trend — required by ProjectionProtocol
     let trendDirection: TrendDirection?
     let confidenceScoreDk: Double?
+    let confidenceScoreFd: Double?
+    let consistencyScore: Double?
+    let usageEfficiencySignal: UsageEfficiencySignal?
 
     var additionalSearchFields: [String] { [] }
 
@@ -1759,53 +1574,18 @@ struct Projection: Codable, Equatable, Hashable, Identifiable, Filterable {
 }
 """
 
-playoff_series_swift = header() + """\
-import BKSCore
-
-// MARK: - SeriesStatus
-
-enum SeriesStatus: String, Codable, Equatable, Hashable {
-    case scheduled
-    case ongoing
-    case completed
-    case cancelled
-}
-
-// MARK: - PlayoffSeries
-
-struct PlayoffSeries: Codable, Equatable, Hashable, Identifiable {
-    let seriesID: String
-    let roundNumber: Int
-    let roundName: String
-    let conference: String
-    let higherSeedTeam: String
-    let lowerSeedTeam: String
-    let higherSeed: Int
-    let lowerSeed: Int
-    let winsHigherSeed: Int
-    let winsLowerSeed: Int
-    let status: SeriesStatus
-    let winner: String?
-    let gamesPlayed: Int
-    let eliminationGameNext: Bool
-    let homeCourt: String?
-
-    var id: String { seriesID }
-}
-"""
+# PlayoffSeries lives in BKSCore (Sources/Models/PlayoffBracket.swift) as a public struct.
+# SeriesStatus also removed — BKSCore uses status: String directly.
+# Do NOT generate a local PlayoffSeries.swift — it would cause a duplicate symbol error.
 
 _league_playoff_fields = """
     let playoffRound: Int?
     let playoffStartDate: String?
     let regularSeasonEndDate: String?""" if has_playoffs else ""
 
+# SeasonMode is now a public enum in BKSCore (Sources/Models/SeasonMode.swift).
+# Do NOT redeclare it locally — import BKSCore and reference it directly.
 league_state_swift = header() + f"""import BKSCore
-
-// MARK: - SeasonMode
-
-enum SeasonMode: String, Codable, Equatable, Hashable {{
-{season_mode_cases}
-}}
 
 // MARK: - LeagueState
 
@@ -1815,7 +1595,6 @@ struct LeagueState: Codable, Equatable {{
 }}
 """
 
-write(os.path.join(models_dir, "PlayoffSeries.swift"), playoff_series_swift)
 write(os.path.join(models_dir, "LeagueState.swift"), league_state_swift)
 # Player is now a shared public type in BKSCore — no local Player.swift generated
 # write_if_absent(os.path.join(models_dir, "Player.swift"), player_swift)
@@ -2449,8 +2228,8 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
         category: "ProjectionsService"
     )
 
-    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v1" }}
-    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v1_date" }}
+    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v3" }}
+    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v3_date" }}
     private let coalescer = FetchCoalescer<[Projection]>()
 
     init(
@@ -2472,12 +2251,11 @@ final class ProjectionsService: ProjectionsServiceProtocol {{
     }}
 
     private func _fetchProjections(fields: [String]?) async throws -> [Projection] {{
-        let url = configuration.value(for: .getProjectionsURL)
+        let url = configuration.checkedURL(for: .getProjectionsURL)
 
         let params = sportConfiguration.projectionParams
         var parameters: Parameters = [
             "lookahead": params.lookahead,
-            "platform": params.platform,
             "mode": params.mode,
         ]
         if let fields, !fields.isEmpty {{
@@ -7281,16 +7059,17 @@ print("Bootstrap:")
 print(f"  App/Sources/App/Bootstrap/{type_prefix}App.swift")
 print(f"  App/Sources/App/Bootstrap/AppShell.swift")
 print(f"  App/Sources/App/Bootstrap/DependencyContainer.swift")
-print(f"  App/Sources/App/Bootstrap/FirebaseAnalyticsAdapter.swift")
+print("  (FirebaseAnalyticsAdapter lives in BKSCore — not generated)")
 print()
 print("Models:")
-print(f"  App/Sources/Core/Models/Player.swift")
 print(f"  App/Sources/Core/Models/Opportunity.swift")
 print(f"  App/Sources/Core/Models/Projection.swift")
 print(f"  App/Sources/Core/Models/GameEntry+{swift_name}.swift")
 print(f"  App/Sources/Core/Models/ProjectedStatLine+{swift_name}.swift")
-print(f"  App/Sources/Core/Models/PlayoffSeries.swift")
 print(f"  App/Sources/Core/Models/LeagueState.swift")
+print("  (PlayoffSeries lives in BKSCore — not generated)")
+print("  (Player lives in BKSCore — not generated)")
+print("  (DiagnosticLogger lives in BKSCore — not generated)")
 print()
 print("Services (sport-specific implementations — protocols in BKSCore):")
 print(f"  App/Sources/Core/Services/OpportunitiesService.swift")
