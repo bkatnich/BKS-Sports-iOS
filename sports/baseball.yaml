@@ -169,10 +169,10 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "2.1.13"
+    from: "2.3.0"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.5.23"
+    from: "1.5.36"
   swinject:
     url: https://github.com/Swinject/Swinject.git
     from: "2.9.0"

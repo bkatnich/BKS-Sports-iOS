@@ -1494,7 +1494,7 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable, Oppo
 
     // Core scoring
     let opportunityScore: Double?
-    let opportunityTier: TierLevel?
+    let opportunityTier: TierLevel        // non-optional per OpportunityProtocol
     let playerTierDk: TierLevel?
     let playerTierFd: TierLevel?
     let mode: String
@@ -2127,6 +2127,7 @@ final class OpportunitiesService: OpportunitiesServiceProtocol {{
             opportunityScore: dto.opportunityScore,
             opportunityTier: tier,
             playerTierDk: dto.playerTier.flatMap {{ TierLevel(serverValue: $0) }},
+            playerTierFd: dto.playerTierFd.flatMap {{ TierLevel(serverValue: $0) }},
             mode: dto.mode ?? "",
             platforms: dto.platform.map {{ [$0] }} ?? ["dk"],
             injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
@@ -2173,8 +2174,8 @@ private struct OpportunityDTO: Decodable {{
 
     let opportunityScore: Double?
     let opportunityTier: String?
-    // Single platform field (API returns "dk" or "fd" as a string, not an array).
     let playerTier: String?
+    let playerTierFd: String?
     let mode: String?
     let platform: String?
 
@@ -2204,6 +2205,7 @@ private struct OpportunityDTO: Decodable {{
         case opportunityScore = "opportunity_score"
         case opportunityTier = "opportunity_tier"
         case playerTier = "player_tier"
+        case playerTierFd = "player_tier_fd"
         case mode
         case platform
         case injuryStatus = "injury_status"
@@ -7311,8 +7313,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSCore.git",
       "state" : {
-        "revision" : "45acc9e9f520d73e8ddfbe62cdf8f1d2b3763a87",
-        "version" : "2.1.21"
+        "revision" : "b6b757c1244dbfb1c373018517c6f0ad095b64b1",
+        "version" : "2.3.0"
       }
     },
     {
@@ -7320,8 +7322,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSUICore.git",
       "state" : {
-        "revision" : "d8e083c9e51c58d6c6b0aba7f8088ceb025e933a",
-        "version" : "1.5.34"
+        "revision" : "525ab6b7bc29c7df4f10f9f8801a0a08da1a1298",
+        "version" : "1.5.36"
       }
     },
     {
