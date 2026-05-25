@@ -1564,27 +1564,18 @@ extension Container {{
             let projectionService = resolver.require(ProjectionsServiceProtocol.self)
             let opportunityService = resolver.require(OpportunitiesServiceProtocol.self)
             let analysisService = resolver.require(DailyAnalysisServiceProtocol.self)
-            let activityService = resolver.require(ActivityFeedServiceProtocol.self)
             let positionMap = resolver.require((any SportConfigurationProtocol).self).positionMap
             return MainActor.assumeIsolated {{
-                // StoreRef breaks the chicken-and-egg: makeReduce needs to dispatch
-                // .analysisLoaded back to the store, but the store doesn't exist yet.
-                // We create the ref first, pass it in, then wire it after construction.
-                let storeRef = StoreRef<BoardState, BoardIntent>()
-                let store = Store(
+                Store(
                     initial: BoardState(),
                     reduce: BoardState.makeReduce(
                         boardService: boardService,
                         projectionService: projectionService,
                         opportunityService: opportunityService,
                         analysisService: analysisService,
-                        activityService: activityService,
-                        positionMap: positionMap,
-                        storeRef: storeRef
+                        positionMap: positionMap
                     )
                 )
-                storeRef.store = store
-                return store
             }}
         }}
     }}
@@ -3518,13 +3509,20 @@ import BKSCore
 
 struct BoardLoadResult {{
     let entries: [BoardEntry]
+    let projections: [Projection]
     let games: [ScheduledGame]
     let lockTime: Date?
     let seasonMode: SeasonMode
     let gameOdds: [String: GameOdds]
     let serverDateString: String?
     let dailyAnalysis: DailyAnalysis?
+    let analysisPreview: String?
     let playoffSeries: [PlayoffSeries]
+    let nextPageOffset: Int
+    let hasMorePages: Bool
+    let totalOpportunities: Int
+    /// ISO 8601 UTC timestamp of the last sync_today_games run. Nil until the board response arrives.
+    let scheduleSyncedAt: String?
 }}
 
 // MARK: - BoardViewMode
@@ -3539,9 +3537,7 @@ enum BoardViewMode: String {{
 enum BoardIntent: CancellableIntent {{
     case onAppear
     case refreshRequested
-    /// Triggered by a background data refresh (silent push / BGTask).
-    /// Does NOT cancel an in-flight fetch — the existing request is already running
-    /// and its result will be fresher than anything we could start now.
+    /// Triggered by background data refresh (silent push / BGTask). Does not cancel an in-flight fetch.
     case backgroundRefreshRequested
     case entriesLoaded(BoardLoadResult)
     case loadFailed(Error)
@@ -3553,14 +3549,20 @@ enum BoardIntent: CancellableIntent {{
     case pushNotificationTapped(String)
     case deepLinkHandled
     case refreshBannerExpired
-    case analysisLoaded(DailyAnalysis)
+    case diskCacheLoaded(BoardLoadResult)
+    case loadNextPage
+    case nextPageLoaded(OpportunitiesPageResult)
+    /// Projections arrived after the board already rendered from opportunity data.
+    /// Enriches existing entries without replacing them.
+    case projectionsLoaded([Projection])
 
     var cancelsInFlightWork: Bool {{
         switch self {{
         case .navigationPathChanged, .searchTextChanged, .positionFilterChanged,
              .tierFilterChanged, .viewModeChanged, .pushNotificationTapped,
-             .deepLinkHandled, .refreshBannerExpired, .backgroundRefreshRequested,
-             .analysisLoaded:
+             .deepLinkHandled, .refreshBannerExpired, .diskCacheLoaded,
+             .loadNextPage, .nextPageLoaded, .backgroundRefreshRequested,
+             .projectionsLoaded:
             false
         default:
             true
@@ -3576,17 +3578,9 @@ import BKSUICore
 import OSLog
 import SwiftUI
 
-// MARK: - StoreRef
-
-/// Weak-reference box used to break the chicken-and-egg between makeReduce
-/// and the Store it dispatches back into.
-@MainActor
-final class StoreRef<State, Intent> {{
-    weak var store: Store<State, Intent>?
-}}
-
 // MARK: - BoardState
 
+// swiftlint:disable:next type_body_length
 struct BoardState {{
     var navigationPath = NavigationPath()
     var loadState: ViewState<[BoardEntry]> = .idle
@@ -3600,12 +3594,27 @@ struct BoardState {{
     var gameCount: Int = 0
     var todayGames: [ScheduledGame] = []
     var seasonMode: SeasonMode = .regularSeason
+    /// Vegas lines and projected totals keyed by "VISITOR@HOME:gameSequence".
     var gameOdds: [String: GameOdds] = [:]
+    /// Server-authoritative date string "yyyy-MM-dd" in ET. Nil until first load.
     var serverDateString: String?
+    /// ISO 8601 UTC timestamp of the last sync_today_games run. Used for "last updated" on the schedule strip.
+    var scheduleSyncedAt: String?
     var viewMode: BoardViewMode = .byPosition
     var groupedEntries: [(position: String, picks: [BoardEntry])] = []
     var dailyAnalysis: DailyAnalysis?
+    /// Short narrative preview from get_board. Shown on the board card before the user taps through.
+    var analysisPreview: String?
     var playoffSeries: [PlayoffSeries] = []
+    /// True while a background network refresh is in flight after serving a disk-cache hit.
+    var isBackgroundRefreshing: Bool = false
+    var nextPageOffset: Int = 0
+    var hasMorePages: Bool = false
+    var isLoadingNextPage: Bool = false
+    /// Server-reported total player count for the current slate, independent of how many pages have loaded.
+    var totalOpportunities: Int = 0
+    /// Cached projections retained for appending subsequent opportunity pages.
+    var cachedProjections: [Projection] = []
 
     private static let stalenessThreshold = CacheFreshness.defaultThreshold
 
@@ -3614,46 +3623,81 @@ struct BoardState {{
         category: "BoardState"
     )
 
-    // swiftlint:disable:next function_body_length cyclomatic_complexity function_parameter_count
+    // swiftlint:disable:next function_body_length cyclomatic_complexity
     static func makeReduce(
         boardService: BoardServiceProtocol,
         projectionService: ProjectionsServiceProtocol,
         opportunityService: OpportunitiesServiceProtocol,
         analysisService: DailyAnalysisServiceProtocol,
-        activityService: ActivityFeedServiceProtocol,
-        positionMap: SportPositionMap,
-        storeRef: StoreRef<Self, BoardIntent>
+        positionMap: SportPositionMap
     ) -> Reduce<Self, BoardIntent> {{
         {{ state, intent in
             switch intent {{
             case .onAppear:
+                // Force refetch if the calendar date has changed since last load —
+                // yesterday's players must not persist.
                 let isNewDay = state.lastUpdated.map {{ !Calendar.current.isDateInToday($0) }} ?? false
+                let lastUpdatedDesc = state.lastUpdated?.description ?? "nil"
+                let entryCount = state.allEntries.count
                 if !isNewDay,
                    CacheFreshness.isFresh(lastUpdated: state.lastUpdated, threshold: stalenessThreshold),
-                   case .loaded = state.loadState
+                   case .loaded = state.loadState,
+                   !state.allEntries.isEmpty
                 {{
+                    logger.debug("onAppear — cache hit, skipping fetch (lastUpdated: \\(lastUpdatedDesc, privacy: .public) entries: \\(entryCount, privacy: .public))")
                     return nil
                 }}
                 // A fetch is already in flight (e.g. refreshRequested fired before onAppear) —
-                // don't spawn a second concurrent fetchAll that races and doubles network load.
-                if case .loading = state.loadState {{ return nil }}
+                // don't spawn a second concurrent fetch that races and doubles network load.
+                if case .loading = state.loadState {{
+                    logger.debug("onAppear — fetch already in flight, skipping (lastUpdated: \\(lastUpdatedDesc, privacy: .public))")
+                    return nil
+                }}
+                logger.debug("onAppear — triggering fetch (isNewDay: \\(isNewDay, privacy: .public) lastUpdated: \\(lastUpdatedDesc, privacy: .public))")
+                // Seed the games strip from disk before the full board cache check.
+                if let schedule = try? boardService.loadCachedTodaySchedule() {{
+                    state.todayGames = schedule.games.sorted {{ $0.gameDatetime < $1.gameDatetime }}
+                    state.gameCount = schedule.games.count
+                    state.serverDateString = schedule.date
+                }}
+                // Serve disk cache immediately so the board renders before the network
+                // round-trip completes. Background fetch below overwrites with fresh data.
                 state.loadState = .loading
-                return await fetchAll(
+                async let diskTask = Perf.measure("BoardDiskHydration") {{
+                    await loadFromDisk(
+                        boardService: boardService,
+                        opportunityService: opportunityService,
+                        projectionService: projectionService,
+                        analysisService: analysisService,
+                        positionMap: positionMap
+                    )
+                }}
+                async let networkTask = fetchAll(
                     boardService: boardService,
-                    projectionService: projectionService,
-                    opportunityService: opportunityService,
-                    analysisService: analysisService,
-                    storeRef: storeRef
+                    analysisService: analysisService
                 )
+                if let diskResult = await diskTask {{
+                    logger.debug("onAppear — disk cache hit, instant render (\\(diskResult.entries.count, privacy: .public) entries), background refresh starting")
+                    state.allEntries = diskResult.entries
+                    state.loadState = .loaded(diskResult.entries)
+                    state.todayGames = diskResult.games.sorted {{ $0.gameDatetime < $1.gameDatetime }}
+                    state.gameCount = diskResult.games.count
+                    state.lockTime = diskResult.lockTime
+                    state.seasonMode = diskResult.seasonMode
+                    state.gameOdds = diskResult.gameOdds
+                    state.serverDateString = diskResult.serverDateString
+                    if let analysis = diskResult.dailyAnalysis {{ state.dailyAnalysis = analysis }}
+                    state.isBackgroundRefreshing = true
+                    applyFilters(&state, positionMap: positionMap)
+                }}
+                return await networkTask
 
             case .refreshRequested:
+                state.isBackgroundRefreshing = false
                 state.loadState = .loading
                 return await fetchAll(
                     boardService: boardService,
-                    projectionService: projectionService,
-                    opportunityService: opportunityService,
-                    analysisService: analysisService,
-                    storeRef: storeRef
+                    analysisService: analysisService
                 )
 
             case .backgroundRefreshRequested:
@@ -3663,46 +3707,73 @@ struct BoardState {{
                 state.loadState = .loading
                 return await fetchAll(
                     boardService: boardService,
-                    projectionService: projectionService,
-                    opportunityService: opportunityService,
-                    analysisService: analysisService,
-                    storeRef: storeRef
+                    analysisService: analysisService
                 )
 
             case let .entriesLoaded(result):
                 state.isBackgroundRefreshing = false
-                state.allEntries       = result.entries
-                state.todayGames       = result.games
-                state.lockTime         = result.lockTime
-                state.seasonMode       = result.seasonMode
-                state.gameOdds         = result.gameOdds
+                // Mark spinner on cards immediately — projections fetch is about to start.
+                let loadingEntries = result.projections.isEmpty
+                    ? BoardEntryBuilder.markProjectionsLoading(result.entries)
+                    : result.entries
+                state.allEntries = loadingEntries
+                state.cachedProjections = result.projections
+                state.loadState = .loaded(loadingEntries)
+                state.lastUpdated = .now
+                state.nextPageOffset = result.nextPageOffset
+                state.hasMorePages = result.hasMorePages
+                state.isLoadingNextPage = false
+                state.totalOpportunities = result.totalOpportunities
+                state.todayGames = result.games.sorted {{ $0.gameDatetime < $1.gameDatetime }}
+                state.gameCount = result.games.count
+                state.lockTime = result.lockTime
+                state.seasonMode = result.seasonMode
+                state.gameOdds = result.gameOdds
                 state.serverDateString = result.serverDateString
+                if let syncedAt = result.scheduleSyncedAt {{ state.scheduleSyncedAt = syncedAt }}
+                state.playoffSeries = result.playoffSeries
+                if let preview = result.analysisPreview {{ state.analysisPreview = preview }}
                 if let analysis = result.dailyAnalysis {{ state.dailyAnalysis = analysis }}
-                state.playoffSeries    = result.playoffSeries
-                state.gameCount        = result.games.count
-                state.lastUpdated      = .now
-                state.loadState        = .loaded(result.entries)
-                return nil
+                applyFilters(&state, positionMap: positionMap)
+                // Phase 2 — board is now visible; fetch projections in background to enrich entries.
+                return await fetchProjectionsInBackground(projectionService: projectionService)
 
             case let .loadFailed(error):
-                logger.error("Board load failed: \\(error.localizedDescription, privacy: .public)")
+                state.isBackgroundRefreshing = false
+                if case .loaded = state.loadState {{
+                    let msg = "Board refresh failed but keeping existing data: \\(error.diagnosticDescription)"
+                    logger.warning("\\(msg, privacy: .public)")
+                    DiagnosticLogger.warning(msg, category: "BoardState")
+                    return nil
+                }}
+                let msg = "Board load failed: \\(error.localizedDescription)"
+                logger.error("\\(msg, privacy: .public)")
+                DiagnosticLogger.error(msg, category: "BoardState")
                 state.loadState = .failed(error)
+                return nil
+
+            case .refreshBannerExpired:
+                state.isBackgroundRefreshing = false
                 return nil
 
             case let .searchTextChanged(text):
                 state.searchText = text
+                applyFilters(&state, positionMap: positionMap)
                 return nil
 
             case let .positionFilterChanged(position):
                 state.selectedPosition = position
+                applyFilters(&state, positionMap: positionMap)
                 return nil
 
             case let .tierFilterChanged(tier):
                 state.selectedTier = tier
+                applyFilters(&state, positionMap: positionMap)
                 return nil
 
             case let .viewModeChanged(mode):
                 state.viewMode = mode
+                applyFilters(&state, positionMap: positionMap)
                 return nil
 
             case let .navigationPathChanged(path):
@@ -3715,14 +3786,176 @@ struct BoardState {{
             case .deepLinkHandled:
                 return nil
 
-            case .refreshBannerExpired:
+            case let .diskCacheLoaded(result):
+                state.isBackgroundRefreshing = false
+                state.allEntries = result.entries
+                state.loadState = .loaded(result.entries)
+                state.nextPageOffset = result.nextPageOffset
+                state.hasMorePages = result.hasMorePages
+                state.isLoadingNextPage = false
+                state.totalOpportunities = result.totalOpportunities
+                state.todayGames = result.games.sorted {{ $0.gameDatetime < $1.gameDatetime }}
+                state.gameCount = result.games.count
+                state.lockTime = result.lockTime
+                state.seasonMode = result.seasonMode
+                state.gameOdds = result.gameOdds
+                state.serverDateString = result.serverDateString
+                applyFilters(&state, positionMap: positionMap)
                 return nil
 
-            case let .analysisLoaded(analysis):
-                state.dailyAnalysis = analysis
+            case let .projectionsLoaded(projections):
+                guard !state.allEntries.isEmpty else {{ return nil }}
+                let serverDate = state.serverDateString
+                let enriched = Perf.measure("BoardProjectionMerge") {{
+                    BoardEntryBuilder.mergeProjections(
+                        into: state.allEntries,
+                        projections: projections,
+                        todayDateString: serverDate
+                    )
+                }}
+                state.allEntries = enriched
+                state.cachedProjections = projections
+                if case .loaded = state.loadState {{
+                    state.loadState = .loaded(enriched)
+                }}
+                applyFilters(&state, positionMap: positionMap)
+                return nil
+
+            case .loadNextPage:
+                guard state.hasMorePages, !state.isLoadingNextPage else {{ return nil }}
+                state.isLoadingNextPage = true
+                let offset = state.nextPageOffset
+                return await loadNextPage(
+                    offset: offset,
+                    boardService: boardService
+                )
+
+            case let .nextPageLoaded(pageResult):
+                state.isLoadingNextPage = false
+                let existingIDs = Set(state.allEntries.map(\\.id))
+                let newEntries = BoardEntryBuilder.build(
+                    players: [],
+                    projections: state.cachedProjections,
+                    opportunities: pageResult.opportunities,
+                    todayDateString: state.serverDateString
+                ).filter {{ !existingIDs.contains($0.id) }}
+                state.allEntries.append(contentsOf: newEntries)
+                state.loadState = .loaded(state.allEntries)
+                let nextOffset = pageResult.offset + pageResult.limit
+                state.nextPageOffset = nextOffset
+                state.hasMorePages = nextOffset < pageResult.total
+                applyFilters(&state, positionMap: positionMap)
                 return nil
             }}
         }}
+    }}
+
+    // MARK: - Disk cache
+
+    /// Reads all disk caches synchronously and builds a `BoardLoadResult` if every
+    /// required piece is present. Returns nil on any missing cache so the caller
+    /// falls through to the normal loading spinner.
+    nonisolated private static func loadFromDisk( // swiftlint:disable:this function_body_length
+        boardService: BoardServiceProtocol,
+        opportunityService: OpportunitiesServiceProtocol,
+        projectionService: ProjectionsServiceProtocol,
+        analysisService: DailyAnalysisServiceProtocol,
+        positionMap: SportPositionMap
+    ) async -> BoardLoadResult? {{
+        let opportunities: [Opportunity]
+        do {{
+            guard let loaded = try opportunityService.loadCachedOpportunities() else {{
+                logger.debug("loadFromDisk — opportunities cache miss")
+                return nil
+            }}
+            opportunities = loaded
+        }} catch {{
+            let msg = "loadFromDisk — opportunities decode failed: \\(error.localizedDescription)"
+            logger.warning("\\(msg, privacy: .public)")
+            DiagnosticLogger.error(msg, category: "BoardState")
+            return nil
+        }}
+
+        guard !opportunities.isEmpty else {{
+            logger.debug("loadFromDisk — opportunities cache empty")
+            DiagnosticLogger.warning("loadFromDisk — opportunities cache empty", category: "BoardState")
+            return nil
+        }}
+
+        // Projections are optional for the disk-cache fast path — entries render without them
+        // and get enriched via `.projectionsLoaded` once the network call completes.
+        let projections: [Projection] = (try? projectionService.loadCachedProjections()) ?? []
+
+        let schedule: TodaySchedule
+        do {{
+            guard let loaded = try boardService.loadCachedTodaySchedule() else {{
+                logger.debug("loadFromDisk — schedule cache miss")
+                return nil
+            }}
+            schedule = loaded
+        }} catch {{
+            let msg = "loadFromDisk — schedule decode failed: \\(error.localizedDescription)"
+            logger.warning("\\(msg, privacy: .public)")
+            DiagnosticLogger.error(msg, category: "BoardState")
+            return nil
+        }}
+
+        let seasonMode = (try? opportunityService.loadCachedSeasonMode()) ?? .regularSeason
+        let cachedAnalysis = try? analysisService.loadCachedDailyAnalysis()
+        let entries = Perf.measure("BoardEntryBuildFromDisk") {{
+            BoardEntryBuilder.build(
+                players: [],
+                projections: projections,
+                opportunities: opportunities,
+                todayDateString: schedule.date
+            )
+        }}
+        let games = schedule.games
+        let lockTime = games.map(\\.gameDatetime).min()
+        return BoardLoadResult(
+            entries: entries,
+            projections: projections,
+            games: games,
+            lockTime: lockTime,
+            seasonMode: seasonMode,
+            gameOdds: buildGameOdds(from: games),
+            serverDateString: schedule.date,
+            dailyAnalysis: cachedAnalysis,
+            analysisPreview: nil,
+            playoffSeries: [],
+            nextPageOffset: 0,
+            hasMorePages: false,
+            totalOpportunities: entries.count,
+            scheduleSyncedAt: nil
+        )
+    }}
+
+    nonisolated private static func loadNextPage(
+        offset: Int,
+        boardService: BoardServiceProtocol
+    ) async -> BoardIntent {{
+        do {{
+            let page = try await boardService.fetchBoard(platform: nil, limit: nil, offset: offset)
+            let adapted = OpportunitiesPageResult(
+                opportunities: page.players,
+                seasonMode: page.seasonMode,
+                total: page.total,
+                offset: page.offset,
+                limit: page.limit
+            )
+            return .nextPageLoaded(adapted)
+        }} catch {{
+            let msg = "Board: next page fetch failed (offset \\(offset)): \\(error.diagnosticDescription)"
+            logger.warning("\\(msg, privacy: .public)")
+            DiagnosticLogger.warning(msg, category: "BoardState")
+            return .loadFailed(error)
+        }}
+    }}
+
+    private static func buildGameOdds(from games: [ScheduledGame]) -> [String: GameOdds] {{
+        Dictionary(uniqueKeysWithValues: games.map {{ game in
+            ("\\(game.visitorTeamAbbr)@\\(game.homeTeamAbbr):\\(game.gameSequence)", GameOdds(game: game))
+        }})
     }}
 
     // MARK: - Async fetch
@@ -3730,61 +3963,138 @@ struct BoardState {{
     // swiftlint:disable:next function_body_length
     nonisolated private static func fetchAll(
         boardService: BoardServiceProtocol,
-        projectionService: ProjectionsServiceProtocol,
-        opportunityService: OpportunitiesServiceProtocol,
-        analysisService: DailyAnalysisServiceProtocol,
-        storeRef: StoreRef<Self, BoardIntent>
+        analysisService: DailyAnalysisServiceProtocol
     ) async -> BoardIntent {{
-        // Analysis is slow (pipeline-dependent) — fire it independently so it never
-        // blocks the board render. It dispatches .analysisLoaded when it arrives.
-        Task {{ @MainActor in
-            do {{
-                let analysis = try await analysisService.fetchDailyAnalysis()
-                storeRef.store?.send(.analysisLoaded(analysis))
-            }} catch {{
-                if case NetworkError.httpError(statusCode: 404, _) = error {{
-                    logger.info("Board: no daily analysis available yet")
-                }} else {{
-                    logger.warning("Board: analysis fetch failed: \\(error.diagnosticDescription, privacy: .public)")
-                }}
-            }}
-        }}
+        #if DEBUG
+        let fetchAllStart = Date()
+        let fetchAllID = Perf.begin("BoardFetchAll")
+        defer {{ Perf.end("BoardFetchAll", id: fetchAllID, startedAt: fetchAllStart) }}
+        #endif
 
-        // Phase 1 — get-board is the critical path. Returns schedule + players + odds.
+        // Phase 1 — get_board is the critical path. We do NOT await projections here.
+        // Projections are fetched concurrently but dispatched separately so the board
+        // renders as soon as get_board completes.
         let page: BoardPageResult
         do {{
             page = try await boardService.fetchBoard()
         }} catch {{
-            logger.warning("Board: get_board fetch failed: \\(error.diagnosticDescription, privacy: .public)")
+            if case NetworkError.httpError(statusCode: 402, _) = error {{
+                return .loadFailed(error)
+            }}
+            let msg = "Board: get_board fetch failed: \\(error.diagnosticDescription)"
+            logger.warning("\\(msg, privacy: .public)")
+            DiagnosticLogger.error(msg, category: "BoardState")
             return .loadFailed(error)
         }}
 
-        let entries = BoardEntryBuilder.build(
-            players: [],
-            projections: [],
-            opportunities: page.players,
-            todayDateString: page.date.isEmpty ? nil : page.date
-        )
+        // Build entries from opportunity data alone — no projections needed for board cards.
+        let entries = Perf.measure("BoardEntryBuildFromNetwork") {{
+            BoardEntryBuilder.build(
+                players: [],
+                opportunities: page.players,
+                todayDateString: page.date.isEmpty ? nil : page.date
+            )
+        }}
 
-        let games = page.games
-        let gameOdds = Dictionary(
-            uniqueKeysWithValues: games.map {{ game in
-                let key = "\\(game.visitorTeamAbbr)@\\(game.homeTeamAbbr):\\(game.gameSequence)"
-                return (key, GameOdds(game: game))
-            }}
-        )
-        let lockTime = games.map(\\.gameDatetime).min()
+        let lockTime = page.games.map(\\.gameDatetime).min()
+        let nextOffset = page.offset + page.limit
+        let hasMore = nextOffset < page.total
 
         return .entriesLoaded(BoardLoadResult(
             entries: entries,
-            games: games,
+            projections: [],
+            games: page.games,
             lockTime: lockTime,
             seasonMode: page.seasonMode,
-            gameOdds: gameOdds,
+            gameOdds: buildGameOdds(from: page.games),
             serverDateString: page.date.isEmpty ? nil : page.date,
             dailyAnalysis: nil,
-            playoffSeries: []
+            analysisPreview: page.analysisPreview,
+            playoffSeries: [],
+            nextPageOffset: nextOffset,
+            hasMorePages: hasMore,
+            totalOpportunities: page.total,
+            scheduleSyncedAt: page.scheduleSyncedAt
         ))
+    }}
+
+    /// Fetches projections in the background and dispatches `.projectionsLoaded` when done.
+    /// Called after `.entriesLoaded` so the board is already visible when this fires.
+    nonisolated static func fetchProjectionsInBackground(
+        projectionService: ProjectionsServiceProtocol
+    ) async -> BoardIntent {{
+        do {{
+            let projections = try await projectionService.fetchProjections()
+            return .projectionsLoaded(projections)
+        }} catch {{
+            let msg = "Board: background projections fetch failed: \\(error.diagnosticDescription)"
+            logger.warning("\\(msg, privacy: .public)")
+            DiagnosticLogger.warning(msg, category: "BoardState")
+            return .projectionsLoaded([])
+        }}
+    }}
+
+    // MARK: - Filtering
+
+    private static func applyFilters(_ state: inout Self, positionMap: SportPositionMap) {{
+        #if DEBUG
+        let applyFiltersStart = Date()
+        let applyFiltersID = Perf.begin("BoardApplyFilters")
+        defer {{ Perf.end("BoardApplyFilters", id: applyFiltersID, startedAt: applyFiltersStart) }}
+        #endif
+        let search = state.searchText.lowercased()
+        let chip = state.selectedPosition
+        let tierFilter = state.selectedTier
+
+        let base = state.allEntries
+            .filter {{ $0.isPlayingTonight }}
+            .filter {{ entry in
+                let matchesSearch = search.isEmpty || entry.searchHaystack.contains(search)
+
+                let matchesChip: Bool = {{
+                    guard let chip, chip != "All" else {{ return true }}
+                    return positionMap.matchesChip(chip, position: entry.position)
+                }}()
+
+                let matchesTier: Bool = {{
+                    guard let tierFilter else {{ return true }}
+                    return entry.playerTier == tierFilter
+                }}()
+
+                return matchesSearch && matchesChip && matchesTier
+            }}
+            .sorted {{ lhs, rhs in
+                switch (lhs.opportunityScore, rhs.opportunityScore) {{
+                case let (lScore?, rScore?): return lScore > rScore
+                case (.some, .none): return true
+                case (.none, .some): return false
+                case (.none, .none):
+                    let tierA = lhs.playerTier?.tierSortOrder ?? Int.max
+                    let tierB = rhs.playerTier?.tierSortOrder ?? Int.max
+                    return tierA < tierB
+                }}
+            }}
+
+        state.filteredEntries = base
+        state.groupedEntries = buildGroupedEntries(from: base, positionMap: positionMap)
+    }}
+
+    private static func buildGroupedEntries(
+        from entries: [BoardEntry],
+        positionMap: SportPositionMap
+    ) -> [(position: String, picks: [BoardEntry])] {{
+        positionMap.filterChips.compactMap {{ chip in
+            let picks = entries
+                .filter {{ positionMap.matchesChip(chip, position: $0.position) }}
+                .sorted {{
+                    let tierA = $0.playerTier?.tierSortOrder ?? Int.max
+                    let tierB = $1.playerTier?.tierSortOrder ?? Int.max
+                    if tierA != tierB {{ return tierA < tierB }}
+                    return ($0.opportunityScore ?? 0) > ($1.opportunityScore ?? 0)
+                }}
+            guard !picks.isEmpty else {{ return nil }}
+            return (position: chip, picks: picks)
+        }}
     }}
 }}
 """
