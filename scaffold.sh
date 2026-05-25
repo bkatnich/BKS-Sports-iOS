@@ -3427,7 +3427,8 @@ import BKSCore
 //
 // Composite model combining opportunities, projections, and game data
 // into a single display-ready record.
-// Add sport-specific fields below the Sport-specific marker.
+// Sport-specific fields are in the section marked below — add or remove
+// fields to match the data your API returns.
 
 struct BoardEntry: Identifiable, Equatable, Hashable, BoardEntryDisplayable {{
     let id: String
@@ -3440,6 +3441,7 @@ struct BoardEntry: Identifiable, Equatable, Hashable, BoardEntryDisplayable {{
     let opponentAbbr: String?
     let isHome: Bool?
     let isPlayingTonight: Bool
+    let playFadeRecommendation: PlayFadeRecommendation?
 
     // Projection layer
     let projectedScore: Double?       // DK fantasy points
@@ -3451,6 +3453,14 @@ struct BoardEntry: Identifiable, Equatable, Hashable, BoardEntryDisplayable {{
     let projectionTier: TierLevel?
     let confidenceScore: Double?
     let confidenceScoreFd: Double?
+    let isProjectionsLoading: Bool
+
+    // Trend layer
+    let hotStreak: Int?
+    let coldStreak: Int?
+    let usageEfficiencySignal: UsageEfficiencySignal?
+    let avgFantasyScoreHome: Double?
+    let avgFantasyScoreAway: Double?
 
     // Opportunity layer
     let opportunityScore: Double?
@@ -3460,15 +3470,61 @@ struct BoardEntry: Identifiable, Equatable, Hashable, BoardEntryDisplayable {{
 
     // Status
     let injuryStatus: InjuryStatus?
+    let isConfirmedStarter: Bool?
     let playerTier: TierLevel?
     let seasonGames: Int?
+    let playoffDataConfidence: Double?
+
+    // Ceiling & Value slate picks
+    let isTopCeiling: Bool
+    let topCeilingRank: Int?
+    let isTopValue: Bool
+    let topValueRank: Int?
 
     // MARK: - Sport-specific fields
-    // Add fields here that are unique to this sport's board display.
-    // Reference: Baseball app BoardEntry has gameDateTime, battingOrder, probablePitcher,
-    // parkFactor, topPickReasons, trendDirection, recentGameScores, upcomingGames,
-    // rotationTier, trend slopes (trendHits/HR/RBI/Runs/SB/Doubles/TB),
-    // and season metrics (seasonAvg/OBP/SLG/OPS/WAR, wobaProxy, obpProxy, avgPaPerGame).
+    // The fields below are populated from the sport's opportunity and projection APIs.
+    // Add, remove, or rename as needed for your sport's data model.
+
+    // Game context
+    let gameDateTime: Date?
+    let battingOrder: Int?
+    let probablePitcher: String?
+    let parkFactor: Double?
+    let topPickReasons: [String]
+
+    // Trend
+    let trendDirection: TrendDirection?
+    let recentGameScores: [Double]?
+    let upcomingGames: [ProjectedGame]?
+
+    // Pitcher classification (baseball-specific — remove for non-pitching sports)
+    let rotationTier: RotationTier?
+
+    // Trend slopes — rate-of-change for key stats over recent games
+    let trendHits: Double?
+    let trendHR: Double?
+    let trendRBI: Double?
+    let trendRuns: Double?
+    let trendSB: Double?
+    let trendDoubles: Double?
+    let trendTB: Double?
+
+    // Season advanced metrics
+    let seasonAvg: Double?
+    let seasonOBP: Double?
+    let seasonSLG: Double?
+    let seasonOPS: Double?
+    let seasonWAR: Double?
+    let wobaProxy: Double?
+    let obpProxy: Double?
+    let avgPaPerGame: Double?
+
+    // Sportsbook prop lines — keyed by market key e.g. "hits_0.5", "home_runs_0.5"
+    let propLines: [String: PropLine]?
+
+    /// Pre-lowercased concatenation of searchable fields, built once at entry construction.
+    /// Format: "displayname|team|position" — eliminates per-keystroke lowercasing in applyFilters.
+    let searchHaystack: String
 }}
 """
 
@@ -3479,41 +3535,392 @@ import OSLog
 import BKSCore
 
 // MARK: - BoardEntryBuilder
-//
-// ┌─────────────────────────────────────────────────────────────────────────┐
-// │  MANUAL IMPLEMENTATION REQUIRED                                         │
-// │                                                                         │
-// │  This file was generated as a stub by the BKS scaffold and will NOT    │
-// │  be overwritten on subsequent scaffold runs.                            │
-// │                                                                         │
-// │  Implement build() following this pattern:                              │
-// │    1. Build [externalPersonID: Projection] and [externalPersonID:      │
-// │       Opportunity] lookup dictionaries (first entry wins on duplicate). │
-// │    2. For each player, find matching projection + opportunity.          │
-// │    3. Identify tonight's game: the upcoming ProjectedGame whose date    │
-// │       matches the server's todayDateString ("yyyy-MM-dd" ET).           │
-// │    4. Resolve scores: tonight → nearest fallback → opportunity.         │
-// │    5. Construct and return BoardEntry. Exclude players with neither     │
-// │       projection nor opportunity.                                       │
-// │    6. See the basketball app's BoardEntryBuilder for a reference impl.  │
-// └─────────────────────────────────────────────────────────────────────────┘
 
 private let logger = os.Logger(subsystem: "{bundle_id}", category: "BoardEntryBuilder")
 
+private let dateFormatter: DateFormatter = {{
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    return formatter
+}}()
+
+// swiftlint:disable:next type_body_length
 enum BoardEntryBuilder {{
 
     static func build(
         players: [Player],
+        projections: [Projection] = [],
+        opportunities: [Opportunity],
+        todayDateString: String?
+    ) -> [BoardEntry] {{
+        // Primary join: external person ID when available on both sides.
+        // Fallback: displayName+team when externalPersonID is nil everywhere.
+        let hasIDOnProj = projections.contains {{ $0.externalPersonID != nil }}
+        let hasIDOnOpp  = opportunities.contains {{ $0.externalPersonID != nil }}
+
+        if hasIDOnProj && hasIDOnOpp {{
+            return buildByID(projections: projections, opportunities: opportunities, todayDateString: todayDateString)
+        }} else {{
+            logger.warning("externalPersonID nil on all records — falling back to name+team join")
+            return buildByName(projections: projections, opportunities: opportunities, todayDateString: todayDateString)
+        }}
+    }}
+
+    // MARK: - ID join
+
+    private static func buildByID(
         projections: [Projection],
         opportunities: [Opportunity],
         todayDateString: String?
     ) -> [BoardEntry] {{
-        // Replace this stub with a real implementation before shipping.
-        // See the basketball app's BoardEntryBuilder.swift for a reference.
-        #if DEBUG
-        assertionFailure("BoardEntryBuilder.build() not yet implemented for {name}")
-        #endif
-        return []
+        var projMap: [Int: Projection] = [:]
+        for proj in projections {{
+            guard let pid = proj.externalPersonID, projMap[pid] == nil else {{ continue }}
+            projMap[pid] = proj
+        }}
+        var oppMap: [Int: Opportunity] = [:]
+        for opp in opportunities {{
+            guard let pid = opp.externalPersonID, oppMap[pid] == nil else {{ continue }}
+            oppMap[pid] = opp
+        }}
+        let allIDs = Set(projMap.keys).union(oppMap.keys)
+        let entries = allIDs.compactMap {{ pid in
+            makeEntry(id: String(pid), proj: projMap[pid], opp: oppMap[pid], todayDateString: todayDateString)
+        }}
+        logger.debug("ID join: \\(entries.count, privacy: .public) entries (projections: \\(projections.count, privacy: .public), opportunities: \\(opportunities.count, privacy: .public))")
+        return entries
+    }}
+
+    // MARK: - Name+team fallback join
+
+    private static func buildByName(
+        projections: [Projection],
+        opportunities: [Opportunity],
+        todayDateString: String?
+    ) -> [BoardEntry] {{
+        var projByName: [String: Projection] = [:]
+        for proj in projections {{
+            let key = nameKey(proj.displayName, proj.team)
+            if projByName[key] == nil {{ projByName[key] = proj }}
+        }}
+
+        var usedKeys = Set<String>()
+        var entries: [BoardEntry] = []
+
+        // Opportunity-anchored entries (enriched with projection if name matches).
+        for opp in opportunities {{
+            let key = nameKey(opp.displayName, opp.team)
+            let proj = projByName[key]
+            if proj != nil {{ usedKeys.insert(key) }}
+            if let entry = makeEntry(id: opp.id, proj: proj, opp: opp, todayDateString: todayDateString) {{
+                entries.append(entry)
+            }}
+        }}
+
+        // Projection-only entries with no matching opportunity.
+        for proj in projections {{
+            let key = nameKey(proj.displayName, proj.team)
+            guard !usedKeys.contains(key) else {{ continue }}
+            if let entry = makeEntry(id: proj.id, proj: proj, opp: nil, todayDateString: todayDateString) {{
+                entries.append(entry)
+            }}
+        }}
+
+        logger.debug("Name join: \\(entries.count, privacy: .public) entries (projections: \\(projections.count, privacy: .public), opportunities: \\(opportunities.count, privacy: .public))")
+        return entries
+    }}
+
+    private static func nameKey(_ displayName: String, _ team: String) -> String {{
+        "\\(displayName.lowercased())|\\(team.lowercased())"
+    }}
+
+    // MARK: - Loading state
+
+    // swiftlint:disable:next function_body_length
+    static func markProjectionsLoading(_ entries: [BoardEntry]) -> [BoardEntry] {{
+        entries.map {{ entry in
+            guard !entry.isProjectionsLoading else {{ return entry }}
+            return BoardEntry(
+                id: entry.id,
+                displayName: entry.displayName,
+                team: entry.team,
+                position: entry.position,
+                headshotURL: entry.headshotURL,
+                opponentAbbr: entry.opponentAbbr,
+                isHome: entry.isHome,
+                isPlayingTonight: entry.isPlayingTonight,
+                playFadeRecommendation: entry.playFadeRecommendation,
+                projectedScore: entry.projectedScore,
+                projectedScoreFd: entry.projectedScoreFd,
+                fpFloor: entry.fpFloor,
+                fpCeiling: entry.fpCeiling,
+                fpFloorFd: entry.fpFloorFd,
+                fpCeilingFd: entry.fpCeilingFd,
+                projectionTier: entry.projectionTier,
+                confidenceScore: entry.confidenceScore,
+                confidenceScoreFd: entry.confidenceScoreFd,
+                isProjectionsLoading: true,
+                hotStreak: entry.hotStreak,
+                coldStreak: entry.coldStreak,
+                usageEfficiencySignal: entry.usageEfficiencySignal,
+                avgFantasyScoreHome: entry.avgFantasyScoreHome,
+                avgFantasyScoreAway: entry.avgFantasyScoreAway,
+                opportunityScore: entry.opportunityScore,
+                opportunityTier: entry.opportunityTier,
+                isTopPick: entry.isTopPick,
+                topPickRank: entry.topPickRank,
+                injuryStatus: entry.injuryStatus,
+                isConfirmedStarter: entry.isConfirmedStarter,
+                playerTier: entry.playerTier,
+                seasonGames: entry.seasonGames,
+                playoffDataConfidence: entry.playoffDataConfidence,
+                isTopCeiling: entry.isTopCeiling,
+                topCeilingRank: entry.topCeilingRank,
+                isTopValue: entry.isTopValue,
+                topValueRank: entry.topValueRank,
+                gameDateTime: entry.gameDateTime,
+                battingOrder: entry.battingOrder,
+                probablePitcher: entry.probablePitcher,
+                parkFactor: entry.parkFactor,
+                topPickReasons: entry.topPickReasons,
+                trendDirection: entry.trendDirection,
+                recentGameScores: entry.recentGameScores,
+                upcomingGames: entry.upcomingGames,
+                rotationTier: entry.rotationTier,
+                trendHits: entry.trendHits,
+                trendHR: entry.trendHR,
+                trendRBI: entry.trendRBI,
+                trendRuns: entry.trendRuns,
+                trendSB: entry.trendSB,
+                trendDoubles: entry.trendDoubles,
+                trendTB: entry.trendTB,
+                seasonAvg: entry.seasonAvg,
+                seasonOBP: entry.seasonOBP,
+                seasonSLG: entry.seasonSLG,
+                seasonOPS: entry.seasonOPS,
+                seasonWAR: entry.seasonWAR,
+                wobaProxy: entry.wobaProxy,
+                obpProxy: entry.obpProxy,
+                avgPaPerGame: entry.avgPaPerGame,
+                propLines: entry.propLines,
+                searchHaystack: entry.searchHaystack
+            )
+        }}
+    }}
+
+    // MARK: - Projection enrichment
+
+    /// Merge a freshly-fetched projections list into an already-rendered entry array.
+    ///
+    /// Called after the board has rendered from opportunity data alone so that
+    /// projection detail arrives without blocking the initial paint. Entries with
+    /// no matching projection are returned unchanged.
+    static func mergeProjections(
+        into entries: [BoardEntry],
+        projections: [Projection],
+        todayDateString: String?
+    ) -> [BoardEntry] {{
+        guard !projections.isEmpty else {{ return entries }}
+
+        // Use name+team as the stable join key for the merge path.
+        var projByName: [String: Projection] = [:]
+        for proj in projections {{
+            let key = nameKey(proj.displayName, proj.team)
+            if projByName[key] == nil {{ projByName[key] = proj }}
+        }}
+
+        return entries.map {{ entry in
+            guard let proj = projByName[nameKey(entry.displayName, entry.team)] else {{ return entry }}
+            return enrich(entry: entry, with: proj, todayDateString: todayDateString)
+        }}
+    }}
+
+    // swiftlint:disable:next function_body_length
+    private static func enrich(
+        entry: BoardEntry,
+        with proj: Projection,
+        todayDateString: String?
+    ) -> BoardEntry {{
+        let tonightGame: ProjectedGame? = {{
+            guard let today = todayDateString else {{ return nil }}
+            return proj.upcomingGames?.first {{ dateFormatter.string(from: $0.gameDate) == today }}
+        }}()
+
+        return BoardEntry(
+            id: entry.id,
+            displayName: entry.displayName,
+            team: entry.team,
+            position: entry.position ?? proj.position,
+            headshotURL: entry.headshotURL ?? proj.headshotURL,
+            opponentAbbr: entry.opponentAbbr ?? tonightGame?.opponentAbbr,
+            isHome: entry.isHome ?? tonightGame.map(\\.isHome),
+            isPlayingTonight: entry.isPlayingTonight || tonightGame != nil,
+            playFadeRecommendation: proj.playFadeRecommendation,
+            projectedScore: tonightGame?.projectedScoreDk ?? proj.projectionScore,
+            projectedScoreFd: proj.projectedScoreFd ?? entry.projectedScoreFd,
+            fpFloor: tonightGame?.fpFloorDk ?? entry.fpFloor,
+            fpCeiling: tonightGame?.fpCeilingDk ?? entry.fpCeiling,
+            fpFloorFd: tonightGame?.fpFloorFd ?? entry.fpFloorFd,
+            fpCeilingFd: tonightGame?.fpCeilingFd ?? entry.fpCeilingFd,
+            projectionTier: proj.projectionTier,
+            confidenceScore: proj.confidenceScoreDk ?? entry.confidenceScore,
+            confidenceScoreFd: proj.confidenceScoreFd ?? entry.confidenceScoreFd,
+            isProjectionsLoading: false,
+            hotStreak: proj.hotStreak ?? entry.hotStreak,
+            coldStreak: proj.coldStreak ?? entry.coldStreak,
+            usageEfficiencySignal: proj.usageEfficiencySignal,
+            avgFantasyScoreHome: entry.avgFantasyScoreHome,
+            avgFantasyScoreAway: entry.avgFantasyScoreAway,
+            opportunityScore: entry.opportunityScore,
+            opportunityTier: entry.opportunityTier,
+            isTopPick: entry.isTopPick,
+            topPickRank: entry.topPickRank,
+            injuryStatus: proj.injuryStatus ?? entry.injuryStatus,
+            isConfirmedStarter: entry.isConfirmedStarter,
+            playerTier: proj.projectionTier,
+            seasonGames: entry.seasonGames,
+            playoffDataConfidence: entry.playoffDataConfidence,
+            isTopCeiling: entry.isTopCeiling,
+            topCeilingRank: entry.topCeilingRank,
+            isTopValue: entry.isTopValue,
+            topValueRank: entry.topValueRank,
+            gameDateTime: entry.gameDateTime,
+            battingOrder: entry.battingOrder,
+            probablePitcher: entry.probablePitcher,
+            parkFactor: entry.parkFactor,
+            topPickReasons: entry.topPickReasons,
+            trendDirection: proj.trendDirection ?? entry.trendDirection,
+            recentGameScores: entry.recentGameScores,
+            upcomingGames: proj.upcomingGames ?? entry.upcomingGames,
+            rotationTier: entry.rotationTier,
+            trendHits: proj.trendHits ?? entry.trendHits,
+            trendHR: proj.trendHR ?? entry.trendHR,
+            trendRBI: proj.trendRBI ?? entry.trendRBI,
+            trendRuns: proj.trendRuns ?? entry.trendRuns,
+            trendSB: proj.trendSB ?? entry.trendSB,
+            trendDoubles: proj.trendDoubles ?? entry.trendDoubles,
+            trendTB: proj.trendTB ?? entry.trendTB,
+            seasonAvg: proj.seasonAvg ?? entry.seasonAvg,
+            seasonOBP: proj.seasonOBP ?? entry.seasonOBP,
+            seasonSLG: proj.seasonSLG ?? entry.seasonSLG,
+            seasonOPS: proj.seasonOPS ?? entry.seasonOPS,
+            seasonWAR: proj.seasonWAR ?? entry.seasonWAR,
+            wobaProxy: proj.wobaProxy ?? entry.wobaProxy,
+            obpProxy: proj.obpProxy ?? entry.obpProxy,
+            avgPaPerGame: proj.avgPaPerGame ?? entry.avgPaPerGame,
+            propLines: entry.propLines,
+            searchHaystack: entry.searchHaystack
+        )
+    }}
+
+    // MARK: - Entry construction
+
+    // swiftlint:disable:next function_body_length
+    private static func makeEntry(
+        id: String,
+        proj: Projection?,
+        opp: Opportunity?,
+        todayDateString: String?
+    ) -> BoardEntry? {{
+        let tonightGame: ProjectedGame? = proj.flatMap {{ projection in
+            guard let today = todayDateString else {{ return nil }}
+            return projection.upcomingGames?.first {{ dateFormatter.string(from: $0.gameDate) == today }}
+        }}
+
+        let projectedScore    = tonightGame?.projectedScoreDk ?? proj?.projectionScore ?? opp?.predictedFP
+        let projectedScoreFd  = proj?.projectedScoreFd
+        let fpFloor           = tonightGame?.fpFloorDk ?? opp?.fpFloorDk
+        let fpCeiling         = tonightGame?.fpCeilingDk ?? opp?.fpCeilingDk
+        let fpFloorFd         = tonightGame?.fpFloorFd ?? opp?.fpFloorFd
+        let fpCeilingFd       = tonightGame?.fpCeilingFd ?? opp?.fpCeilingFd
+        let projectionTier    = proj?.projectionTier
+        let confidenceScore   = proj?.confidenceScoreDk
+        let confidenceScoreFd = proj?.confidenceScoreFd
+
+        guard let displayName = proj?.displayName ?? opp?.displayName,
+              let team        = proj.map(\\.team) ?? opp.map(\\.team)
+        else {{ return nil }}
+
+        let position     = proj?.position ?? opp?.position
+        let headshotURL  = proj?.headshotURL ?? opp?.headshotURL
+        let injuryStatus = proj?.injuryStatus ?? opp?.injuryStatus
+        let opponentAbbr = tonightGame?.opponentAbbr ?? opp?.opponentAbbr
+        let isHome: Bool? = tonightGame.map(\\.isHome) ?? opp.map(\\.isHome)
+        // tonightGame: projection matched today's date
+        // gameDateTime: opportunity has an explicit game time for today
+        // opponentAbbr on opp: opportunity API only returns players with tonight's game context
+        let isPlayingTonight = tonightGame != nil
+            || opp?.gameDateTime != nil
+            || (opp?.opponentAbbr.isEmpty == false)
+
+        let searchHaystack = "\\(displayName.lowercased())|\\(team.lowercased())|\\(position?.lowercased() ?? "")"
+
+        return BoardEntry(
+            id: id,
+            displayName: displayName,
+            team: team,
+            position: position,
+            headshotURL: headshotURL,
+            opponentAbbr: opponentAbbr,
+            isHome: isHome,
+            isPlayingTonight: isPlayingTonight,
+            playFadeRecommendation: proj?.playFadeRecommendation,
+            projectedScore: projectedScore,
+            projectedScoreFd: projectedScoreFd,
+            fpFloor: fpFloor,
+            fpCeiling: fpCeiling,
+            fpFloorFd: fpFloorFd,
+            fpCeilingFd: fpCeilingFd,
+            projectionTier: projectionTier,
+            confidenceScore: confidenceScore,
+            confidenceScoreFd: confidenceScoreFd,
+            isProjectionsLoading: false,
+            hotStreak: proj?.hotStreak,
+            coldStreak: proj?.coldStreak,
+            usageEfficiencySignal: proj?.usageEfficiencySignal,
+            avgFantasyScoreHome: nil,
+            avgFantasyScoreAway: nil,
+            opportunityScore: opp?.opportunityScore,
+            opportunityTier: opp?.opportunityTier,
+            isTopPick: opp?.isTopPick ?? false,
+            topPickRank: opp?.topPickRank,
+            injuryStatus: injuryStatus,
+            isConfirmedStarter: nil,
+            playerTier: proj?.projectionTier ?? opp?.opportunityTier,
+            seasonGames: nil,
+            playoffDataConfidence: nil,
+            isTopCeiling: false,
+            topCeilingRank: nil,
+            isTopValue: false,
+            topValueRank: nil,
+            gameDateTime: opp?.gameDateTime,
+            battingOrder: opp?.battingOrder,
+            probablePitcher: opp?.probablePitcher,
+            parkFactor: opp?.parkFactor,
+            topPickReasons: opp?.topPickReasons ?? [],
+            trendDirection: proj?.trendDirection,
+            recentGameScores: nil,
+            upcomingGames: proj?.upcomingGames,
+            rotationTier: opp?.rotationTier,
+            trendHits: proj?.trendHits ?? opp?.trendHits,
+            trendHR: proj?.trendHR ?? opp?.trendHR,
+            trendRBI: proj?.trendRBI ?? opp?.trendRBI,
+            trendRuns: proj?.trendRuns ?? opp?.trendRuns,
+            trendSB: proj?.trendSB ?? opp?.trendSB,
+            trendDoubles: proj?.trendDoubles ?? opp?.trendDoubles,
+            trendTB: proj?.trendTB ?? opp?.trendTB,
+            seasonAvg: proj?.seasonAvg ?? opp?.seasonAvg,
+            seasonOBP: proj?.seasonOBP ?? opp?.obpProxy,
+            seasonSLG: proj?.seasonSLG,
+            seasonOPS: proj?.seasonOPS,
+            seasonWAR: proj?.seasonWAR,
+            wobaProxy: proj?.wobaProxy ?? opp?.wobaProxy,
+            obpProxy: proj?.obpProxy ?? opp?.obpProxy,
+            avgPaPerGame: proj?.avgPaPerGame ?? opp?.avgPaPerGame,
+            propLines: opp?.propLines,
+            searchHaystack: searchHaystack
+        )
     }}
 }}
 """
