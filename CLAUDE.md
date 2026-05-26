@@ -67,6 +67,11 @@ Generated apps expect these SPM packages to be present in the target:
 - **Swinject** ≥ 2.9.0 — Dependency injection
 - **Firebase** ≥ 11.0.0 — Auth, Firestore, Analytics, AppCheck
 
+## Branch Policy
+- **Always commit and push to `develop`** — this is the default integration branch for all work.
+- **Never touch `main`** without explicit permission from the user. Do not push, merge, rebase, or force-push to `main` under any circumstances unless directly instructed.
+- If a task would require merging to `main`, stop and ask first.
+
 ## Template Sync
 
 When modifying `scaffold.sh`, the Python template strings inside it are the source of truth for generated code. If you change a template inside `scaffold.sh`, the change applies to all future scaffolds of that file type. There are no separate template files — templates are embedded directly in the script.
