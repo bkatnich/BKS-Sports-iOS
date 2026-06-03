@@ -42,7 +42,7 @@ positions:
   - label: Pitchers
     terms: [Pitchers, P]
   - label: Infielders
-    terms: [Infielder, Inf, First Base, FB, Second Base, SB, Short Stop, SS, Third Base, TB, Catcher, C]
+    terms: [Infielder, Inf, First Base, FB, Second Base, 2B, Short Stop, SS, Third Base, 3B, Catcher, C]
   - label: Outfielders
     terms: [Outfielder, Out, Right Fielder, RF, Center Fielder, Centre Fielder, CF, Left Fielder, LF]
 

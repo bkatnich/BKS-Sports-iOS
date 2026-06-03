@@ -473,9 +473,14 @@ import OSLog
 
 /// Actor that coalesces concurrent async fetch calls into a single in-flight Task.
 ///
-/// When a second caller arrives while a fetch is already running, it awaits the
-/// existing Task's result rather than spawning a new network request. This prevents
-/// duplicate Cloud Run cold-starts when a silent push and the board's onAppear race.
+/// When a second caller arrives while a fetch is already running, it joins the
+/// existing Task rather than spawning a new network request. This prevents duplicate
+/// Cloud Run cold-starts when a silent push and the board's onAppear race.
+///
+/// Caller cancellation is intentionally decoupled from the shared Task: if a caller
+/// is cancelled (e.g. the view disappears mid-flight), the underlying network request
+/// continues to completion so the next caller finds `inflight` still set and joins it
+/// rather than firing a duplicate request.
 actor FetchCoalescer<Value: Sendable> {{
     private var inflight: Task<Value, Error>?
 
@@ -484,14 +489,34 @@ actor FetchCoalescer<Value: Sendable> {{
         label: StaticString,
         work: @Sendable @escaping () async throws -> Value
     ) async throws -> Value {{
+        let task: Task<Value, Error>
         if let existing = inflight {{
             logger.debug("\\(label, privacy: .public) — joining in-flight request")
-            return try await existing.value
+            task = existing
+        }} else {{
+            // Cleanup task clears `inflight` once work finishes (success or failure)
+            // so the next caller spawns a fresh request rather than joining a dead task.
+            let newTask = Task<Value, Error> {{ try await work() }}
+            inflight = newTask
+            task = newTask
+            Task<Void, Never> {{
+                _ = try? await newTask.value
+                self.clearInflight()
+            }}
         }}
-        let task = Task<Value, Error> {{ try await work() }}
-        inflight = task
-        defer {{ inflight = nil }}
-        return try await task.value
+
+        // Await the shared task's result without propagating this caller's cancellation
+        // into it. If this caller is cancelled, CancellationError is thrown here, but
+        // the shared task keeps running so subsequent callers can still join it.
+        return try await withTaskCancellationHandler {{
+            try await task.value
+        }} onCancel: {{
+            // Intentionally empty: do not cancel the shared task on caller cancellation.
+        }}
+    }}
+
+    private func clearInflight() {{
+        inflight = nil
     }}
 }}
 """
@@ -757,7 +782,7 @@ def stat_pill_line(s, entry_var="entry", config_var="sportConfig"):
         value = f'{entry_var}.minutes'
         color_arg = ""
     else:
-        value = f'"\\\\({entry_var}.{key})"'
+        value = f'"\\({entry_var}.{key})"'
         color_arg = ""
 
     return f"""\
@@ -4023,6 +4048,11 @@ struct BoardState {{
 
             case .refreshRequested:
                 state.isBackgroundRefreshing = false
+                state.allEntries = []
+                state.filteredEntries = []
+                state.groupedEntries = []
+                state.todayGames = []
+                state.dailyAnalysis = nil
                 state.loadState = .loading
                 return await fetchAll(
                     boardService: boardService,
@@ -4032,8 +4062,9 @@ struct BoardState {{
             case .backgroundRefreshRequested:
                 // Skip if a fetch is already in flight — the in-flight result will be fresher.
                 if case .loading = state.loadState {{ return nil }}
-                if case .loaded = state.loadState {{ state.isBackgroundRefreshing = true }}
-                state.loadState = .loading
+                // Keep loadState as-is so the live board is not replaced by a skeleton.
+                // isBackgroundRefreshing signals the banner overlay instead.
+                state.isBackgroundRefreshing = true
                 return await fetchAll(
                     boardService: boardService,
                     analysisService: analysisService
@@ -4412,16 +4443,22 @@ struct BoardState {{
         from entries: [BoardEntry],
         positionMap: SportPositionMap
     ) -> [(position: String, picks: [BoardEntry])] {{
-        positionMap.filterChips.compactMap {{ chip in
-            let picks = entries
-                .filter {{ positionMap.matchesChip(chip, position: $0.position) }}
-                .sorted {{
-                    let tierA = $0.playerTier?.tierSortOrder ?? Int.max
-                    let tierB = $1.playerTier?.tierSortOrder ?? Int.max
-                    if tierA != tierB {{ return tierA < tierB }}
-                    return ($0.opportunityScore ?? 0) > ($1.opportunityScore ?? 0)
-                }}
-            guard !picks.isEmpty else {{ return nil }}
+        // Single O(M) pass: bucket each entry into every chip it matches, then
+        // map over filterChips to restore the canonical chip order.
+        var buckets: [String: [BoardEntry]] = [:]
+        for entry in entries {{
+            for chip in positionMap.filterChips where positionMap.matchesChip(chip, position: entry.position) {{
+                buckets[chip, default: []].append(entry)
+            }}
+        }}
+        return positionMap.filterChips.compactMap {{ chip in
+            guard var picks = buckets[chip], !picks.isEmpty else {{ return nil }}
+            picks.sort {{
+                let tierA = $0.playerTier?.tierSortOrder ?? Int.max
+                let tierB = $1.playerTier?.tierSortOrder ?? Int.max
+                if tierA != tierB {{ return tierA < tierB }}
+                return ($0.opportunityScore ?? 0) > ($1.opportunityScore ?? 0)
+            }}
             return (position: chip, picks: picks)
         }}
     }}
