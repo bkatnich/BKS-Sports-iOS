@@ -122,6 +122,9 @@ gamelog         = spec.get("gamelog", {})
 season       = spec.get("season", {})
 has_playoffs = season.get("hasPlayoffs", False)
 season_modes = season.get("modes", ["regular_season", "playoffs", "offseason"])
+game_detail       = spec.get("gameDetail", {})
+spread_label      = game_detail.get("spreadLabel", "Spread")
+spread_pick_label = game_detail.get("spreadPickLabel", "BK Pick")
 
 def season_mode_case(raw):
     """Convert a snake_case mode string to a Swift enum case declaration."""
@@ -1058,6 +1061,10 @@ struct {type_prefix}App: App {{
     @State private var splashDismissed = false
     @State private var pendingConsentResult: AuthResult?
     @State private var isErasingCache = false
+    /// True once refreshEntitlement() has completed. Guards the board from fetching
+    /// before the backend has confirmed the user's subscription state, preventing
+    /// spurious 402 responses for users on non-expiring tiers.
+    @State private var entitlementReady = false
     #if DEBUG
     @State private var frameMonitor = FrameDropMonitor()
     #endif
@@ -1156,7 +1163,9 @@ struct {type_prefix}App: App {{
                     activityService: activityService,
                     sportConfig: SportConfiguration.{slug},
                     isErasingCache: $isErasingCache,
-                    onEraseCachedData: eraseCachedData
+                    onEraseCachedData: eraseCachedData,
+                    onForceRefresh: forceRefreshGameData,
+                    entitlementReady: entitlementReady
                 )
             }} consentContent: {{ result in
                 subscriptionConsentView(for: result)
@@ -1181,7 +1190,11 @@ struct {type_prefix}App: App {{
                 profileStore.send(.onAppear)
                 await BKSAppScaffold.registerForPushNotifications()
                 await subscriptionService.refreshEntitlement()
+                entitlementReady = true
                 await subscriptionService.fetchProducts()
+                #if DEBUG
+                frameMonitor.start()
+                #endif
             }}
             .onReceive(
                 NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
@@ -1196,9 +1209,8 @@ struct {type_prefix}App: App {{
             }}
             .onReceive(
                 NotificationCenter.default.publisher(for: DataRefreshTask.dataDidRefreshNotification)
+                    .receive(on: RunLoop.main)
             ) {{ _ in
-                // Use .backgroundRefreshRequested (cancelsInFlightWork = false) so that a
-                // silent push arriving during app launch does not cancel the in-flight board fetch.
                 boardStore.send(.backgroundRefreshRequested)
             }}
             .onReceive(
@@ -1223,6 +1235,18 @@ struct {type_prefix}App: App {{
         boardStore.send(.refreshRequested)
         Task.detached(priority: .userInitiated) {{ [storage] in
             try? storage.deleteAll(from: .file)
+        }}
+    }}
+
+    private func forceRefreshGameData() {{
+        let gameDataKeys = opportunitiesService.cacheKeys
+            + projectionsService.cacheKeys
+            + ["daily_analysis_v2"]
+        Task.detached(priority: .userInitiated) {{ [storage, gamesService] in
+            for key in gameDataKeys {{
+                try? storage.delete(forKey: key, from: .file)
+            }}
+            gamesService.clearCachedGameLogs()
         }}
     }}
 
@@ -1437,6 +1461,8 @@ struct {swift_name}AppShell: View {{
     let sportConfig: any SportConfigurationProtocol
     @Binding var isErasingCache: Bool
     let onEraseCachedData: () -> Void
+    let onForceRefresh: () -> Void
+    let entitlementReady: Bool
     @EnvironmentObject var networkMonitor: NetworkMonitor
 
     var body: some View {{
@@ -1452,7 +1478,9 @@ struct {swift_name}AppShell: View {{
                 promoCodeService: promoCodeService,
                 activityService: activityService,
                 sportConfig: sportConfig,
-                onEraseCachedData: onEraseCachedData
+                onEraseCachedData: onEraseCachedData,
+                onForceRefresh: onForceRefresh,
+                entitlementReady: entitlementReady
             )
         }}
     }}
@@ -4481,11 +4509,14 @@ struct BoardView: View {{
     let activityService: any ActivityFeedServiceProtocol
     let sportConfig: any SportConfigurationProtocol
     let onEraseCachedData: () -> Void
+    let onForceRefresh: () -> Void
+    let entitlementReady: Bool
 
     @State private var showProfile = false
     @State private var showInbox = false
     @State private var showPaywall = false
     @State private var selectedGame: ScheduledGame?
+    @State private var bannerDismissTask: Task<Void, Never>?
     private let notificationLogger = PushNotificationLogger.shared
 
     private var searchBinding: Binding<String> {{
@@ -4515,11 +4546,38 @@ struct BoardView: View {{
         return false
     }}
 
-    private var subtitleText: String {{
+    private func resolvedGameInsight(for game: ScheduledGame) -> GameInsight? {{
+        let analysis = store.state.dailyAnalysis
+        if let insight = analysis?.gameInsights?[String(game.id)] {{
+            return insight
+        }}
+        guard let section = analysis?.slateNarrativeSections?.first(where: {{
+            $0.title.contains(game.visitorTeamAbbr) && $0.title.contains(game.homeTeamAbbr)
+        }}) else {{ return nil }}
+        return GameInsight(
+            gameId: String(game.id),
+            homeTeam: game.homeTeamAbbr,
+            awayTeam: game.visitorTeamAbbr,
+            generatedAt: analysis?.generatedAt ?? Date.now,
+            gameEnvironment: .neutral,
+            lineMovementSignal: .neutral,
+            matchupNarrative: section.body,
+            keyPlayers: [],
+            gameStackTargets: [],
+            injuryFlags: []
+        )
+    }}
+
+    private var titleText: String {{
         let weekday = weekdayName(from: store.state.serverDateString)
+        return String(localized: "board.title", defaultValue: "\\(weekday)'s Blackboard")
+    }}
+
+    private var subtitleText: String {{
         let count = store.state.gameCount
-        let gamesLabel = String(localized: "board.subtitle.games", defaultValue: "games")
-        return "\\(weekday) · \\(count) \\(gamesLabel)"
+        let dateStr = formattedDate(from: store.state.serverDateString)
+        let gamesStr = String(localized: "board.subtitle.games", defaultValue: "\\(count) games")
+        return "\\(dateStr) · \\(gamesStr)"
     }}
 
     var body: some View {{
@@ -4552,24 +4610,33 @@ struct BoardView: View {{
                     SlateAnalysisView(analysis: analysis)
                 }}
         }}
-        .task {{
+        .task(id: entitlementReady) {{
+            guard entitlementReady else {{ return }}
+            if case .loading = store.state.loadState {{ return }}
             Perf.event("BoardViewTask")
             store.send(.onAppear)
         }}
         .onChange(of: store.state.isBackgroundRefreshing) {{ _, isRefreshing in
+            bannerDismissTask?.cancel()
             guard isRefreshing else {{ return }}
-            Task {{
+            bannerDismissTask = Task {{
                 try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled else {{ return }}
                 store.send(.refreshBannerExpired)
             }}
+        }}
+        .onDisappear {{
+            bannerDismissTask?.cancel()
+            bannerDismissTask = nil
         }}
         .sheet(item: $selectedGame) {{ game in
             let oddsKey = "\\(game.visitorTeamAbbr)@\\(game.homeTeamAbbr):\\(game.gameSequence)"
             GameDetailSheet(
                 game: game,
                 odds: store.state.gameOdds[oddsKey],
-                spreadLabel: String(localized: "gameDetail.spreadLine", defaultValue: "Spread Line"),
-                spreadPickLabel: String(localized: "gameDetail.bkSpreadPick", defaultValue: "BK Pick")
+                spreadLabel: String(localized: "gameDetail.spreadLabel", defaultValue: "{spread_label}"),
+                spreadPickLabel: String(localized: "gameDetail.spreadPickLabel", defaultValue: "{spread_pick_label}"),
+                gameInsight: resolvedGameInsight(for: game)
             )
             .presentationDetents([.medium, .large])
         }}
@@ -4594,24 +4661,26 @@ struct BoardView: View {{
     private var boardList: some View {{
         VStack(spacing: 0) {{
             BoardNavBar(
+                title: titleText,
                 subtitle: subtitleText,
                 isLoaded: {{
                     if case .loaded = store.state.loadState {{ return true }}
                     return false
                 }}(),
+                isRefreshing: isLoading || store.state.isBackgroundRefreshing,
                 unreadCount: notificationLogger.unreadCount,
                 onInbox: {{ showInbox = true }},
-                onProfile: {{ showProfile = true }}
+                onProfile: {{ showProfile = true }},
+                onRefresh: {{
+                    onForceRefresh()
+                    store.send(.refreshRequested)
+                }}
             )
             .skeletonPulse(delay: 0, active: isLoading)
 
-            if !store.state.todayGames.isEmpty {{
-                GamesStrip(games: store.state.todayGames) {{ game in
-                    game.isDoubleheader ? "DH · Game \\(game.gameSequence)" : nil
-                }} onSelect: {{ selectedGame = $0 }}
-                    .padding(.top, 8)
-                    .skeletonPulse(delay: 0.1, active: isLoading)
-            }}
+            GamesStripSkeleton(games: store.state.todayGames, isLoading: isLoading) {{ game in
+                game.isDoubleheader ? "DH · Game \\(game.gameSequence)" : nil
+            }} onSelect: {{ selectedGame = $0 }}
 
             SlateAnalysisCard(analysis: store.state.dailyAnalysis ?? store.state.analysisPreview.map {{
                 DailyAnalysis(
@@ -4695,12 +4764,46 @@ struct BoardView: View {{
         return fmt
     }}()
 
+    private static let monthFormatter: DateFormatter = {{
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMMM"
+        fmt.locale = .current
+        return fmt
+    }}()
+
     private func weekdayName(from serverDateString: String?) -> String {{
         guard let dateString = serverDateString,
               let date = Self.dateParseFormatter.date(from: dateString) else {{
             return Self.weekdayFormatter.string(from: Date.now)
         }}
         return Self.weekdayFormatter.string(from: date)
+    }}
+
+    private func formattedDate(from serverDateString: String?) -> String {{
+        let date: Date
+        if let dateString = serverDateString,
+           let parsed = Self.dateParseFormatter.date(from: dateString) {{
+            date = parsed
+        }} else {{
+            date = Date.now
+        }}
+        let month = Self.monthFormatter.string(from: date)
+        let day = Calendar.current.component(.day, from: date)
+        let year = Calendar.current.component(.year, from: date)
+        return "\\(month) \\(day)\\(daySuffix(day)), \\(year)"
+    }}
+
+    private func daySuffix(_ day: Int) -> String {{
+        switch day {{
+        case 11, 12, 13: return "th"
+        default:
+            switch day % 10 {{
+            case 1: return "st"
+            case 2: return "nd"
+            case 3: return "rd"
+            default: return "th"
+            }}
+        }}
     }}
 }}
 """
@@ -4781,27 +4884,23 @@ import SwiftUI
 // MARK: - BoardNavBar
 
 struct BoardNavBar: View {{
+    let title: String
     let subtitle: String
     let isLoaded: Bool
+    let isRefreshing: Bool
     let unreadCount: Int
     let onInbox: () -> Void
     let onProfile: () -> Void
+    let onRefresh: () -> Void
 
     var body: some View {{
         AppCustomNavBar(
-            title: String(localized: "board.title", defaultValue: "Today's Blackboard"),
-            subtitle: subtitle,
+            title: title,
+            subtitle: nil,
             slotWidth: 60,
             leading: {{
-                if isLoaded {{
-                    Image("InAppIcon")
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 48, height: 48)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                }} else {{
-                    Color.clear.frame(width: 48, height: 48)
-                }}
+                RefreshIconButton(isRefreshing: isRefreshing, onRefresh: onRefresh)
+                    .opacity(isLoaded || isRefreshing ? 1 : 0)
             }},
             trailing: {{
                 HStack(spacing: 16) {{
@@ -4833,6 +4932,56 @@ struct BoardNavBar: View {{
                 }}
             }}
         )
+        .overlay(alignment: .bottom) {{
+            Text(subtitle)
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.6))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .padding(.bottom, 10)
+        }}
+    }}
+}}
+
+// MARK: - RefreshIconButton
+
+/// Owns its own @State so the pulse animation lives in the same view that
+/// drives opacity — avoiding the lost-animation-at-init-boundary problem
+/// with AppCustomNavBar's eager leading() evaluation.
+private struct RefreshIconButton: View {{
+    let isRefreshing: Bool
+    let onRefresh: () -> Void
+
+    @State private var pulsing = false
+
+    var body: some View {{
+        Button(action: onRefresh) {{
+            Image("InAppIcon")
+                .resizable()
+                .scaledToFill()
+                .frame(width: 48, height: 48)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .opacity(pulsing ? 0.35 : 1.0)
+        }}
+        .buttonStyle(.plain)
+        .accessibilityLabel(String(localized: "a11y.label.refresh", defaultValue: "Refresh"))
+        .onAppear {{ if isRefreshing {{ startPulse() }} }}
+        .onChange(of: isRefreshing) {{ _, refreshing in
+            if refreshing {{ startPulse() }} else {{ stopPulse() }}
+        }}
+    }}
+
+    private func startPulse() {{
+        guard !pulsing else {{ return }}
+        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {{
+            pulsing = true
+        }}
+    }}
+
+    private func stopPulse() {{
+        withAnimation(.easeInOut(duration: 0.3)) {{
+            pulsing = false
+        }}
     }}
 }}
 """
@@ -4874,10 +5023,13 @@ import SwiftUI
 
 struct BoardScrollContent: View {{
     let loadState: ViewState<[BoardEntry]>
+    let isSubscriptionRequired: Bool
     let filteredEntries: [BoardEntry]
     let groupedEntries: [(position: String, picks: [BoardEntry])]
     let viewMode: BoardViewMode
+    let topPropOpportunities: [TopPropOpportunity]?
     let onRetry: () -> Void
+    let onShowPaywall: () -> Void
     let onRefresh: () -> Void
 
     var body: some View {{
@@ -4886,6 +5038,33 @@ struct BoardScrollContent: View {{
             case .idle, .loading:
                 BoardSkeletonView()
                     .padding(.bottom, 16)
+
+            case .failed where isSubscriptionRequired:
+                VStack(spacing: 16) {{
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.white.opacity(AppOpacity.muted))
+                    Text(String(
+                        localized: "board.subscriptionRequired.title",
+                        defaultValue: "Subscription Required"
+                    ))
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    Text(String(
+                        localized: "board.subscriptionRequired.body",
+                        defaultValue: "Your trial has ended. Subscribe to keep getting daily picks."
+                    ))
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(AppOpacity.muted))
+                        .multilineTextAlignment(.center)
+                    Button(String(localized: "board.subscriptionRequired.cta", defaultValue: "View Plans")) {{
+                        onShowPaywall()
+                    }}
+                    .buttonStyle(.borderedProminent)
+                }}
+                .padding(.top, 40)
+                .padding(.horizontal, 24)
 
             case .failed:
                 VStack(spacing: 12) {{
@@ -4905,21 +5084,33 @@ struct BoardScrollContent: View {{
                 .padding(.horizontal, 24)
 
             case .loaded:
-                if filteredEntries.isEmpty {{
-                    VStack(spacing: 12) {{
-                        Image(systemName: "sportscourt")
-                            .font(.system(size: 36))
-                            .foregroundStyle(.white.opacity(AppOpacity.muted))
-                        Text(String(localized: "board.empty", defaultValue: "No picks today"))
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(AppOpacity.muted))
-                            .multilineTextAlignment(.center)
-                    }}
-                    .padding(.top, 40)
-                    .padding(.horizontal, 24)
-                }} else {{
-                    switch viewMode {{
-                    case .flat:
+                switch viewMode {{
+                case .props:
+                    if let props = topPropOpportunities, !props.isEmpty {{
+                        LazyVStack(spacing: 0) {{
+                            ForEach(groupedProps(props), id: \\.key) {{ group in
+                                PropSectionHeader(title: group.key)
+                                ForEach(group.value) {{ prop in
+                                    PropOpportunityRow(prop: prop)
+                                    Divider().overlay(.white.opacity(0.1))
+                                }}
+                            }}
+                        }}
+                        .padding(.bottom, 16)
+                    }} else if filteredEntries.isEmpty {{
+                        VStack(spacing: 12) {{
+                            Image(systemName: "sportscourt")
+                                .font(.system(size: 36))
+                                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                            Text(String(localized: "board.empty", defaultValue: "No picks today"))
+                                .font(.subheadline)
+                                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                                .multilineTextAlignment(.center)
+                        }}
+                        .padding(.horizontal, 24)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .containerRelativeFrame(.vertical)
+                    }} else {{
                         LazyVStack(spacing: 0) {{
                             ForEach(filteredEntries, id: \\.id) {{ entry in
                                 NavigationLink(value: entry) {{
@@ -4929,7 +5120,7 @@ struct BoardScrollContent: View {{
                                             .font(.headline)
                                             .foregroundStyle(.white)
                                         if let score = entry.projectedScore {{
-                                            Text(String(format: "%.1f DK pts", score))
+                                            Text(String(format: "%.1f pts", score))
                                                 .font(.caption)
                                                 .foregroundStyle(.white.opacity(AppOpacity.muted))
                                         }}
@@ -4943,8 +5134,22 @@ struct BoardScrollContent: View {{
                             }}
                         }}
                         .padding(.bottom, 16)
+                    }}
 
-                    case .byPosition:
+                case .draftKings, .fanDuel:
+                    if groupedEntries.isEmpty {{
+                        VStack(spacing: 12) {{
+                            Image(systemName: "sportscourt")
+                                .font(.system(size: 36))
+                                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                            Text(String(localized: "board.empty", defaultValue: "No picks today"))
+                                .font(.subheadline)
+                                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                                .multilineTextAlignment(.center)
+                        }}
+                        .padding(.top, 40)
+                        .padding(.horizontal, 24)
+                    }} else {{
                         VStack(spacing: 0) {{
                             ForEach(groupedEntries, id: \\.position) {{ group in
                                 HStack {{
@@ -4978,6 +5183,18 @@ struct BoardScrollContent: View {{
         }}
         .refreshable {{ onRefresh() }}
         .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
+    }}
+
+    private func groupedProps(_ props: [TopPropOpportunity]) -> [(key: String, value: [TopPropOpportunity])] {{
+        var seen = Set<String>()
+        var order: [String] = []
+        var buckets: [String: [TopPropOpportunity]] = [:]
+        for prop in props {{
+            let key = prop.marketType
+            if seen.insert(key).inserted {{ order.append(key) }}
+            buckets[key, default: []].append(prop)
+        }}
+        return order.map {{ (key: $0, value: buckets[$0]!) }}
     }}
 }}
 """
@@ -6947,6 +7164,14 @@ iOS app built with Swift and SwiftUI, targeting iOS {deploy_tgt}+. Uses Swift Pa
 - **Lint**: `swiftlint`
 - **Regenerate project**: `./generate.sh` (from repo root — runs xcodegen then syncs both Package.resolved files)
   - **Never** run `xcodegen generate` directly; always use `./generate.sh` to keep the inner and outer Package.resolved in sync
+- **After every build cycle** (mandatory, no exceptions): Always nuke DerivedData, re-resolve, and sync both Package.resolved files:
+  ```
+  rm -rf ~/Library/Developer/Xcode/DerivedData/{app_target}-*
+  xcodebuild -resolvePackageDependencies -scheme {app_target}
+  cp App/{app_target}.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved *.xcworkspace/xcshareddata/swiftpm/Package.resolved
+  ```
+  This is required after every build, tag, package bump, or significant change — not just SPM version bumps. Skipping causes stale SPM source, phantom build errors, and layout bugs that are invisible until device.
+- **Before completing any task**: Run `swiftlint` and verify it produces no warnings or errors in app source. Confirm both `Package.resolved` files are in sync. Run a full build and confirm `BUILD SUCCEEDED` with no `error:` or `warning:` lines beyond the `appintentsmetadataprocessor` tooling noise.
 
 ## Code Standards
 - Use async/await for all new concurrency code (no Combine for new work)
