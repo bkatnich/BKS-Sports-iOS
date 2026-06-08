@@ -278,6 +278,10 @@ api:
   leagueState:
     url: ""
 
+gameDetail:
+  spreadLabel: "Spread"
+  spreadPickLabel: "BK Pick"
+
   playoffBracket:
     url: ""
     # No query params sent — server defaults to current playoff year

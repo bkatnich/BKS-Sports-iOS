@@ -267,6 +267,10 @@ api:
 
   playoffBracket:
     url: ""
+
+gameDetail:
+  spreadLabel: "Run Line"
+  spreadPickLabel: "Run Line Pick"
     # No query params sent — server defaults to current playoff year
 
   gameLog:
