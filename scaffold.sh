@@ -33,19 +33,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ── argument check ───────────────────────────────────────────────────────────
 
 DRY_RUN=0
+REGEN_PROJECT=0
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dry-run) DRY_RUN=1; shift ;;
+        --dry-run)       DRY_RUN=1;       shift ;;
+        --regen-project) REGEN_PROJECT=1; shift ;;
         *) POSITIONAL+=("$1"); shift ;;
     esac
 done
 
 if [[ ${#POSITIONAL[@]} -lt 1 ]]; then
-    echo "Usage: $0 [--dry-run] <sport-slug> [output-dir]"
+    echo "Usage: $0 [--dry-run] [--regen-project] <sport-slug> [output-dir]"
     echo "  e.g. $0 baseball"
     echo "  e.g. $0 baseball /path/to/BKS-Baseball-Client-iOS"
-    echo "  e.g. $0 --dry-run baseball    (print what would be generated, no writes)"
+    echo "  e.g. $0 --dry-run baseball          (print what would be generated, no writes)"
+    echo "  e.g. $0 --regen-project baseball    (overwrite existing project.yml)"
     exit 1
 fi
 
@@ -67,7 +70,7 @@ fi
 
 # ── python helper: parse yaml and emit scaffold ───────────────────────────────
 
-SCRIPT_DIR="$SCRIPT_DIR" SPORT_SLUG="$SPORT_SLUG" OUTPUT_DIR="$OUTPUT_DIR" DRY_RUN="$DRY_RUN" python3 << 'PYEOF'
+SCRIPT_DIR="$SCRIPT_DIR" SPORT_SLUG="$SPORT_SLUG" OUTPUT_DIR="$OUTPUT_DIR" DRY_RUN="$DRY_RUN" REGEN_PROJECT="$REGEN_PROJECT" python3 << 'PYEOF'
 import sys, os, re, textwrap
 sys.path.insert(0, '')
 
@@ -80,7 +83,8 @@ except ImportError:
 SCRIPT_DIR  = os.environ["SCRIPT_DIR"]
 SPORT_SLUG  = os.environ["SPORT_SLUG"]
 OUTPUT_DIR  = os.environ.get("OUTPUT_DIR", "")  # empty string means auto-derive
-DRY_RUN     = os.environ.get("DRY_RUN", "0") == "1"
+DRY_RUN        = os.environ.get("DRY_RUN", "0") == "1"
+REGEN_PROJECT  = os.environ.get("REGEN_PROJECT", "0") == "1"
 
 # ── load spec ─────────────────────────────────────────────────────────────────
 
@@ -434,26 +438,37 @@ write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"NotificationPreferen
 #     Maps raw FCM event strings → preference keys for this sport.
 # ─────────────────────────────────────────────────────────────────────────────
 
-if visible_push_events:
-    from collections import defaultdict as _defaultdict
-    pref_to_events = _defaultdict(list)
-    for e in visible_push_events:
-        pref_key = e.get("preferenceKey", "playoffAlerts")
-        pref_to_events[pref_key].append(e["rawValue"])
-    fcm_case_lines = []
-    for pref_key, raw_values in pref_to_events.items():
-        quoted = ", ".join(f'"{v}"' for v in raw_values)
-        fcm_case_lines.append(f'        case {quoted}:\n            self = .{pref_key}')
-    fcm_cases = "\n".join(fcm_case_lines)
-else:
-    fcm_cases = ""
+from collections import defaultdict as _defaultdict
+
+# visiblePushEvents with an explicit preferenceKey → auto-generated switch cases.
+# Events without preferenceKey (e.g. analysisReady) fall through to the default arm.
+pref_to_events = _defaultdict(list)
+for e in visible_push_events:
+    if "preferenceKey" in e:
+        pref_to_events[e["preferenceKey"]].append(e["rawValue"])
+# playoffAlerts covers the four playoff VisiblePushEvents that have no preferenceKey
+playoff_raw = [e["rawValue"] for e in visible_push_events if "preferenceKey" not in e and e["name"] not in ("analysisReady",)]
+if playoff_raw:
+    pref_to_events["playoffAlerts"].extend(playoff_raw)
+
+fcm_case_lines = []
+for pref_key, raw_values in pref_to_events.items():
+    quoted = ", ".join(f'"{v}"' for v in raw_values)
+    fcm_case_lines.append(f'        case {quoted}:\n            self = .{pref_key}')
+
+# coreEventMappings: server events that aren't VisiblePushEvents but still map to prefs.
+core_event_mappings = fcm.get("coreEventMappings", [])
+for m in core_event_mappings:
+    fcm_case_lines.append(f'        case "{m["rawValue"]}":\n            self = .{m["preferenceKey"]}')
+
+fcm_cases = "\n".join(fcm_case_lines)
 
 notif_fcm_swift = header() + f"""\
 import BKSCore
 
 extension NotificationPreferenceKey {{
     /// Maps FCM event strings to preference keys for the {name} app.
-    /// Sport-specific playoff events are handled here; core events delegate to BKSCore.
+    /// Sport-specific events are handled here; core events delegate to BKSCore.
     init?(fcmEvent: String) {{
         switch fcmEvent {{
 {fcm_cases}
@@ -821,6 +836,7 @@ struct GameLogPlaceholderView: View {{
                 Image(systemName: "calendar.badge.exclamationmark")
                     .font(.callout)
                     .foregroundStyle(.white.opacity(AppOpacity.dim))
+                    .accessibilityHidden(true)
                 Text(String(localized: "No games found", defaultValue: "No games found"))
                     .font(.caption)
                     .foregroundStyle(.white.opacity(AppOpacity.separator))
@@ -880,6 +896,7 @@ struct GameLogTableView: View {{
         }}
         .font(AppFonts.gameLogHeader)
         .lineLimit(1)
+        .minimumScaleFactor(0.8)
         .accessibilityElement(children: .combine)
     }}
 
@@ -938,6 +955,7 @@ struct GameLogTableView: View {{
             }}
             .font(AppFonts.gameLogHeader)
             .lineLimit(1)
+            .minimumScaleFactor(0.8)
 
             Text(String(localized: "gamelog.dnp", defaultValue: "DNP"))
                 .font(AppFonts.gameLogCell)
@@ -978,6 +996,7 @@ struct GameLogErrorView: View {{
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.callout)
                 .foregroundStyle(.white.opacity(AppOpacity.separator))
+                .accessibilityHidden(true)
             Text(String(localized: "Failed to load game log", defaultValue: "Failed to load game log"))
                 .font(.caption)
                 .foregroundStyle(.white.opacity(AppOpacity.secondary))
@@ -4593,6 +4612,7 @@ struct BoardView: View {{
                         credential: credential,
                         profileStore: profileStore,
                         promoCodeService: promoCodeService,
+                        seasonMode: store.state.seasonMode,
                         onEraseCachedData: {{ // swiftlint:disable:this trailing_closure
                             showProfile = false
                             onEraseCachedData()
@@ -4823,6 +4843,7 @@ struct ProfileContainerView: View {{
     let credential: StoredCredential
     @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
     let promoCodeService: PromoCodeServiceProtocol
+    let seasonMode: SeasonMode
     let onEraseCachedData: () -> Void
 
     var body: some View {{
@@ -4834,26 +4855,59 @@ struct ProfileContainerView: View {{
             appName: String(localized: "app.name", defaultValue: "{app_name}"),
             onEraseCachedData: onEraseCachedData
         ) {{
-            NotificationsDetailView(profileStore: profileStore)
+            NotificationsDetailView(profileStore: profileStore, seasonMode: seasonMode)
         }}
     }}
 }}
 """
 
-playoff_toggle = """
+# Build one Toggle block per notificationPreferences entry in the YAML.
+def make_toggle(key, raw_value, label, system_image):
+    loc_key = f"profile.row.notifications.{key}"
+    a11y_id = f"profile.notification.{raw_value}"
+    return f"""
             Toggle(isOn: Binding(
-                get: { profileStore.state.preferences.notificationPreferences.isEnabled(.playoffAlerts) },
-                set: { profileStore.send(.notificationPreferenceToggled(.playoffAlerts, $0)) }
-            )) {
+                get: {{ profileStore.state.preferences.notificationPreferences.isEnabled(.{key}) }},
+                set: {{ profileStore.send(.notificationPreferenceToggled(.{key}, $0)) }}
+            )) {{
                 Label(
-                    String(localized: "profile.row.notifications.playoff",
-                           defaultValue: "Playoff Alerts"),
-                    systemImage: "trophy.fill"
+                    String(localized: "{loc_key}",
+                           defaultValue: "{label}"),
+                    systemImage: "{system_image}"
                 )
                 .foregroundStyle(.white)
-            }
+            }}
             .tint(.accentColor)
-            .accessibilityIdentifier("profile.notification.playoff_alerts")""" if has_playoffs else "            EmptyView()"
+            .accessibilityIdentifier("{a11y_id}")"""
+
+dynamic_toggles = "".join(
+    make_toggle(
+        p["key"],
+        p["rawValue"],
+        p.get("label", p["key"]),
+        p.get("systemImage", "bell.fill"),
+    )
+    for p in notif_prefs
+)
+
+playoff_toggle_block = """
+            if seasonMode == .playoffs {
+                Toggle(isOn: Binding(
+                    get: { profileStore.state.preferences.notificationPreferences.isEnabled(.playoffAlerts) },
+                    set: { profileStore.send(.notificationPreferenceToggled(.playoffAlerts, $0)) }
+                )) {
+                    Label(
+                        String(localized: "profile.row.notifications.playoff",
+                               defaultValue: "Playoff Alerts"),
+                        systemImage: "trophy.fill"
+                    )
+                    .foregroundStyle(.white)
+                }
+                .tint(.accentColor)
+                .accessibilityIdentifier("profile.notification.playoff_alerts")
+            }""" if has_playoffs else ""
+
+notif_detail_body = dynamic_toggles + playoff_toggle_block
 
 notifications_detail_swift = header() + f"""import BKSCore
 import BKSUICore
@@ -4865,12 +4919,13 @@ import SwiftUI
 
 struct NotificationsDetailView: View {{
     @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    let seasonMode: SeasonMode
 
     var body: some View {{
         BKSNotificationsView(
             profileStore: profileStore,
             appName: String(localized: "app.name", defaultValue: "{app_name}")
-        ) {{{playoff_toggle}
+        ) {{{notif_detail_body}
         }}
     }}
 }}
@@ -6319,7 +6374,12 @@ targets:
       - target: {app_target}
 """
 
-write(os.path.join(out_dir, "App/project.yml"), project_yml)
+# project.yml is write_if_absent by default — existing projects typically
+# have a hand-tuned project.yml. Pass --regen-project to overwrite.
+if REGEN_PROJECT:
+    write(os.path.join(out_dir, "App/project.yml"), project_yml)
+else:
+    write_if_absent(os.path.join(out_dir, "App/project.yml"), project_yml)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. xcconfig files
@@ -7159,8 +7219,8 @@ claude_md = f"""# CLAUDE.md
 iOS app built with Swift and SwiftUI, targeting iOS {deploy_tgt}+. Uses Swift Package Manager for dependencies.
 
 ## Build & Test Commands
-- **Build**: `xcodebuild -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'`
-- **Test**: `xcodebuild test -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'`
+- **Build**: `xcodebuild -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`
+- **Test**: `xcodebuild test -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`
 - **Lint**: `swiftlint`
 - **Regenerate project**: `./generate.sh` (from repo root — runs xcodegen then syncs both Package.resolved files)
   - **Never** run `xcodegen generate` directly; always use `./generate.sh` to keep the inner and outer Package.resolved in sync
@@ -7197,6 +7257,11 @@ This project was scaffolded by the **BKS-Sports-iOS** code generator:
 https://github.com/bkatnich/BKS-Sports-iOS
 
 The generator takes `sports/{slug}.yaml` and produces the sport-specific Swift files. If the generator's templates change, re-run `./scaffold.sh {slug}` from the template repo to regenerate those files.
+
+`project.yml` is **write-if-absent** by default — re-running the scaffold never overwrites it. To regenerate it from the YAML spec, pass `--regen-project`:
+```
+./scaffold.sh --regen-project {slug}
+```
 
 **Do NOT** automatically propagate changes from this project back to the template repo. Always ask for explicit permission before modifying files in the BKS-Sports-iOS generator.
 

@@ -491,11 +491,28 @@ fcm:
       rawValue: bracket_advance
     - name: analysisReady
       rawValue: analysis_ready
-      preferenceKey: analysisAlerts
+    - name: propPredictionsReady
+      rawValue: prop_predictions_ready
+      preferenceKey: predictionsReady
+  # Core FCM event strings that map to sport-defined preference keys.
+  # These are server-side event names NOT emitted by visiblePushEvents (no VisiblePushEvent model).
+  coreEventMappings:
+    - rawValue: games_update
+      preferenceKey: gameUpdates
+    - rawValue: data_freshness
+      preferenceKey: pregameAlerts
   notificationPreferences:
-    - key: analysisAlerts
-      rawValue: analysis_alerts
-      label: Analysis Alerts
+    - key: gameUpdates
+      rawValue: game_updates
+      label: Game Updates
+      systemImage: sportscourt.fill
+    - key: pregameAlerts
+      rawValue: pregame_alerts
+      label: Pregame Alerts
+      systemImage: bell.badge.fill
+    - key: predictionsReady
+      rawValue: predictions_ready
+      label: Predictions Ready
       systemImage: brain.head.profile
 
 # ---------------------------------------------------------------------------
