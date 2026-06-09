@@ -6926,6 +6926,11 @@ Sources/
 - **Features/*/Store/**: UI Agent (state) or Data Agent (service wiring)
 - **Tests/**: Test Agent
 
+## Branch Policy
+- **Always commit and push to `develop`** — this is the default integration branch for all work.
+- **Never touch `main`** without explicit permission from the user. Do not push, merge, rebase, or force-push to `main` under any circumstances unless directly instructed.
+- If a task would require merging to `main`, stop and ask first.
+
 ## Xcode Project Protection
 - **NEVER** remove or modify the `FIRAAppCheckDebugToken` environment variable from any Xcode scheme. This is the Firebase App Check debug token required for API access in debug builds. Deleting it breaks all authenticated network calls.
 - **NEVER** change the Development Team identifier (`DEVELOPMENT_TEAM`) in `project.yml` or the Xcode project settings. This is tied to the signing certificate and provisioning profiles.
