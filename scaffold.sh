@@ -3287,7 +3287,9 @@ private struct SeriesDTO: Decodable {{
 }}
 """
 
-write_if_absent(os.path.join(services_dir, "ProjectionsService.swift"), projections_service_swift)
+# ProjectionsService is NOT written by default. BoardState.makeReduce no longer takes a
+# projections service — the template variable above is kept for reference but should only
+# be emitted for sports that genuinely need a separate projections endpoint.
 write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
 # PlayoffService merged into GamesService — fetchPlayoffBracket() is now in GamesService
 # write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
@@ -3689,20 +3691,22 @@ struct BoardLoadResult {{
     let gameOdds: [String: GameOdds]
     let serverDateString: String?
     let dailyAnalysis: DailyAnalysis?
-    let analysisPreview: String?
     let playoffSeries: [PlayoffSeries]
-    let nextPageOffset: Int
-    let hasMorePages: Bool
     let totalOpportunities: Int
     /// ISO 8601 UTC timestamp of the last sync_today_games run. Nil until the board response arrives.
     let scheduleSyncedAt: String?
+    /// Server-ranked prop opportunities. Nil before ~12:30 PM ET.
+    let topPropOpportunities: [TopPropOpportunity]?
 }}
 
 // MARK: - BoardViewMode
 
-enum BoardViewMode: String {{
-    case flat
-    case byPosition
+enum BoardViewMode: String, Hashable {{
+    case props
+    /// Deferred: requires per-player salary data not yet available from the backend.
+    case draftKings
+    /// Deferred: requires per-player salary data not yet available from the backend.
+    case fanDuel
 }}
 
 // MARK: - BoardIntent
@@ -3723,20 +3727,21 @@ enum BoardIntent: CancellableIntent {{
     case deepLinkHandled
     case refreshBannerExpired
     case diskCacheLoaded(BoardLoadResult)
-    case loadNextPage
-    case nextPageLoaded(OpportunitiesPageResult)
-    /// Projections arrived after the board already rendered from opportunity data.
-    /// Enriches existing entries without replacing them.
-    case projectionsLoaded([Projection])
+    /// User committed a new prop feed filter from the filter sheet.
+    case propFeedFilterChanged(PropFeedFilter)
 
     var cancelsInFlightWork: Bool {{
         switch self {{
+        // Pure synchronous mutations — never interrupt long-running fetches.
         case .navigationPathChanged, .searchTextChanged, .positionFilterChanged,
              .tierFilterChanged, .viewModeChanged, .pushNotificationTapped,
              .deepLinkHandled, .refreshBannerExpired, .diskCacheLoaded,
-             .loadNextPage, .nextPageLoaded, .backgroundRefreshRequested,
-             .projectionsLoaded:
+             .propFeedFilterChanged:
             false
+        // backgroundRefreshRequested is cancellable so the Store tracks it in
+        // currentTask. This lets a subsequent .refreshRequested cancel it, and
+        // ensures the dedup guard in makeReduce operates on committed state
+        // rather than racing against an untracked in-flight task.
         default:
             true
         }}
@@ -6900,7 +6905,7 @@ The generator takes `sports/{slug}.yaml` and produces the sport-specific Swift f
 Sources/
 ├── App/           — Composition root ({type_prefix}App, AppShell, DependencyContainer)
 ├── Core/
-│   ├── Services/  — Sport-specific implementations (BoardService, OpportunitiesService, ProjectionsService, GamesService)
+│   ├── Services/  — Sport-specific implementations (BoardService, OpportunitiesService, GamesService)
 │   │              — BoardService owns get-board (schedule + players + odds); GamesService owns game logs + playoff bracket
 │   ├── Models/    — Domain models (Player, Opportunity, Projection, PlayoffSeries, LeagueState)
 │   ├── Sport/     — Sport extensions (SportConfiguration+<Sport>, SportPositionMap+<Sport>, <Calc>)
