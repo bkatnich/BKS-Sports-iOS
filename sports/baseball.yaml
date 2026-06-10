@@ -169,16 +169,16 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "2.3.0"
+    from: "2.4.11"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
-    from: "1.5.36"
+    from: "1.5.60"
   swinject:
     url: https://github.com/Swinject/Swinject.git
-    from: "2.9.0"
+    from: "2.10.0"
   firebaseSDK:
     url: https://github.com/firebase/firebase-ios-sdk.git
-    from: "11.0.0"
+    from: "11.15.0"
   firebaseProducts: [FirebaseAnalytics, FirebaseAuth, FirebaseAppCheck, FirebaseFirestore, FirebaseMessaging, FirebaseInAppMessaging-Beta]
 
 # ---------------------------------------------------------------------------
