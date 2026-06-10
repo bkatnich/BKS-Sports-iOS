@@ -1066,13 +1066,14 @@ struct {type_prefix}App: App {{
     @StateObject private var networkMonitor = NetworkMonitor()
 
     private let auth: AuthenticationProtocol
-    private let opportunitiesService: OpportunitiesServiceProtocol
-    private let projectionsService: ProjectionsServiceProtocol
+    private let boardService: BoardServiceProtocol
     private let gamesService: any GamesServiceProtocol
     private let promoCodeService: PromoCodeServiceProtocol
     private let activityService: any ActivityFeedServiceProtocol
     private let configuration: ConfigurationProtocol
     private let storage: StorageProtocol
+    private let termsURL: URL
+    private let privacyURL: URL
     private let analyticsAdapter = FirebaseAnalyticsAdapter()
     private let metricsCollector: MetricsCollectorProtocol
     private let subscriptionService: SubscriptionService
@@ -1101,26 +1102,36 @@ struct {type_prefix}App: App {{
 
         let auth = container.require(AuthenticationProtocol.self)
         self.auth = auth
-        configuration = container.require(ConfigurationProtocol.self)
+        let config = container.require(ConfigurationProtocol.self)
+        configuration = config
         storage = container.require(StorageProtocol.self)
 
-        (opportunitiesService, projectionsService, gamesService) = Self.resolveSportServices(from: container)
+        termsURL = URL(string: config.value(for: .termsOfServiceURL))
+            ?? URL(string: "https://www.blackkatt.ca/terms-of-service.html")!  // swiftlint:disable:this force_unwrapping
+        privacyURL = URL(string: config.value(for: .privacyPolicyURL))
+            ?? URL(string: "https://www.blackkatt.ca/privacy-policy.html")!  // swiftlint:disable:this force_unwrapping
+
+        boardService = container.require(BoardServiceProtocol.self)
+        gamesService = container.require(GamesServiceProtocol.self)
 
         promoCodeService = container.require(PromoCodeServiceProtocol.self)
         activityService = container.require(ActivityFeedServiceProtocol.self)
         metricsCollector = container.require(MetricsCollectorProtocol.self)
-        metricsCollector.startCollecting()
+        subscriptionService = container.require(SubscriptionService.self)
+        Self.startServices(metrics: metricsCollector, subscription: subscriptionService)
 
-        let resolvedSubscription = container.require(SubscriptionService.self)
-        subscriptionService = resolvedSubscription
-        subscriptionService.startTransactionListener()
+        (profileStore, signInStore) = Self.makeFlowStores(container: container, authStore: resolvedAuth, auth: auth)
+        Self.registerDataRefresh(board: boardService)
+    }}
 
-        let opps = opportunitiesService
-        let projs = projectionsService
-
-        profileStore = BKSAppScaffold.makeProfileStore(
+    private static func makeFlowStores(
+        container: Container,
+        authStore: Store<AuthState, AuthIntent>,
+        auth: AuthenticationProtocol
+    ) -> (Store<ProfileState, ProfileIntent>, Store<SignInState, SignInIntent>) {{
+        let profileStore = BKSAppScaffold.makeProfileStore(
             container: container,
-            authStore: resolvedAuth,
+            authStore: authStore,
             auth: auth
         ) {{ prefs in
             AppDelegate.notificationPreferences = prefs
@@ -1129,41 +1140,35 @@ struct {type_prefix}App: App {{
         }}
 
         let langService = container.require(LanguagePreferenceServiceProtocol.self)
-        signInStore = BKSAppScaffold.makeSignInStore(
+        let signInStore = BKSAppScaffold.makeSignInStore(
             container: container,
-            authStore: resolvedAuth
+            authStore: authStore
         ) {{
             Task {{ await langService.syncLanguage() }}
         }}
 
-        Self.registerDataRefresh(opps: opps, projs: projs)
+        return (profileStore, signInStore)
     }}
 
-    private static func registerDataRefresh(
-        opps: OpportunitiesServiceProtocol,
-        projs: ProjectionsServiceProtocol
+    private static func startServices(
+        metrics: MetricsCollectorProtocol,
+        subscription: SubscriptionService
     ) {{
-        DataRefreshTask.register(
-            identifier: DataRefreshTaskID.identifier,
-            fetchOpportunities: {{ _ = try await opps.fetchOpportunities() }},
-            fetchProjections: {{ _ = try await projs.fetchProjections() }},
-            fetchSchedule: {{ }}
-        )
+        metrics.startCollecting()
+        subscription.startTransactionListener()
     }}
 
-    private static func resolveSportServices(
-        from container: Container
-    ) -> (OpportunitiesServiceProtocol, ProjectionsServiceProtocol, any GamesServiceProtocol) {{
-        (
-            container.require(OpportunitiesServiceProtocol.self),
-            container.require(ProjectionsServiceProtocol.self),
-            container.require(GamesServiceProtocol.self)
-        )
+    private static func registerDataRefresh(board: BoardServiceProtocol) {{
+        DataRefreshTask.register(identifier: DataRefreshTaskID.identifier) {{
+            _ = try await board.fetchBoard()
+        }}
     }}
 
     private var authSessionResolved: Bool {{
-        if case .undetermined = authStore.state.session {{ return false }}
-        return true
+        switch authStore.state.session {{
+        case .undetermined: return false
+        default: return true
+        }}
     }}
 
     var body: some Scene {{
@@ -1205,15 +1210,43 @@ struct {type_prefix}App: App {{
             .environment(\\.subscriptionService, subscriptionService)
             .environment(\\.gamesService, GamesServiceBox(gamesService))
             .task {{
+                let t0 = Date()
+                Self.logger.debug("AppTask: started")
+                let appLaunchStart = t0
+                let appLaunchID = Perf.begin("AppLaunchPostFirstFrame")
+                defer {{ Perf.end("AppLaunchPostFirstFrame", id: appLaunchID, startedAt: appLaunchStart) }}
+
                 authStore.send(.checkStoredCredential)
                 profileStore.send(.onAppear)
-                await BKSAppScaffold.registerForPushNotifications()
-                await subscriptionService.refreshEntitlement()
+
+                let log = Self.logger
+                await Perf.measure("SubscriptionRefresh") {{
+                    await subscriptionService.refreshEntitlement()
+                }}
+                log.debug("AppTask: refreshEntitlement done (\\(Date().timeIntervalSince(t0), privacy: .public)s)")
+
                 entitlementReady = true
-                await subscriptionService.fetchProducts()
+
+                Task {{
+                    await Perf.measure("PushNotificationRegister") {{
+                        await BKSAppScaffold.registerForPushNotifications()
+                    }}
+                    log.debug("AppTask: push registration done (\\(Date().timeIntervalSince(t0), privacy: .public)s)")
+                }}
+
+                await Perf.measure("SubscriptionFetchProducts") {{
+                    await subscriptionService.fetchProducts()
+                }}
+                Self.logger.debug("AppTask: fetchProducts done (\\(Date().timeIntervalSince(t0), privacy: .public)s)")
+
                 #if DEBUG
                 frameMonitor.start()
                 #endif
+            }}
+            .onChange(of: authSessionResolved) {{ _, resolved in
+                if resolved, case .authenticated = authStore.state.session {{
+                    Task {{ await syncPreferencesToServer() }}
+                }}
             }}
             .onReceive(
                 NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
@@ -1225,6 +1258,7 @@ struct {type_prefix}App: App {{
                 NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
             ) {{ _ in
                 analyticsAdapter.logEvent(AnalyticsEvent.appForegrounded, parameters: nil)
+                GamedayTopicManager.shared.syncIfNeeded()
             }}
             .onReceive(
                 NotificationCenter.default.publisher(for: DataRefreshTask.dataDidRefreshNotification)
@@ -1237,6 +1271,7 @@ struct {type_prefix}App: App {{
             ) {{ notification in
                 guard let eventRaw = notification.object as? String else {{ return }}
                 boardStore.send(.pushNotificationTapped(eventRaw))
+                boardStore.send(.backgroundRefreshRequested)
             }}
             .onChange(of: boardStore.state.loadState.isLoading) {{ wasLoading, nowLoading in
                 if wasLoading, !nowLoading, isErasingCache {{
@@ -1245,6 +1280,17 @@ struct {type_prefix}App: App {{
             }}
             .preferredColorScheme(.dark)
         }}
+    }}
+
+    // MARK: - Preference sync
+
+    private func syncPreferencesToServer() async {{
+        let svc = (UIApplication.shared.delegate as? AppDelegate)?
+            .container?.resolve(UserPreferencesServiceProtocol.self)
+        guard let svc else {{ return }}
+        let prefs = profileStore.state.preferences
+        try? await svc.updatePreferences(prefs)
+        Self.logger.debug("Preferences synced to server on auth resolution")
     }}
 
     // MARK: - Cache erase
@@ -1258,25 +1304,19 @@ struct {type_prefix}App: App {{
     }}
 
     private func forceRefreshGameData() {{
-        let gameDataKeys = opportunitiesService.cacheKeys
-            + projectionsService.cacheKeys
-            + ["daily_analysis_v2"]
-        Task.detached(priority: .userInitiated) {{ [storage, gamesService] in
+        let gameDataKeys = boardService.cacheKeys + ["daily_analysis_v2"]
+        Task.detached(priority: .userInitiated) {{ [storage] in
             for key in gameDataKeys {{
                 try? storage.delete(forKey: key, from: .file)
             }}
-            gamesService.clearCachedGameLogs()
         }}
     }}
 
     // MARK: - Subscription consent
 
     private func subscriptionConsentView(for result: AuthResult) -> some View {{
-        let termsURL = URL(string: configuration.value(for: .termsOfServiceURL))
-            ?? URL(string: "https://www.blackkatt.ca/terms-of-service.html")!  // swiftlint:disable:this force_unwrapping
-        let privacyURL = URL(string: configuration.value(for: .privacyPolicyURL))
-            ?? URL(string: "https://www.blackkatt.ca/privacy-policy.html")!  // swiftlint:disable:this force_unwrapping
-        return SubscriptionConsentView(
+        SubscriptionConsentView(
+            rows: consentTermRows,
             title: String(localized: "consent.title", defaultValue: "Welcome to {app_name}"),
             subtitle: String(
                 localized: "consent.subtitle",
@@ -1285,19 +1325,36 @@ struct {type_prefix}App: App {{
             termsURL: termsURL,
             privacyURL: privacyURL,
             promoCodeService: promoCodeService,
-            subscriptionService: subscriptionService,
-            onAccepted: {{
-                saveConsentAccepted(to: storage)
-                authStore.send(.signInSucceeded(result))
-                pendingConsentResult = nil
-            }},
-            termContent: {{ consentTermRows }}
-        )
+            subscriptionService: subscriptionService
+        ) {{
+            saveConsentAccepted(to: storage)
+            authStore.send(.signInSucceeded(result))
+            pendingConsentResult = nil
+        }}
     }}
 
-    @ViewBuilder
-    private var consentTermRows: some View {{
-        EmptyView()
+    private var consentTermRows: [TermRow] {{
+        // MANUAL: replace these with sport-specific consent terms.
+        [
+            TermRow(
+                icon: "calendar",
+                title: String(localized: "consent.term.daily.title", defaultValue: "Daily picks, every game day"),
+                detail: String(localized: "consent.term.daily.detail",
+                               defaultValue: "Board and prop opportunities updated each morning.")
+            ),
+            TermRow(
+                icon: "arrow.clockwise",
+                title: String(localized: "consent.term.cancel.title", defaultValue: "Cancel any time"),
+                detail: String(localized: "consent.term.cancel.detail",
+                               defaultValue: "No commitment. Cancel before renewal and you won't be charged.")
+            ),
+            TermRow(
+                icon: "creditcard",
+                title: String(localized: "consent.term.billing.title", defaultValue: "$2.99 / month after trial"),
+                detail: String(localized: "consent.term.billing.detail",
+                               defaultValue: "Billed monthly through your App Store account.")
+            )
+        ]
     }}
 }}
 
@@ -1308,11 +1365,12 @@ final class AppDelegate: BKSAppDelegate {{
     override func makeContainer() -> Container {{ Container.defaultContainer() }}
 
     override func fcmTopics(config: ConfigurationProtocol) -> [String] {{
-        [config.value(for: .fcmGamedayTopic), config.value(for: .fcmPlayoffTopic)]
+        [config.value(for: .fcmPlayoffTopic)]
     }}
 
     override func shouldSuppressForegroundPush(eventRaw: String) -> Bool {{
         eventRaw == DataRefreshTask.SilentPushEvent.playersUpdate.rawValue
+            || eventRaw == "snapshot_ready"
     }}
 
     override func preferenceKey(for fcmEvent: String) -> NotificationPreferenceKey? {{
@@ -1320,10 +1378,10 @@ final class AppDelegate: BKSAppDelegate {{
     }}
 
     override func handleNotificationTap(eventRaw: String, userInfo: [AnyHashable: Any]) {{
-        if let event = VisiblePushEvent(rawValue: eventRaw) {{
+        if VisiblePushEvent(rawValue: eventRaw) != nil {{
             NotificationCenter.default.post(
                 name: PushNotificationNames.visiblePushTapped,
-                object: event,
+                object: eventRaw,
                 userInfo: userInfo
             )
         }} else {{
@@ -1334,16 +1392,11 @@ final class AppDelegate: BKSAppDelegate {{
     override func handleSilentPush(eventRaw: String, userInfo: [AnyHashable: Any]) async {{
         guard
             let storage = container?.resolve(StorageProtocol.self),
-            let opps = container?.resolve(OpportunitiesServiceProtocol.self),
-            let projs = container?.resolve(ProjectionsServiceProtocol.self)
+            let board = container?.resolve(BoardServiceProtocol.self)
         else {{ return }}
-        await DataRefreshTask.handleSilentPush(
-            userInfo: userInfo,
-            storage: storage,
-            fetchOpportunities: {{ _ = try await opps.fetchOpportunities() }},
-            fetchProjections: {{ _ = try await projs.fetchProjections() }},
-            fetchSchedule: {{ }}
-        )
+        await DataRefreshTask.handleSilentPush(userInfo: userInfo, storage: storage) {{
+            _ = try await board.fetchBoard()
+        }}
     }}
 }}
 """
@@ -1379,7 +1432,6 @@ extension Container {{
         register((any SportConfigurationProtocol).self) {{ _ in SportConfiguration.{slug} }}.inObjectScope(.container)
     }}
 
-    // swiftlint:disable:next function_body_length
     private func registerSportServices() {{
         register(BoardServiceProtocol.self) {{ resolver in
             BoardService(
@@ -1389,31 +1441,9 @@ extension Container {{
                 sportConfiguration: resolver.require((any SportConfigurationProtocol).self)
             )
         }}.inObjectScope(.container)
-        register(NetworkProtocol.self, name: "apiKey") {{ resolver in
-            let config = resolver.require(ConfigurationProtocol.self)
-            let apiKeyInterceptor = APIKeyInterceptor(apiKey: config.value(for: .gameLogAPIKey))
-            let retryPolicy = RetryPolicy(
-                retryLimit: 2,
-                exponentialBackoffBase: 2,
-                exponentialBackoffScale: 0.5
-            )
-            let interceptor = Interceptor(
-                adapters: [apiKeyInterceptor],
-                retriers: [retryPolicy]
-            )
-            return Network(interceptor: interceptor)
-        }}
-        register(OpportunitiesServiceProtocol.self) {{ resolver in
-            OpportunitiesService(
-                network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
-                storage: resolver.require(StorageProtocol.self),
-                configuration: resolver.require(ConfigurationProtocol.self),
-                sportConfiguration: resolver.require((any SportConfigurationProtocol).self)
-            )
-        }}.inObjectScope(.container)
         register(GamesServiceProtocol.self) {{ resolver in
             GamesService(
-                network: resolver.require(NetworkProtocol.self, name: "apiKey"),
+                network: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
                 firebaseNetwork: resolver.require(NetworkProtocol.self, name: "{firebase_network_name}"),
                 storage: resolver.require(StorageProtocol.self),
                 configuration: resolver.require(ConfigurationProtocol.self),
@@ -1449,6 +1479,95 @@ extension Container {{
 bootstrap_dir = os.path.join(out_dir, "App/Sources/App/Bootstrap")
 write(os.path.join(bootstrap_dir, f"{type_prefix}App.swift"), bootstrap_app)
 write(os.path.join(bootstrap_dir, "DependencyContainer.swift"), bootstrap_container)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8e. GamedayTopicManager.swift
+#     Date-scoped FCM gameday topic subscription manager. Generic across all
+#     sports — keyed by fcm.gamedayTopic from the YAML (e.g. "gameday").
+#     Subscribes to "gameday_YYYYMMDD" and unsubscribes the previous day on
+#     every foreground resume, but only when the date has actually changed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+fcm_gameday     = fcm.get("gamedayTopic", "gameday")
+
+gameday_topic_manager_swift = header() + f"""\
+import FirebaseMessaging
+import Foundation
+import OSLog
+
+// MARK: - GamedayTopicManager
+
+/// Manages the date-scoped FCM gameday topic subscription.
+///
+/// Subscribes to today's topic (`{fcm_gameday}_YYYYMMDD`) and unsubscribes from
+/// yesterday's on every foreground resume, but only when the date has changed
+/// since the last successful subscription. Safe to call repeatedly — the
+/// guard on `lastSubscribedDate` makes it idempotent within a single day.
+///
+/// Date boundary uses America/New_York so a user in a western timezone
+/// foregrounding after midnight ET gets the correct topic.
+@MainActor
+final class GamedayTopicManager {{
+
+    static let shared = GamedayTopicManager()
+
+    private let defaults = UserDefaults.standard
+    private let lastSubscribedKey = "gameday.lastSubscribedDate"
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "GamedayTopic"
+    )
+
+    private static let formatter: DateFormatter = {{
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd"
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(identifier: "America/New_York")
+        return fmt
+    }}()
+
+    func syncIfNeeded() {{
+        let today = Self.formatter.string(from: Date())
+        let lastSubscribed = defaults.string(forKey: lastSubscribedKey)
+        guard lastSubscribed != today else {{ return }}
+
+        subscribe(to: "{fcm_gameday}_\\(today)")
+
+        if let lastDate = lastSubscribed {{
+            unsubscribe(from: "{fcm_gameday}_\\(lastDate)")
+        }}
+
+        defaults.set(today, forKey: lastSubscribedKey)
+    }}
+
+    private func subscribe(to topic: String) {{
+        Messaging.messaging().subscribe(toTopic: topic) {{ [weak self] error in
+            if let error {{
+                self?.logger.error(
+                    "subscribe \\(topic, privacy: .public) failed: \\(error.localizedDescription, privacy: .public)"
+                )
+            }} else {{
+                self?.logger.info("subscribed to \\(topic, privacy: .public)")
+            }}
+        }}
+    }}
+
+    private func unsubscribe(from topic: String) {{
+        Messaging.messaging().unsubscribe(fromTopic: topic) {{ [weak self] error in
+            if let error {{
+                self?.logger.error(
+                    "unsubscribe \\(topic, privacy: .public) failed: \\(error.localizedDescription, privacy: .public)"
+                )
+            }} else {{
+                self?.logger.info("unsubscribed from \\(topic, privacy: .public)")
+            }}
+        }}
+    }}
+}}
+"""
+
+utilities_dir = os.path.join(out_dir, "App/Sources/Core/Utilities")
+write(os.path.join(utilities_dir, "GamedayTopicManager.swift"), gameday_topic_manager_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9a. AppShell.swift
@@ -3382,6 +3501,7 @@ write(os.path.join(models_dir, f"ProjectedStatLine+{swift_name}.swift"), project
 board_models_dir  = os.path.join(out_dir, "App/Sources/Features/Board/Models")
 board_store_dir   = os.path.join(out_dir, "App/Sources/Features/Board/Store")
 board_views_dir   = os.path.join(out_dir, "App/Sources/Features/Board/Views")
+props_views_dir   = os.path.join(out_dir, "App/Sources/Features/Board/Views/Props")
 profile_views_dir = os.path.join(out_dir, "App/Sources/Features/Profile/Views")
 
 # ── BoardEntry.swift ───────────────────────────────────────────────────────────────────
@@ -5857,6 +5977,821 @@ struct TrendPill: View {{
 }}
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Props feed views  (Features/Board/Views/Props/)
+#
+# All five files are write_if_absent — they require sport-specific styling.
+# PropPlayerRow and TierDividerRow are fully generic; EdgePropCard, AllPropRow,
+# and PropsFeedView contain a stat/odds row that callers style per-sport.
+# ─────────────────────────────────────────────────────────────────────────────
+
+prop_player_row_swift = header() + """\
+import SwiftUI
+
+// MARK: - PropPlayerRow
+
+/// Player identity row: optional leading slot + name/team/pos + optional trailing slot.
+/// Does NOT own the tier strip — callers render the strip alongside their full card content
+/// so it spans the entire card height, not just this row.
+struct PropPlayerRow<Leading: View, Trailing: View>: View {
+    let prop: TopPropOpportunity
+    var nameFontSize: CGFloat = 15
+    var nameWeight: Font.Weight = .semibold
+    @ViewBuilder var leading: () -> Leading
+    @ViewBuilder var trailing: () -> Trailing
+
+    private var teamPosLabel: String? {
+        guard let team = prop.team else { return nil }
+        return prop.position.map { "\\(team)/\\($0)" } ?? team
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 6) {
+            leading()
+            Text(prop.playerName)
+                .font(.system(size: nameFontSize, weight: nameWeight))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            if let label = teamPosLabel {
+                Text(label)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+            Spacer(minLength: 8)
+            trailing()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+// No leading, no trailing — default convenience
+extension PropPlayerRow where Leading == EmptyView, Trailing == EmptyView {
+    init(
+        prop: TopPropOpportunity,
+        nameFontSize: CGFloat = 15,
+        nameWeight: Font.Weight = .semibold
+    ) {
+        self.prop = prop
+        self.nameFontSize = nameFontSize
+        self.nameWeight = nameWeight
+        self.leading = { EmptyView() }
+        self.trailing = { EmptyView() }
+    }
+}
+"""
+
+tier_divider_row_swift = header() + """\
+import SwiftUI
+
+// MARK: - TierDividerRow
+
+/// Colored label row separating tier groups in the ALL PROPS section.
+/// Rendered once per non-empty tier (descending). Subdued tier uses SubduedDisclosureRow instead.
+struct TierDividerRow: View {
+    let tier: PropEdgeTier
+
+    var body: some View {
+        HStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(tier.stripColor)
+                .frame(width: 9, height: 9)
+
+            Text(tier.label)
+                .font(.system(size: 11, weight: .medium))
+                .kerning(1.2)
+                .foregroundStyle(tier.stripColor)
+
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 20)
+        .padding(.bottom, 6)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel(tier.label)
+    }
+}
+
+// MARK: - SubduedDisclosureRow
+
+/// Collapsed disclosure row for subdued props. Gray to stay in the tier system.
+/// Collapsed by default — subdued plays are below the model's confidence threshold.
+struct SubduedDisclosureRow: View {
+    let count: Int
+    let props: [TopPropOpportunity]
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(PropEdgeTier.subdued.stripColor)
+                        .frame(width: 9, height: 9)
+
+                    Text(String(
+                        localized: "props.subdued.count",
+                        defaultValue: "\\(count) subdued props"
+                    ))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.5))
+
+                    Spacer()
+
+                    Text(isExpanded
+                         ? String(localized: "props.subdued.hide", defaultValue: "Hide")
+                         : String(localized: "props.subdued.show", defaultValue: "Show"))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.4))
+
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.35))
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(.white.opacity(0.04))
+                )
+                .padding(.horizontal, 16)
+                .padding(.top, 16)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(String(localized: "props.subdued.a11y.label",
+                                       defaultValue: "\\(count) subdued props"))
+            .accessibilityValue(isExpanded
+                ? String(localized: "props.subdued.a11y.expanded", defaultValue: "expanded")
+                : String(localized: "props.subdued.a11y.collapsed", defaultValue: "collapsed"))
+            .accessibilityHint(String(localized: "props.subdued.a11y.hint",
+                                      defaultValue: "Double tap to show or hide"))
+
+            if isExpanded {
+                VStack(spacing: 8) {
+                    ForEach(props) { prop in
+                        AllPropRow(prop: prop)
+                            .padding(.horizontal, 16)
+                    }
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+}
+"""
+
+edge_prop_card_swift = header() + """\
+import BKSUICore
+import SwiftUI
+
+// MARK: - EdgePropCard
+
+// MARK: - MANUAL IMPLEMENTATION REQUIRED
+// This stub was generated by scaffold.sh. The stat/odds row is sport-specific —
+// replace the statOddsRow body with the correct stat display for this sport.
+
+/// Card shown in the TODAY'S BEST BETS section.
+/// All ranks show identical formatting: player identity row + stat/odds row.
+struct EdgePropCard: View {
+    let prop: TopPropOpportunity
+    let rank: Int
+
+    @State private var isExpanded = false
+
+    private var tierColor: Color { prop.tier.stripColor }
+
+    private func sortedBooks() -> [(name: String, odds: Int, line: Double)] {
+        guard let books = prop.bookmakers else { return [] }
+        return books
+            .map { key, val in
+                let odds = prop.direction == .over ? val.overOdds : val.underOdds
+                return (name: key.capitalized, odds: odds, line: val.line)
+            }
+            .sorted { $0.odds > $1.odds }
+    }
+
+    var body: some View {
+        cardContent
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: 13)
+                    .fill(Color.white.opacity(0.05))
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(accessibilityLabel)
+    }
+
+    @ViewBuilder
+    private var cardContent: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(tierColor)
+                .frame(width: 5)
+                .frame(maxHeight: .infinity)
+
+            VStack(alignment: .leading, spacing: 2) {
+                PropPlayerRow(
+                    prop: prop,
+                    nameFontSize: 16,
+                    nameWeight: .bold,
+                    leading: {
+                        Text("#\\(rank)")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.5))
+                    },
+                    trailing: { EmptyView() }
+                )
+                statOddsRow.padding(.top, -6)
+                conflictWarning
+            }
+            .padding(.vertical, 12)
+            .padding(.trailing, 12)
+        }
+    }
+
+    // MARK: - Sport-specific: replace stat label/line display for this sport
+
+    @ViewBuilder
+    private var statOddsRow: some View {
+        let books = sortedBooks()
+        let statLabel = (prop.statCategory?.shortLabel ?? prop.statDisplayName).uppercased()
+        let dirLabel = prop.direction == .over
+            ? String(localized: "gameDetail.call.over", defaultValue: "OVER")
+            : String(localized: "gameDetail.call.under", defaultValue: "UNDER")
+        let lineStr = prop.line.truncatingRemainder(dividingBy: 1) == 0
+            ? String(format: "%.0f", prop.line)
+            : String(format: "%.1f", prop.line)
+
+        if books.count > 1 {
+            VStack(alignment: .leading, spacing: 4) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 0) {
+                        Text(statLabel)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.55))
+                        Text(" ")
+                        Text("\\(dirLabel) \\(lineStr)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.7))
+                        Spacer(minLength: 8)
+                        if let best = books.first {
+                            let oddsStr = best.odds > 0 ? "+\\(best.odds)" : "\\(best.odds)"
+                            Text("\\(oddsStr)  \\(best.name)")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .padding(.leading, 6)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                if isExpanded {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(books, id: \\.name) { book in
+                            HStack(spacing: 0) {
+                                let oddsStr = book.odds > 0 ? "+\\(book.odds)" : "\\(book.odds)"
+                                Text(oddsStr)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.85))
+                                    .frame(width: 44, alignment: .leading)
+                                Text(book.name)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.white.opacity(0.6))
+                                if book.line != prop.line {
+                                    let ls = book.line.truncatingRemainder(dividingBy: 1) == 0
+                                        ? String(format: " (%.0f)", book.line)
+                                        : String(format: " (%.1f)", book.line)
+                                    Text(ls)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.white.opacity(0.4))
+                                }
+                            }
+                        }
+                    }
+                    .padding(.leading, 4)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+        } else {
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
+                Text(statLabel)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                Text(" ")
+                Text("\\(dirLabel) \\(lineStr)")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+                Spacer(minLength: 8)
+                if let best = books.first {
+                    let oddsStr = best.odds > 0 ? "+\\(best.odds)" : "\\(best.odds)"
+                    Text("\\(oddsStr)  \\(best.name)")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var conflictWarning: some View {
+        if prop.instinctAgrees == false {
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                Text(String(localized: "props.card.conflict", defaultValue: "Model conflicts with recent form"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange.opacity(0.9))
+            }
+        }
+    }
+
+    private var accessibilityLabel: String {
+        let dir = prop.direction == .over
+            ? String(localized: "props.card.a11y.over", defaultValue: "over")
+            : String(localized: "props.card.a11y.under", defaultValue: "under")
+        let pct = Int(prop.ourProbability * 100)
+        let lineStr = prop.line.truncatingRemainder(dividingBy: 1) == 0
+            ? String(format: "%.0f", prop.line)
+            : String(format: "%.1f", prop.line)
+        let stat = prop.statCategory?.shortLabel ?? prop.statDisplayName
+        let rankLabel = String(
+            format: String(localized: "props.card.a11y.rank", defaultValue: "Rank %@"),
+            String(rank)
+        )
+        let pctLabel = String(
+            format: String(localized: "props.card.a11y.probability", defaultValue: "%@%% model probability"),
+            String(pct)
+        )
+        let edgeLabel = String(
+            format: String(localized: "props.card.a11y.edge", defaultValue: "+%.1f percentage point edge"),
+            prop.edgePP
+        )
+        var parts: [String] = [
+            rankLabel,
+            "\\(prop.playerName), \\(stat), \\(dir) \\(lineStr)",
+            pctLabel,
+            edgeLabel,
+        ]
+        if let odds = prop.bestOdds {
+            let oddsStr = odds > 0 ? "+\\(odds)" : "\\(odds)"
+            let oddsLabel = String(
+                format: String(localized: "props.card.a11y.bestOdds", defaultValue: "best odds %@"),
+                oddsStr
+            )
+            parts.append(oddsLabel)
+        }
+        if prop.instinctAgrees == false {
+            parts.append(String(localized: "props.card.a11y.disagrees", defaultValue: "model disagrees"))
+        }
+        return parts.joined(separator: ". ")
+    }
+}
+"""
+
+all_prop_row_swift = header() + """\
+import SwiftUI
+
+// MARK: - AllPropRow
+
+// MARK: - MANUAL IMPLEMENTATION REQUIRED
+// This stub was generated by scaffold.sh. The statRow body is sport-specific —
+// replace the stat label/line display for this sport.
+
+/// Compact prop row used in the ALL PROPS section beneath the hero cards.
+struct AllPropRow: View {
+    let prop: TopPropOpportunity
+
+    @State private var isExpanded = false
+
+    private var tierColor: Color { prop.tier.stripColor }
+
+    private func sortedBooks() -> [(name: String, odds: Int, line: Double)] {
+        guard let books = prop.bookmakers else { return [] }
+        return books
+            .map { key, val in
+                let odds = prop.direction == .over ? val.overOdds : val.underOdds
+                return (name: key.capitalized, odds: odds, line: val.line)
+            }
+            .sorted { $0.odds > $1.odds }
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(tierColor)
+                .frame(width: 5)
+                .frame(maxHeight: .infinity)
+
+            VStack(alignment: .leading, spacing: 2) {
+                PropPlayerRow(
+                    prop: prop,
+                    nameFontSize: 16,
+                    nameWeight: .bold,
+                    leading: { EmptyView() },
+                    trailing: { EmptyView() }
+                )
+                statRow.padding(.top, -8)
+                if prop.instinctAgrees == false { conflictWarning }
+            }
+            .padding(.vertical, 12)
+            .padding(.trailing, 12)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 13)
+                .fill(Color.white.opacity(0.05))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    // MARK: - Sport-specific: replace stat label/line display for this sport
+
+    @ViewBuilder
+    private var statRow: some View {
+        let dirLabel = prop.direction == .over
+            ? String(localized: "gameDetail.call.over", defaultValue: "OVER")
+            : String(localized: "gameDetail.call.under", defaultValue: "UNDER")
+        let lineStr = prop.line.truncatingRemainder(dividingBy: 1) == 0
+            ? String(format: "%.0f", prop.line)
+            : String(format: "%.1f", prop.line)
+        let statLabel = (prop.statCategory?.shortLabel ?? prop.statDisplayName).uppercased()
+        let books = sortedBooks()
+
+        if books.count > 1 {
+            VStack(alignment: .leading, spacing: 4) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 0) {
+                        Text(statLabel)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.55))
+                        Text(" ")
+                        Text("\\(dirLabel) \\(lineStr)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.7))
+                        Spacer(minLength: 8)
+                        if let best = books.first {
+                            let oddsStr = best.odds > 0 ? "+\\(best.odds)" : "\\(best.odds)"
+                            Text("\\(oddsStr)  \\(best.name)")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .padding(.leading, 6)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                if isExpanded {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(books, id: \\.name) { book in
+                            HStack(spacing: 0) {
+                                let oddsStr = book.odds > 0 ? "+\\(book.odds)" : "\\(book.odds)"
+                                Text(oddsStr)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.85))
+                                    .frame(width: 44, alignment: .leading)
+                                Text(book.name)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.white.opacity(0.6))
+                                if book.line != prop.line {
+                                    let ls = book.line.truncatingRemainder(dividingBy: 1) == 0
+                                        ? String(format: " (%.0f)", book.line)
+                                        : String(format: " (%.1f)", book.line)
+                                    Text(ls)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.white.opacity(0.4))
+                                }
+                            }
+                        }
+                    }
+                    .padding(.leading, 4)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+        } else {
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
+                Text(statLabel)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                Text(" ")
+                Text("\\(dirLabel) \\(lineStr)")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+                Spacer(minLength: 8)
+                if let best = books.first {
+                    let oddsStr = best.odds > 0 ? "+\\(best.odds)" : "\\(best.odds)"
+                    Text("\\(oddsStr)  \\(best.name)")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var conflictWarning: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(.orange)
+            Text(String(localized: "props.card.conflict", defaultValue: "Model conflicts with recent form"))
+                .font(.system(size: 12))
+                .foregroundStyle(.orange.opacity(0.9))
+        }
+    }
+
+    private var accessibilityLabel: String {
+        let dir = prop.direction == .over
+            ? String(localized: "props.card.a11y.over", defaultValue: "over")
+            : String(localized: "props.card.a11y.under", defaultValue: "under")
+        let lineStr = prop.line.truncatingRemainder(dividingBy: 1) == 0
+            ? String(format: "%.0f", prop.line)
+            : String(format: "%.1f", prop.line)
+        let stat = prop.statCategory?.shortLabel ?? prop.statDisplayName
+        var parts = [prop.tier.label, "\\(prop.playerName), \\(stat), \\(dir) \\(lineStr)"]
+        if prop.instinctAgrees == false {
+            parts.append(String(localized: "props.card.a11y.disagrees", defaultValue: "model disagrees"))
+        }
+        return parts.joined(separator: ". ")
+    }
+}
+"""
+
+props_feed_view_swift = header() + """\
+import BKSUICore
+import SwiftUI
+
+// MARK: - PropsFeedView
+
+// MARK: - MANUAL IMPLEMENTATION REQUIRED
+// This stub was generated by scaffold.sh. Wire bestBetProps / filteredTopProps
+// from BoardState.topPropOpportunities in BoardView, and implement
+// PropsFeedFilterSheet for sport-specific filter options.
+
+/// Root compositor for the Props feed screen.
+/// Presents an edge-ranked feed in two sections:
+///   • TODAY'S BEST BETS — top 3 as rich cards
+///   • ALL PROPS — remainder grouped by tier with TierDividerRows; subdued collapsed
+struct PropsFeedView: View {
+    let bestBetProps: [TopPropOpportunity]
+    let filteredTopProps: [TopPropOpportunity]
+    let propFeedFilter: PropFeedFilter
+    let activeFilterCount: Int
+    let onFilterChanged: (PropFeedFilter) -> Void
+
+    @State private var showFilterSheet = false
+    @State private var filterSnapshot: PropFeedFilter
+    @State private var committed = false
+
+    init(
+        bestBetProps: [TopPropOpportunity],
+        filteredTopProps: [TopPropOpportunity],
+        propFeedFilter: PropFeedFilter,
+        activeFilterCount: Int,
+        onFilterChanged: @escaping (PropFeedFilter) -> Void
+    ) {
+        self.bestBetProps = bestBetProps
+        self.filteredTopProps = filteredTopProps
+        self.propFeedFilter = propFeedFilter
+        self.activeFilterCount = activeFilterCount
+        self.onFilterChanged = onFilterChanged
+        self._filterSnapshot = State(initialValue: propFeedFilter)
+    }
+
+    private var allPropsRemainder: [TopPropOpportunity] {
+        guard filteredTopProps.count > 3 else { return [] }
+        return Array(filteredTopProps.dropFirst(3))
+    }
+
+    private var groupedRemainder: GroupedRemainder {
+        GroupedRemainder(from: allPropsRemainder)
+    }
+
+    private var availableStats: [PropStatCategory] {
+        var seen = Set<PropStatCategory>()
+        var result: [PropStatCategory] = []
+        for prop in filteredTopProps {
+            if let cat = prop.statCategory, seen.insert(cat).inserted { result.append(cat) }
+        }
+        return result
+    }
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 0, pinnedViews: []) {
+            bestBetsSection
+            if !allPropsRemainder.isEmpty { allPropsSection }
+        }
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                HStack(spacing: 7) {
+                    if activeFilterCount > 0 {
+                        Text("\\(activeFilterCount)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(Color(red: 0.094, green: 0.373, blue: 0.647)))
+                            .accessibilityHidden(true)
+                    }
+                    Button {
+                        filterSnapshot = propFeedFilter
+                        committed = false
+                        showFilterSheet = true
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .accessibilityLabel(
+                        activeFilterCount > 0
+                            ? String(localized: "props.filter.fab.a11y.active",
+                                     defaultValue: "\\(activeFilterCount) active filters")
+                            : String(localized: "props.filter.fab.a11y.base",
+                                     defaultValue: "Filter props")
+                    )
+                    .accessibilityHint(String(
+                        localized: "props.filter.fab.a11y.hint",
+                        defaultValue: "Opens filter options"
+                    ))
+                }
+            }
+        }
+        .sheet(isPresented: $showFilterSheet) {
+            PropsFeedFilterSheet(
+                isPresented: $showFilterSheet,
+                currentFilter: filterSnapshot,
+                availableStats: availableStats,
+                filteredCount: filteredTopProps.count,
+                onFilterChanged: { onFilterChanged($0) },
+                onCommit: { filter in
+                    committed = true
+                    onFilterChanged(filter)
+                },
+                onRollback: { original in
+                    if !committed { onFilterChanged(original) }
+                }
+            )
+        }
+    }
+
+    // MARK: - Best Bets Section
+
+    private var bestBetsSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            bestBetsHeader
+            if bestBetProps.isEmpty {
+                emptyBestBets
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(Array(bestBetProps.enumerated()), id: \\.element.id) { index, prop in
+                        EdgePropCard(prop: prop, rank: index + 1)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+            }
+        }
+    }
+
+    private var bestBetsHeader: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "star.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.yellow.opacity(0.8))
+                .accessibilityHidden(true)
+            Text(String(localized: "props.feed.bestBets.title", defaultValue: "TODAY'S BEST BETS"))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.7))
+                .kerning(0.8)
+            Spacer()
+            let count = bestBetProps.count
+            Text(count == 1
+                 ? String(localized: "props.feed.propCount.singular", defaultValue: "1 prop")
+                 : String(localized: "props.feed.propCount.plural", defaultValue: "\\(count) props"))
+                .font(.system(size: 12))
+                .foregroundStyle(.white.opacity(0.4))
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+        .padding(.bottom, 10)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel(String(localized: "props.bestBets.header.a11y",
+                                   defaultValue: "Today's Best Bets, \\(bestBetProps.count) props"))
+    }
+
+    private var emptyBestBets: some View {
+        VStack(spacing: 10) {
+            // MANUAL: replace systemName with a sport-appropriate SF Symbol
+            Image(systemName: "sportscourt")
+                .font(.system(size: 32))
+                .foregroundStyle(.white.opacity(0.3))
+                .accessibilityHidden(true)
+            Text(String(localized: "props.feed.empty", defaultValue: "No props match the active filter"))
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.45))
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 40)
+        .padding(.horizontal, 24)
+    }
+
+    // MARK: - All Props Section
+
+    private var allPropsSection: some View {
+        let grouped = groupedRemainder
+        return VStack(alignment: .leading, spacing: 0) {
+            allPropsHeader
+            ForEach(grouped.tiers, id: \\.rawValue) { tier in
+                let propsForTier = grouped.byTier[tier] ?? []
+                if tier != .elite {
+                    TierDividerRow(tier: tier)
+                        .padding(.horizontal, 16)
+                }
+                VStack(spacing: 8) {
+                    ForEach(propsForTier) { prop in
+                        AllPropRow(prop: prop)
+                            .padding(.horizontal, 16)
+                    }
+                }
+            }
+            if !grouped.subdued.isEmpty {
+                SubduedDisclosureRow(count: grouped.subdued.count, props: grouped.subdued)
+                    .padding(.bottom, 8)
+            }
+        }
+    }
+
+    private var allPropsHeader: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "list.bullet")
+                .font(.system(size: 11))
+                .foregroundStyle(.white.opacity(0.7))
+                .accessibilityHidden(true)
+            Text(String(localized: "props.feed.allProps.title", defaultValue: "ALL PROPS"))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.7))
+                .kerning(0.8)
+            Spacer()
+            let count = allPropsRemainder.count
+            Text(count == 1
+                 ? String(localized: "props.feed.allProps.count.singular", defaultValue: "1 prop")
+                 : String(localized: "props.feed.allProps.count.plural", defaultValue: "\\(count) props"))
+                .font(.system(size: 12))
+                .foregroundStyle(.white.opacity(0.4))
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+        .padding(.bottom, 10)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel(String(localized: "props.allProps.header.a11y",
+                                   defaultValue: "All Props, \\(allPropsRemainder.count) props"))
+    }
+}
+
+// MARK: - GroupedRemainder
+
+/// Partitions the allPropsRemainder list in a single O(N) pass.
+private struct GroupedRemainder {
+    let tiers: [PropEdgeTier]
+    let byTier: [PropEdgeTier: [TopPropOpportunity]]
+    let subdued: [TopPropOpportunity]
+
+    init(from props: [TopPropOpportunity]) {
+        var tierOrder: [PropEdgeTier] = []
+        var seenTiers = Set<PropEdgeTier>()
+        var byTier: [PropEdgeTier: [TopPropOpportunity]] = [:]
+        var subdued: [TopPropOpportunity] = []
+
+        for prop in props {
+            if prop.tier == .subdued {
+                subdued.append(prop)
+            } else {
+                if seenTiers.insert(prop.tier).inserted {
+                    tierOrder.append(prop.tier)
+                }
+                byTier[prop.tier, default: []].append(prop)
+            }
+        }
+
+        self.tiers = tierOrder
+        self.byTier = byTier
+        self.subdued = subdued
+    }
+}
+"""
+
 # ── Write all files ─────────────────────────────────────────────────────────────────────────
 
 write(os.path.join(board_models_dir,  "BoardEntry.swift"),               board_entry_swift)
@@ -5867,9 +6802,14 @@ write_if_absent(os.path.join(board_views_dir,   "BoardView.swift"),             
 write_if_absent(os.path.join(board_views_dir,   "BoardNavBar.swift"),              board_nav_bar_swift)
 write_if_absent(os.path.join(board_views_dir,   "BoardViewModePicker.swift"),      board_view_mode_picker_swift)
 write_if_absent(os.path.join(board_views_dir,   "BoardScrollContent.swift"),       board_scroll_content_swift)
-write_if_absent(os.path.join(board_views_dir,   "BoardDetailView.swift"),          board_detail_view_swift)
-write_if_absent(os.path.join(board_views_dir,   "BoardDetailSubviews.swift"),      board_detail_subviews_swift)
-write_if_absent(os.path.join(board_views_dir,   "BoardDetailHeaderCard.swift"),    board_detail_header_card_swift)
+# BoardDetailView, BoardDetailSubviews, BoardDetailHeaderCard are intentionally not scaffolded.
+# The player detail UI has been consolidated into BKSUICore shared components.
+# Add sport-specific detail views manually if needed.
+write_if_absent(os.path.join(props_views_dir,   "PropPlayerRow.swift"),            prop_player_row_swift)
+write_if_absent(os.path.join(props_views_dir,   "TierDividerRow.swift"),           tier_divider_row_swift)
+write_if_absent(os.path.join(props_views_dir,   "EdgePropCard.swift"),             edge_prop_card_swift)
+write_if_absent(os.path.join(props_views_dir,   "AllPropRow.swift"),               all_prop_row_swift)
+write_if_absent(os.path.join(props_views_dir,   "PropsFeedView.swift"),            props_feed_view_swift)
 write(os.path.join(profile_views_dir, "ProfileContainerView.swift"),     profile_container_swift)
 write(os.path.join(profile_views_dir, "NotificationsDetailView.swift"),  notifications_detail_swift)
 

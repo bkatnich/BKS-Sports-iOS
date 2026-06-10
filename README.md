@@ -96,16 +96,23 @@ Running `scaffold.sh` writes these files into your app directory:
 | Generated File | Destination in App | Purpose |
 |---|---|---|
 | `ConfigurationKeys+<Sport>.swift` | `App/Sources/Core/Utilities/` | API endpoint URLs and Info.plist key constants |
+| `GamedayTopicManager.swift` | `App/Sources/Core/Utilities/` | Date-scoped FCM gameday topic subscription manager |
 | `SportPositionMap+<Sport>.swift` | `App/Sources/Core/Sport/` | Position filter chip definitions |
 | `<Calculator>.swift` | `App/Sources/Core/Sport/` | DFS scoring formula (implements `ScoringCalculator`) |
 | `SportConfiguration+<Sport>.swift` | `App/Sources/Core/Sport/` | Master sport config: tiers, stat fields, API params |
-| `TierThresholds+<Sport>.swift` | `App/Sources/Core/UI/` | UI tier badge thresholds |
-| `GameEntry.swift` | `App/Sources/Core/Models/` | Game stat model and `PlayerGameLog` aggregate |
-| `GameLogViews.swift` | `App/Sources/Features/Trending/Views/` | SwiftUI game log table and empty/error states |
+| `GameEntry+<Sport>.swift` | `App/Sources/Core/Models/` | Game stat model and `PlayerGameLog` aggregate |
+| `GameLogViews.swift` | `App/Sources/Features/Board/Views/` | SwiftUI game log table and empty/error states |
+| `PropPlayerRow.swift` *(stub)* | `App/Sources/Features/Board/Views/Props/` | Generic player identity row for prop cards |
+| `TierDividerRow.swift` *(stub)* | `App/Sources/Features/Board/Views/Props/` | Tier section divider and subdued disclosure row |
+| `EdgePropCard.swift` *(stub)* | `App/Sources/Features/Board/Views/Props/` | Best Bets hero card — requires sport stat wiring |
+| `AllPropRow.swift` *(stub)* | `App/Sources/Features/Board/Views/Props/` | Compact ALL PROPS row — requires sport stat wiring |
+| `PropsFeedView.swift` *(stub)* | `App/Sources/Features/Board/Views/Props/` | Props feed root view; requires `PropsFeedFilterSheet` |
+
+Files marked *(stub)* are written once (`write_if_absent`) and never overwritten on re-scaffold.
 
 It also copies shared branding assets into `App/Sources/App/Resources/`:
 - `Assets.xcassets` — App icon, in-app icon, launch background color
-- `Localizable.xcstrings` — 257 localized strings in English, French (CA), and Spanish
+- `Localizable.xcstrings` — Localized strings in English, French (CA), and Spanish
 
 ---
 

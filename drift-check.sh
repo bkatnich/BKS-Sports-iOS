@@ -81,8 +81,14 @@ MATCH_COUNT=0
 SKIP_PATTERNS=(
     "BoardEntryBuilder.swift"
     "BoardView.swift"
-    "BoardState.swift"
-    "BoardIntent.swift"
+    "BoardNavBar.swift"
+    "BoardViewModePicker.swift"
+    "BoardScrollContent.swift"
+    "PropPlayerRow.swift"
+    "TierDividerRow.swift"
+    "EdgePropCard.swift"
+    "AllPropRow.swift"
+    "PropsFeedView.swift"
     "ProfileContainerView.swift"
     "NotificationsDetailView.swift"
 )
