@@ -175,7 +175,7 @@ season:
 packages:
   bkscore:
     url: git@github.com:bkatnich/BKSCore.git
-    from: "2.4.11"
+    from: "2.4.12"
   bksuicore:
     url: git@github.com:bkatnich/BKSUICore.git
     from: "1.5.60"
@@ -486,6 +486,16 @@ fcm:
     - name: propPredictionsReady
       rawValue: prop_predictions_ready
       preferenceKey: predictionsReady
+    - name: oddsUpdate
+      rawValue: odds_update
+    - name: injuryUpdate
+      rawValue: injury_update
+    - name: lineupUpdate
+      rawValue: lineup_update
+    - name: dataFreshness
+      rawValue: data_freshness
+    - name: gamesUpdate
+      rawValue: games_update
   # Core FCM event strings that map to sport-defined preference keys.
   # These are server-side event names NOT emitted by visiblePushEvents (no VisiblePushEvent model).
   coreEventMappings:

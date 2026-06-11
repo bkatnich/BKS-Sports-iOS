@@ -406,6 +406,59 @@ enum PropFeedFilterPersistence {{
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", "PropFeedFilter.swift"), prop_feed_filter_swift)
 
+# ── ETDate (server day boundaries are America/New_York) ──────────────────
+
+et_date_swift = header() + f"""import Foundation
+
+// MARK: - ETDate
+
+/// Day-boundary helpers pinned to America/New_York.
+///
+/// The server's data day rolls at midnight Eastern, not device-local midnight.
+/// Every cache-staleness decision on the board must use these helpers — using
+/// `Calendar.current` makes a Pacific user's 5 AM open look like "yesterday is
+/// still today" and the board serves a stale slate until manual refresh.
+enum ETDate {{
+
+    /// Eastern Time zone. Falls back to the device zone only if the identifier
+    /// is missing from the OS database (never happens on shipping iOS).
+    static let timeZone = TimeZone(identifier: "America/New_York") ?? .current
+
+    private static let calendar: Calendar = {{
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        return calendar
+    }}()
+
+    private static let dayFormatter: DateFormatter = {{
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        return formatter
+    }}()
+
+    /// True when both instants fall on the same Eastern-Time calendar day.
+    static func isSameETDay(_ lhs: Date, _ rhs: Date) -> Bool {{
+        calendar.isDate(lhs, inSameDayAs: rhs)
+    }}
+
+    /// The Eastern-Time day for `date` as "yyyy-MM-dd" — the same format the
+    /// server uses for `TodaySchedule.date` and silent-push `date` fields.
+    static func dateString(for date: Date = .now) -> String {{
+        dayFormatter.string(from: date)
+    }}
+
+    /// True when a server "yyyy-MM-dd" day string matches the current ET day.
+    /// Used to reject disk-cached schedules from a previous server day.
+    static func isCurrentETDay(serverDateString: String, now: Date = .now) -> Bool {{
+        serverDateString == dateString(for: now)
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Utilities", "ETDate.swift"), et_date_swift)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1c. NotificationPreferenceKey+<Sport>.swift
 #     Sport-specific notification preference key and accessor.
@@ -1045,6 +1098,11 @@ struct {type_prefix}App: App {{
             ) {{ _ in
                 analyticsAdapter.logEvent(AnalyticsEvent.appForegrounded, parameters: nil)
                 GamedayTopicManager.shared.syncIfNeeded()
+                // Self-heal on foreground: overnight gameday pushes are sent to a
+                // date-stamped topic the device only subscribes to on open, so they
+                // can never warm the cache for the first open of a new ET day.
+                // .onAppear is cheap — its reducer skips when the cache is fresh.
+                boardStore.send(.onAppear)
             }}
             .onReceive(
                 NotificationCenter.default.publisher(for: DataRefreshTask.dataDidRefreshNotification)
@@ -1057,6 +1115,19 @@ struct {type_prefix}App: App {{
             ) {{ notification in
                 guard let eventRaw = notification.object as? String else {{ return }}
                 boardStore.send(.pushNotificationTapped(eventRaw))
+                boardStore.send(.backgroundRefreshRequested)
+            }}
+            .onReceive(
+                NotificationCenter.default.publisher(for: PushNotificationNames.foregroundPushReceived)
+                    .receive(on: RunLoop.main)
+            ) {{ notification in
+                // Server contract: any gameday event arriving in the foreground must
+                // refresh the board in place. Unknown event names are ignored here —
+                // silent content-available pushes route via dataDidRefreshNotification.
+                guard let eventRaw = notification.object as? String,
+                      VisiblePushEvent(rawValue: eventRaw) != nil
+                        || DataRefreshTask.SilentPushEvent(rawValue: eventRaw) != nil
+                else {{ return }}
                 boardStore.send(.backgroundRefreshRequested)
             }}
             .onChange(of: boardStore.state.loadState.isLoading) {{ wasLoading, nowLoading in
@@ -3806,6 +3877,7 @@ import SwiftUI
 
 // MARK: - BoardState
 
+// swiftlint:disable:next type_body_length
 struct BoardState {{
     var navigationPath = NavigationPath()
     var loadState: ViewState<[BoardEntry]> = .loading
@@ -3860,9 +3932,11 @@ struct BoardState {{
         {{ state, intent in
             switch intent {{
             case .onAppear:
-                // Force refetch if the calendar date has changed since last load —
-                // yesterday's players must not persist.
-                let isNewDay = state.lastUpdated.map {{ !Calendar.current.isDateInToday($0) }} ?? false
+                // Force refetch if the EASTERN-TIME date has changed since last load —
+                // the server's day rolls at midnight ET, so the device-local calendar
+                // must not be consulted here (a PT user at 9:30 PM is already on the
+                // next server day; at 5 AM they are still on the previous local day).
+                let isNewDay = state.lastUpdated.map {{ !ETDate.isSameETDay($0, .now) }} ?? false
                 let lastUpdatedDesc = state.lastUpdated?.description ?? "nil"
                 let entryCount = state.allEntries.count
                 if !isNewDay,
@@ -4069,6 +4143,15 @@ struct BoardState {{
             let msg = "loadFromDisk — schedule decode failed: \\(error.localizedDescription)"
             logger.warning("\\(msg, privacy: .public)")
             DiagnosticLogger.error(msg, category: "BoardState")
+            return nil
+        }}
+
+        // Reject schedules from a previous ET server day — painting yesterday's
+        // slate (even briefly, ahead of the entitlement-gated network fetch) is
+        // the "stale board until manual refresh" bug. A cache miss here leaves
+        // loadState untouched so the skeleton shows until fresh data arrives.
+        guard ETDate.isCurrentETDay(serverDateString: schedule.date) else {{
+            logger.info("loadFromDisk — cached schedule \\(schedule.date, privacy: .public) is a previous ET day, skipping")
             return nil
         }}
 
@@ -7865,6 +7948,58 @@ enum SeedData {{
 
 write_if_absent(os.path.join(out_dir, "App/Tests/BoardPerformanceTests.swift"), board_performance_tests_swift)
 
+et_date_tests_swift = header() + f"""import XCTest
+@testable import {type_prefix}
+
+/// Server data days roll at midnight America/New_York, not device-local midnight.
+/// These tests pin the ET day-boundary logic that gates board cache staleness:
+/// a Pacific user opening the app at 5 AM local must be treated as a NEW server
+/// day even though the local calendar has not flipped yet.
+final class ETDateTests: XCTestCase {{
+
+    /// 2026-06-11T03:59Z == 2026-06-10 23:59 EDT (UTC-4 in June).
+    private let lateNightET = Date(timeIntervalSince1970: 1_781_150_340)
+    /// 2026-06-11T04:01Z == 2026-06-11 00:01 EDT — two minutes later, new ET day.
+    private let justAfterMidnightET = Date(timeIntervalSince1970: 1_781_150_460)
+    /// 2026-06-11T23:00Z == 2026-06-11 19:00 EDT — same ET day as 00:01 EDT.
+    private let eveningSameETDay = Date(timeIntervalSince1970: 1_781_218_800)
+    /// 2026-01-15T04:59Z == 2026-01-14 23:59 EST (UTC-5 in January).
+    private let winterLateNightET = Date(timeIntervalSince1970: 1_768_453_140)
+
+    func testMidnightETBoundarySplitsDays() {{
+        XCTAssertFalse(
+            ETDate.isSameETDay(lateNightET, justAfterMidnightET),
+            "23:59 ET and 00:01 ET the next day must be different ET days"
+        )
+    }}
+
+    func testSameETDayAcrossWholeDay() {{
+        XCTAssertTrue(
+            ETDate.isSameETDay(justAfterMidnightET, eveningSameETDay),
+            "00:01 ET and 19:00 ET on the same date must be the same ET day"
+        )
+    }}
+
+    func testDateStringUsesEasternTimeInSummer() {{
+        XCTAssertEqual(ETDate.dateString(for: lateNightET), "2026-06-10")
+        XCTAssertEqual(ETDate.dateString(for: justAfterMidnightET), "2026-06-11")
+    }}
+
+    func testDateStringUsesEasternTimeInWinter() {{
+        // EST (UTC-5): 04:59Z is still the previous ET day.
+        XCTAssertEqual(ETDate.dateString(for: winterLateNightET), "2026-01-14")
+    }}
+
+    func testIsCurrentETDayMatchesServerDateString() {{
+        XCTAssertTrue(ETDate.isCurrentETDay(serverDateString: "2026-06-10", now: lateNightET))
+        XCTAssertFalse(ETDate.isCurrentETDay(serverDateString: "2026-06-10", now: justAfterMidnightET))
+        XCTAssertTrue(ETDate.isCurrentETDay(serverDateString: "2026-06-11", now: justAfterMidnightET))
+    }}
+}}
+"""
+
+write_if_absent(os.path.join(out_dir, "App/Tests/ETDateTests.swift"), et_date_tests_swift)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. Info.plist
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8950,8 +9085,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSCore.git",
       "state" : {
-        "revision" : "b6b757c1244dbfb1c373018517c6f0ad095b64b1",
-        "version" : "2.3.0"
+        "revision" : "9067cf30fbe49236d73933be69b4ca8c0d4fb684",
+        "version" : "2.4.12"
       }
     },
     {
@@ -8959,8 +9094,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSUICore.git",
       "state" : {
-        "revision" : "525ab6b7bc29c7df4f10f9f8801a0a08da1a1298",
-        "version" : "1.5.36"
+        "revision" : "9250ca0c49b5b3229c03a51908d0731b257b6fde",
+        "version" : "1.5.60"
       }
     },
     {
@@ -9067,8 +9202,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-protobuf.git",
       "state" : {
-        "revision" : "a008af1a102ff3dd6cc3764bb69bf63226d0f5f6",
-        "version" : "1.36.1"
+        "revision" : "81558271e243f8f47dfe8e9fdd55f3c2b5413f68",
+        "version" : "1.37.0"
       }
     },
     {
