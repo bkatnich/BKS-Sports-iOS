@@ -11,7 +11,7 @@ sport:
   bundleId: com.blackkatt.bksbaseball
   league: MLB
   platform: iOS
-  deploymentTarget: "17.0"
+  deploymentTarget: "18.0"
   xcodeVersion: "26.4"
   swiftVersion: "5.10"
 
@@ -42,9 +42,13 @@ positions:
   - label: Pitchers
     terms: [Pitchers, P]
   - label: Infielders
-    terms: [Infielder, Inf, First Base, FB, Second Base, 2B, Short Stop, SS, Third Base, 3B, Catcher, C]
+    termLines:   # explicit groups — each list renders as one wrapped source line
+      - [Infielder, Inf, First Base, FB, Second Base, 2B]
+      - [Short Stop, SS, Third Base, 3B, Catcher, C]
   - label: Outfielders
-    terms: [Outfielder, Out, Right Fielder, RF, Center Fielder, Centre Fielder, CF, Left Fielder, LF]
+    termLines:
+      - [Outfielder, Out, Right Fielder, RF]
+      - [Center Fielder, Centre Fielder, CF, Left Fielder, LF]
 
 # ---------------------------------------------------------------------------
 # Tier definitions (maps to TierLevel: elite / good / solid / bottom)
@@ -83,7 +87,9 @@ tiers:
 scoring:
   platform: draftkings
   formula: mlb_classic
-  calculator: DraftKingsMLBCalculator
+  # Live app uses a private NullScoringCalculator inlined in SportConfiguration —
+  # fantasy scoring is server-side; the client never computes scores.
+  useNullCalculator: true
   stats:
     # Hitter stats
     - key: single
@@ -196,10 +202,6 @@ api:
       - position
       - headshot_url
       - mlb_person_id
-      - player_tier
-      - avg_fantasy_score
-      - avg_fantasy_score_home
-      - avg_fantasy_score_away
       - recent_game_scores
       - trend_score
       - trend_direction
@@ -229,11 +231,8 @@ api:
       - opponent_abbr
       - headshot_url
       - mlb_person_id
-      - opportunity_score
+      - opp_ranking_score
       - opportunity_tier
-      - player_tier
-      - mode
-      - platform
       - injury_status
       - is_surging
       - is_home
@@ -244,7 +243,7 @@ api:
     params:
       limit: 20   # explicit — server default changed; Board lazy-loads subsequent pages
       platform: dk
-      mode: balanced
+      mode: ""
 
   projections:
     url: ""
@@ -252,7 +251,7 @@ api:
     params:
       lookahead: 1   # server returns today-only projections; lookahead > 1 is ignored
       platform: dk
-      mode: gpp
+      mode: ""
 
   board:
     url: ""
@@ -262,22 +261,15 @@ api:
   redeemPromoCode:
     url: ""
 
-  leagueState:
-    url: ""
-
-  playoffBracket:
-    url: ""
-
-gameDetail:
-  spreadLabel: "Run Line"
-  spreadPickLabel: "Run Line Pick"
-    # No query params sent — server defaults to current playoff year
-
   gameLog:
     baseURL: https://api.balldontlie.io/mlb/v1
     # Requires API key injected via GameLogAPIKey in Info.plist
     # Full stat access requires GOAT tier ($39.99/mo) or All-Access ($499.99/mo)
     apiKeyRequired: true
+
+gameDetail:
+  spreadLabel: "Run Line"
+  spreadPickLabel: "Run Line Pick"
 
 # ---------------------------------------------------------------------------
 # Game log stat fields — drives GameEntry.swift and GameLogViews.swift

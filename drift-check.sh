@@ -65,7 +65,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Run scaffold into tmp dir (suppressing its printed output)
-"$SCRIPT_DIR/scaffold.sh" "$SPORT_SLUG" "$TMP_DIR" > /dev/null 2>&1 || {
+SCAFFOLD_OPEN=0 "$SCRIPT_DIR/scaffold.sh" "$SPORT_SLUG" "$TMP_DIR" > /dev/null 2>&1 || {
     echo "Error: scaffold.sh failed — fix scaffold errors before running drift-check."
     exit 1
 }
@@ -82,7 +82,6 @@ SKIP_PATTERNS=(
     "BoardEntryBuilder.swift"
     "BoardView.swift"
     "BoardNavBar.swift"
-    "BoardViewModePicker.swift"
     "BoardScrollContent.swift"
     "PropPlayerRow.swift"
     "TierDividerRow.swift"

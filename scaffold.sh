@@ -19,7 +19,6 @@
 #   <Calculator>.swift  (ScoringCalculator implementation)
 #   SportConfiguration+<Sport>.swift
 #   TierThresholds+<Sport>.swift
-#   GameLogViews.swift
 #   Features/Board/ — BoardEntry, BoardEntryBuilder, BoardState, BoardIntent, BoardView (stubs)
 #   Features/Profile/ — ProfileContainerView, NotificationsDetailView
 #   workspace.yml, generate.sh, project.yml, xcconfig files, Info.plist, storekit stub
@@ -108,6 +107,7 @@ name        = sport["name"]          # e.g. "Baseball"
 slug        = sport["slug"]          # e.g. "baseball"
 prefix      = sport["prefix"]        # e.g. "BKS"
 app_name    = sport["appName"]       # e.g. "BKS Baseball"
+display_name = sport.get("displayName", sport["name"])
 bundle_id   = sport["bundleId"]      # e.g. "com.blackkatt.bksbaseball"
 league      = sport.get("league", name.upper())
 deploy_tgt  = sport["deploymentTarget"]
@@ -143,6 +143,10 @@ season_mode_cases = "\n".join(season_mode_case(m) for m in season_modes)
 swift_name  = name.replace(" ", "")         # "BaseBall" -> "Baseball"
 type_prefix = f"{prefix}{swift_name}"       # "BKSBaseball"
 calc_name   = scoring.get("calculator", f"{swift_name}ScoringCalculator")
+use_null_calc = scoring.get("useNullCalculator", False)
+# Live apps that score server-side inline a private NullScoringCalculator in
+# SportConfiguration instead of generating a full calculator file.
+calc_ref = "NullScoringCalculator()" if use_null_calc else f"{calc_name}.shared"
 platform_label = (
     scoring.get("platform", "DraftKings")
     .replace("draftkings", "DraftKings")
@@ -224,18 +228,11 @@ sub_group       = subscription.get("groupID", f"{type_prefix}Subscriptions")
 sub_product_id  = f"{bundle_id}.{sub_suffix}"
 
 config_keys = header() + f"""\
-import Foundation
 import BKSCore
+import Foundation
 import OSLog
 
 // MARK: - {name}-specific configuration keys
-
-extension ConfigurationKey where Value == Bool {{
-    static let opportunitiesIncludeResting = ConfigurationKey(
-        name: "opportunitiesIncludeResting",
-        defaultValue: false
-    )
-}}
 
 extension ConfigurationKey where Value == String {{
     static let vegasBookPreference = ConfigurationKey(
@@ -254,69 +251,35 @@ extension ConfigurationKey where Value == String {{
         name: "fcmPlayoffTopic",
         defaultValue: "{fcm_playoff}"
     )
-"""
-if api_key_needed:
-    config_keys += f"""\
-    static let gameLogAPIKey = ConfigurationKey(
-        name: "gameLogAPIKey",
-        defaultValue: "",
-        infoPlistKey: "GameLogAPIKey"
-    )
-"""
-config_keys += f"""\
-    static let gameLogBaseURL = ConfigurationKey(
-        name: "gameLogBaseURL",
-        defaultValue: "{gamelog_base}"
-    )
-    static let getPlayersURL = ConfigurationKey(
-        name: "getPlayersURL",
-        defaultValue: "UNCONFIGURED_GET_PLAYERS_URL",
-        infoPlistKey: "GetPlayersURL"
-    )
-    static let getOpportunitiesURL = ConfigurationKey(
-        name: "getOpportunitiesURL",
-        defaultValue: "UNCONFIGURED_GET_OPPORTUNITIES_URL",
-        infoPlistKey: "GetOpportunitiesURL"
-    )
-    static let getBoardURL = ConfigurationKey(
-        name: "getBoardURL",
-        defaultValue: "UNCONFIGURED_GET_BOARD_URL",
-        infoPlistKey: "GetBoardURL"
-    )
-    static let getProjectionsURL = ConfigurationKey(
-        name: "getProjectionsURL",
-        defaultValue: "UNCONFIGURED_GET_PROJECTIONS_URL",
-        infoPlistKey: "GetProjectionsURL"
-    )
-    static let getLeagueStateURL = ConfigurationKey(
-        name: "getLeagueStateURL",
-        defaultValue: "UNCONFIGURED_GET_LEAGUE_STATE_URL",
-        infoPlistKey: "GetLeagueStateURL"
-    )
-    static let getPlayoffBracketURL = ConfigurationKey(
-        name: "getPlayoffBracketURL",
-        defaultValue: "UNCONFIGURED_GET_PLAYOFF_BRACKET_URL",
-        infoPlistKey: "GetPlayoffBracketURL"
-    )
-    static let getDailyAnalysisURL = ConfigurationKey(
-        name: "getDailyAnalysisURL",
-        defaultValue: "UNCONFIGURED_GET_DAILY_ANALYSIS_URL",
-        infoPlistKey: "GetDailyAnalysisURL"
+    static let redeemPromoCodeURL = ConfigurationKey(
+        name: "redeemPromoCodeURL",
+        defaultValue: "UNCONFIGURED_REDEEM_PROMO_CODE_URL",
+        infoPlistKey: "RedeemPromoCodeURL"
     )
     static let getActivityFeedURL = ConfigurationKey(
         name: "getActivityFeedURL",
         defaultValue: "UNCONFIGURED_GET_ACTIVITY_FEED_URL",
         infoPlistKey: "GetActivityFeedURL"
     )
+    static let getDailyAnalysisURL = ConfigurationKey(
+        name: "getDailyAnalysisURL",
+        defaultValue: "UNCONFIGURED_GET_DAILY_ANALYSIS_URL",
+        infoPlistKey: "GetDailyAnalysisURL"
+    )
     static let updateUserPreferencesURL = ConfigurationKey(
         name: "updateUserPreferencesURL",
         defaultValue: "UNCONFIGURED_UPDATE_USER_PREFERENCES_URL",
         infoPlistKey: "UpdateUserPreferencesURL"
     )
-    static let redeemPromoCodeURL = ConfigurationKey(
-        name: "redeemPromoCodeURL",
-        defaultValue: "UNCONFIGURED_REDEEM_PROMO_CODE_URL",
-        infoPlistKey: "RedeemPromoCodeURL"
+    static let getPlayersURL = ConfigurationKey(
+        name: "getPlayersURL",
+        defaultValue: "UNCONFIGURED_GET_PLAYERS_URL",
+        infoPlistKey: "GetPlayersURL"
+    )
+    static let getBoardURL = ConfigurationKey(
+        name: "getBoardURL",
+        defaultValue: "UNCONFIGURED_GET_BOARD_URL",
+        infoPlistKey: "GetBoardURL"
     )
     static let termsOfServiceURL = ConfigurationKey(
         name: "termsOfServiceURL",
@@ -326,6 +289,23 @@ config_keys += f"""\
         name: "privacyPolicyURL",
         defaultValue: "https://www.blackkatt.ca/privacy-policy.html"
     )
+}}
+
+// MARK: - URL configuration guard
+
+private let configLogger = os.Logger(subsystem: "{bundle_id}", category: "Configuration")
+
+extension ConfigurationProtocol {{
+    /// Returns the string value for a URL key, logging a critical error if it is still a placeholder.
+    func checkedURL(for key: ConfigurationKey<String>) -> String {{
+        let url = value(for: key)
+        if url.hasPrefix("UNCONFIGURED_") {{
+            let xconfigKey = key.infoPlistKey ?? key.name
+            let message = "⚠️ URL NOT CONFIGURED: '\\(key.name)' is still a placeholder. Set \\(xconfigKey) in your xcconfig."
+            configLogger.critical("\\(message, privacy: .public)")
+        }}
+        return url
+    }}
 }}
 
 // MARK: - Background task identifier
@@ -341,22 +321,6 @@ enum SubscriptionProductID {{
     static let subscriptionGroupID = "{sub_group}"
     static var allCurrentProductIDs: Set<String> {{ [basicMonthly] }}
 }}
-
-// MARK: - URL configuration guard
-
-private let configLogger = os.Logger(subsystem: "{bundle_id}", category: "Configuration")
-
-extension ConfigurationProtocol {{
-    /// Returns the string value for a URL key, logging a critical error if it is still a placeholder.
-    func checkedURL(for key: ConfigurationKey<String>) -> String {{
-        let url = value(for: key)
-        if url.hasPrefix("UNCONFIGURED_") {{
-            let xconfigKey = key.infoPlistKey ?? key.name
-            configLogger.critical("⚠️ URL NOT CONFIGURED: '\\(key.name, privacy: .public)' is still a placeholder. Set \\(xconfigKey, privacy: .public) in your xcconfig.")
-        }}
-        return url
-    }}
-}}
 """
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"ConfigurationKeys+{swift_name}.swift"), config_keys)
@@ -370,7 +334,7 @@ write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"ConfigurationKeys+{s
 visible_push_events = fcm.get("visiblePushEvents", [])
 
 cases_block = "\n".join(
-    f'    case {e["name"]:<18} = "{e["rawValue"]}"'
+    f'    case {e["name"]:<19} = "{e["rawValue"]}"'
     for e in visible_push_events
 )
 
@@ -388,6 +352,60 @@ enum VisiblePushEvent: String {{
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", "VisiblePushEvent.swift"), visible_push_swift)
 
+# ── PropFeedFilter (props feed filtering + persistence) ────────────────────
+
+prop_feed_filter_swift = header() + f"""import Foundation
+
+// MARK: - PropFeedFilter
+
+/// Active filter state for the props feed. Persisted to UserDefaults via PropFeedFilterPersistence.
+struct PropFeedFilter: Equatable, Codable {{
+    var selectedStatCategories: Set<PropStatCategory> = []
+    var minimumTier: PropEdgeTier = .subdued
+    var instinctAgreesOnly: Bool = false
+
+    var isActive: Bool {{
+        !selectedStatCategories.isEmpty
+            || minimumTier > .subdued
+            || instinctAgreesOnly
+    }}
+
+    var activeFilterCount: Int {{
+        (selectedStatCategories.isEmpty ? 0 : 1)
+            + (minimumTier > .subdued ? 1 : 0)
+            + (instinctAgreesOnly ? 1 : 0)
+    }}
+}}
+
+// MARK: - PropEdgeTier+Codable
+
+extension PropEdgeTier: Codable {{}}
+
+// MARK: - PropFeedFilterPersistence
+
+enum PropFeedFilterPersistence {{
+    /// Bump to "propFeedFilter.v2" if any PropStatCategory rawValue is renamed
+    /// to track a server stat-key change. This invalidates stored filters and
+    /// returns the default rather than silently hiding mismatched props.
+    private static let key = "propFeedFilter.v1"
+
+    static func load() -> PropFeedFilter {{
+        guard
+            let data = UserDefaults.standard.data(forKey: key),
+            let decoded = try? JSONDecoder().decode(PropFeedFilter.self, from: data)
+        else {{ return .init() }}
+        return decoded
+    }}
+
+    static func save(_ filter: PropFeedFilter) {{
+        guard let data = try? JSONEncoder().encode(filter) else {{ return }}
+        UserDefaults.standard.set(data, forKey: key)
+    }}
+}}
+"""
+
+write(os.path.join(out_dir, "App/Sources/Core/Utilities", "PropFeedFilter.swift"), prop_feed_filter_swift)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1c. NotificationPreferenceKey+<Sport>.swift
 #     Sport-specific notification preference key and accessor.
@@ -395,41 +413,49 @@ write(os.path.join(out_dir, "App/Sources/Core/Utilities", "VisiblePushEvent.swif
 
 notif_prefs = fcm.get("notificationPreferences", [])
 
-notif_pref_key_swift = header() + f"""\
-import BKSCore
+notif_pref_key_swift = header() + f"""import BKSCore
 
-// MARK: - {name} notification preference keys
+// MARK: - {swift_name} notification preference keys
 
 extension NotificationPreferenceKey {{
     /// Playoff series/elimination alerts — {slug}-specific.
-    public static let playoffAlerts = NotificationPreferenceKey(rawValue: "playoff_alerts")
-"""
-for pref in notif_prefs:
-    notif_pref_key_swift += f"""\
-    /// {pref.get('label', pref['key'])} — {slug}-specific.
-    public static let {pref['key']} = NotificationPreferenceKey(rawValue: "{pref['rawValue']}")
-"""
-notif_pref_key_swift += f"""\
+    public static let playoffAlerts    = NotificationPreferenceKey(rawValue: "playoff_alerts")
+    /// Game schedule updates (games_update) — {slug}-specific.
+    public static let gameUpdates      = NotificationPreferenceKey(rawValue: "game_updates")
+    /// Pre-game data freshness alerts (data_freshness) — {slug}-specific.
+    public static let pregameAlerts    = NotificationPreferenceKey(rawValue: "pregame_alerts")
+    /// Analysis and predictions ready (analysis_ready, prop_predictions_ready) — {slug}-specific.
+    public static let predictionsReady = NotificationPreferenceKey(rawValue: "predictions_ready")
 }}
 
-// MARK: - {name} preference accessors
+// MARK: - {swift_name} preference accessors
 
 extension NotificationPreferences {{
     /// Playoff alerts preference. Stored in `sportPreferences["playoff_alerts"]`.
     public var playoffAlerts: Bool? {{
-        get {{ sportPreferences[NotificationPreferenceKey.playoffAlerts.rawValue] }}
-        set {{ sportPreferences[NotificationPreferenceKey.playoffAlerts.rawValue] = newValue }}
+        get {{ sportPreferences["playoff_alerts"] }}
+        set {{ sportPreferences["playoff_alerts"] = newValue }}
     }}
-"""
-for pref in notif_prefs:
-    notif_pref_key_swift += f"""\
-    /// {pref.get('label', pref['key'])} preference.
-    public var {pref['key']}: Bool? {{
-        get {{ sportPreferences[NotificationPreferenceKey.{pref['key']}.rawValue] }}
-        set {{ sportPreferences[NotificationPreferenceKey.{pref['key']}.rawValue] = newValue }}
+
+    /// Game updates preference. Stored in `sportPreferences["game_updates"]`.
+    public var gameUpdates: Bool? {{
+        get {{ sportPreferences["game_updates"] }}
+        set {{ sportPreferences["game_updates"] = newValue }}
     }}
+
+    /// Pre-game alerts preference. Stored in `sportPreferences["pregame_alerts"]`.
+    public var pregameAlerts: Bool? {{
+        get {{ sportPreferences["pregame_alerts"] }}
+        set {{ sportPreferences["pregame_alerts"] = newValue }}
+    }}
+
+    /// Predictions ready preference. Stored in `sportPreferences["predictions_ready"]`.
+    public var predictionsReady: Bool? {{
+        get {{ sportPreferences["predictions_ready"] }}
+        set {{ sportPreferences["predictions_ready"] = newValue }}
+    }}
+}}
 """
-notif_pref_key_swift += "}\n"
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"NotificationPreferenceKey+{swift_name}.swift"), notif_pref_key_swift)
 
@@ -438,40 +464,21 @@ write(os.path.join(out_dir, "App/Sources/Core/Utilities", f"NotificationPreferen
 #     Maps raw FCM event strings → preference keys for this sport.
 # ─────────────────────────────────────────────────────────────────────────────
 
-from collections import defaultdict as _defaultdict
-
-# visiblePushEvents with an explicit preferenceKey → auto-generated switch cases.
-# Events without preferenceKey (e.g. analysisReady) fall through to the default arm.
-pref_to_events = _defaultdict(list)
-for e in visible_push_events:
-    if "preferenceKey" in e:
-        pref_to_events[e["preferenceKey"]].append(e["rawValue"])
-# playoffAlerts covers the four playoff VisiblePushEvents that have no preferenceKey
-playoff_raw = [e["rawValue"] for e in visible_push_events if "preferenceKey" not in e and e["name"] not in ("analysisReady",)]
-if playoff_raw:
-    pref_to_events["playoffAlerts"].extend(playoff_raw)
-
-fcm_case_lines = []
-for pref_key, raw_values in pref_to_events.items():
-    quoted = ", ".join(f'"{v}"' for v in raw_values)
-    fcm_case_lines.append(f'        case {quoted}:\n            self = .{pref_key}')
-
-# coreEventMappings: server events that aren't VisiblePushEvents but still map to prefs.
-core_event_mappings = fcm.get("coreEventMappings", [])
-for m in core_event_mappings:
-    fcm_case_lines.append(f'        case "{m["rawValue"]}":\n            self = .{m["preferenceKey"]}')
-
-fcm_cases = "\n".join(fcm_case_lines)
-
-notif_fcm_swift = header() + f"""\
-import BKSCore
+notif_fcm_swift = header() + f"""import BKSCore
 
 extension NotificationPreferenceKey {{
-    /// Maps FCM event strings to preference keys for the {name} app.
+    /// Maps FCM event strings to preference keys for the {swift_name} app.
     /// Sport-specific events are handled here; core events delegate to BKSCore.
     init?(fcmEvent: String) {{
         switch fcmEvent {{
-{fcm_cases}
+        case "series_clinch", "elimination_game", "bracket_advance", "champion":
+            self = .playoffAlerts
+        case "analysis_ready", "prop_predictions_ready":
+            self = .predictionsReady
+        case "games_update":
+            self = .gameUpdates
+        case "data_freshness":
+            self = .pregameAlerts
         default:
             guard let key = NotificationPreferenceKey(coreEvent: fcmEvent) else {{ return nil }}
             self = key
@@ -482,10 +489,7 @@ extension NotificationPreferenceKey {{
 
 write(os.path.join(out_dir, "App/Sources/Core/Utilities", "NotificationPreferenceKey+FCM.swift"), notif_fcm_swift)
 
-fetch_coalescer_swift = f"""\
-{header()}
-
-import OSLog
+fetch_coalescer_swift = header() + f"""import OSLog
 
 // MARK: - FetchCoalescer
 
@@ -555,6 +559,12 @@ chips_str = '", "'.join(chips)
 terms_lines = []
 for p in positions:
     label = p["label"]
+    if "termLines" in p:
+        # Explicit line groups — controls wrapping in the generated source.
+        group_lines = [", ".join(f'"{t}"' for t in group) for group in p["termLines"]]
+        inner = ",\n                ".join(group_lines)
+        terms_lines.append(f'            "{label}": [\n                {inner}\n            ]')
+        continue
     terms = p["terms"]
     quoted = [f'"{t}"' for t in terms]
     single_line = f'            "{label}": [{", ".join(quoted)}]'
@@ -661,7 +671,8 @@ extension ScoringCalculator where Self == {calc_name} {{
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Core/Sport", f"{calc_name}.swift"), calc_file)
+if not use_null_calc:
+    write(os.path.join(out_dir, "App/Sources/Core/Sport", f"{calc_name}.swift"), calc_file)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. TierThresholds+<Sport>.swift
@@ -734,8 +745,10 @@ proj_mode    = proj_params.get("mode", "gpp")
 # Team lookup — from YAML teamIDs section, or empty with TODO comment
 raw_team_ids = spec.get("teamIDs", {})
 if raw_team_ids:
-    team_id_lines = ", ".join(f'{k}: "{v}"' for k, v in sorted(raw_team_ids.items()))
-    team_lookup_value = f"[{team_id_lines}]"
+    team_pairs = [f'{k}: "{v}"' for k, v in sorted(raw_team_ids.items())]
+    team_rows = [", ".join(team_pairs[i:i + 5]) for i in range(0, len(team_pairs), 5)]
+    team_id_lines = ",\n            ".join(team_rows)
+    team_lookup_value = f"[\n            {team_id_lines}\n        ]"
     team_lookup_comment = ""
 else:
     team_lookup_value = "[:]"
@@ -748,18 +761,17 @@ import BKSUICore
 // MARK: - {league} {name}
 
 extension SportConfiguration {{
-    /// Fully-formatted splash subtitle built from the localized format string.
     var splashSubtitle: String {{
-        String(format: String(localized: "splash.subtitle"), sportName)
+        String(localized: "splash.subtitle", defaultValue: "{display_name} Edition")
     }}
 
-    /// Sport configuration for {league} {name} / {platform_label} Classic.
+    /// Sport configuration for {league} {name}.
     static let {slug} = SportConfiguration(
         slug: "{slug}",
         sportName: String(localized: "splash.sportName", defaultValue: "{name}"),
         cacheKeyPrefix: "{slug}_",
         positionMap: .{slug},
-        scoringCalculator: {calc_name}.shared,
+        scoringCalculator: {calc_ref},
         tierThresholds: [
 {tier_thresh_dict}
         ],
@@ -776,252 +788,16 @@ extension SportConfiguration {{
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportConfiguration+{swift_name}.swift"), sport_config)
+if use_null_calc:
+    sport_config += f"""
+// MARK: - NullScoringCalculator
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. GameLogViews.swift (sport-specific stat pills)
-# ─────────────────────────────────────────────────────────────────────────────
-
-display = gamelog.get("display", {})
-primary_stats   = display.get("primary", [])
-secondary_stats = display.get("secondary", [])
-backslash = chr(92)  # used inside f-strings to emit a literal backslash
-
-def stat_pill_line(s, entry_var="entry", config_var="sportConfig"):
-    key = s["key"]
-    label_key = s.get("localizationKey", f"gamelog.header.{key}")
-    label_default = s.get("label", key.upper())
-    color = s.get("color", None)
-
-    if key == "dk":
-        value = f'String(format: "%.1f", {config_var}.scoringCalculator.score(for: {entry_var}))'
-        color_arg = f",\n                color: AppColors.dkGreen"
-    elif key == "minutes":
-        value = f'{entry_var}.minutes'
-        color_arg = ""
-    else:
-        value = f'"\\({entry_var}.{key})"'
-        color_arg = ""
-
-    return f"""\
-            statPill(
-                label: String(localized: "{label_key}", defaultValue: "{label_default}"),
-                value: {value}{color_arg}
-            )"""
-
-primary_pills   = "\n".join([stat_pill_line(s) for s in primary_stats])
-secondary_pills = "\n".join([stat_pill_line(s) for s in secondary_stats])
-
-gamelog_views = header() + f"""\
-import SwiftUI
-import BKSCore
-import BKSUICore
-
-// MARK: - GameLogPlaceholderView
-
-struct GameLogPlaceholderView: View {{
-    enum Style {{ case loading, empty }}
-    let style: Style
-
-    var body: some View {{
-        VStack(spacing: 6) {{
-            switch style {{
-            case .loading:
-                ProgressView()
-                    .tint(.white)
-                Text(String(localized: "Loading game log...", defaultValue: "Loading game log..."))
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(AppOpacity.separator))
-            case .empty:
-                Image(systemName: "calendar.badge.exclamationmark")
-                    .font(.callout)
-                    .foregroundStyle(.white.opacity(AppOpacity.dim))
-                    .accessibilityHidden(true)
-                Text(String(localized: "No games found", defaultValue: "No games found"))
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(AppOpacity.separator))
-            }}
-        }}
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 28)
-        .appCard()
-    }}
-}}
-
-// MARK: - GameLogTableView
-
-struct GameLogTableView: View {{
-    let entries: [GameEntry]
-    @Environment({backslash}.sportConfiguration) private var sportConfig
-
-    var body: some View {{
-        VStack(spacing: 6) {{
-            ForEach(entries) {{ entry in
-                if entry.isDNP {{
-                    dnpCard(entry: entry)
-                }} else {{
-                    gameCard(entry: entry)
-                }}
-            }}
-        }}
-    }}
-
-    // MARK: - Game Card
-
-    private func gameCard(entry: GameEntry) -> some View {{
-        VStack(alignment: .leading, spacing: 4) {{
-            gameHeaderRow(entry: entry)
-            primaryStatsRow(entry: entry)
-            secondaryStatsRow(entry: entry)
-        }}
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .appCard()
-    }}
-
-    private func gameHeaderRow(entry: GameEntry) -> some View {{
-        HStack(spacing: 0) {{
-            Text(Self.dateFormatter.string(from: entry.gameDate))
-                .foregroundStyle(.white.opacity(AppOpacity.secondary))
-            Text(" ")
-            Text(entry.isHomeGame
-                ? String(localized: "gamelog.vs", defaultValue: "vs")
-                : String(localized: "gamelog.at", defaultValue: "at"))
-                .foregroundStyle(.white.opacity(AppOpacity.muted))
-            Text(" ")
-            Text(entry.opponentAbbreviation)
-                .foregroundStyle(.white.opacity(AppOpacity.primary))
-            Spacer(minLength: 0)
-            resultText(for: entry)
-        }}
-        .font(AppFonts.gameLogHeader)
-        .lineLimit(1)
-        .minimumScaleFactor(0.8)
-        .accessibilityElement(children: .combine)
-    }}
-
-    private func primaryStatsRow(entry: GameEntry) -> some View {{
-        HStack(spacing: 0) {{
-{primary_pills}
-        }}
-        .accessibilityElement(children: .combine)
-    }}
-
-    private func secondaryStatsRow(entry: GameEntry) -> some View {{
-        HStack(spacing: 0) {{
-{secondary_pills}
-        }}
-        .foregroundStyle(.white.opacity(AppOpacity.secondary))
-        .accessibilityElement(children: .combine)
-    }}
-
-    // MARK: - Stat Pill
-
-    private func statPill(
-        label: String,
-        value: String,
-        color: Color = .white
-    ) -> some View {{
-        HStack(spacing: 3) {{
-            Text(label)
-                .font(AppFonts.gameLogHeader)
-                .foregroundStyle(.white.opacity(AppOpacity.muted))
-            Text(value)
-                .font(AppFonts.gameLogCell)
-                .foregroundStyle(color)
-        }}
-        .lineLimit(1)
-        .minimumScaleFactor(0.8)
-        .frame(maxWidth: .infinity)
-    }}
-
-    // MARK: - DNP Card
-
-    private func dnpCard(entry: GameEntry) -> some View {{
-        VStack(alignment: .leading, spacing: 4) {{
-            HStack(spacing: 0) {{
-                Text(Self.dateFormatter.string(from: entry.gameDate))
-                    .foregroundStyle(AppColors.dnpText)
-                Text(" ")
-                Text(entry.isHomeGame
-                    ? String(localized: "gamelog.vs", defaultValue: "vs")
-                    : String(localized: "gamelog.at", defaultValue: "at"))
-                    .foregroundStyle(AppColors.dnpText.opacity(0.6))
-                Text(" ")
-                Text(entry.opponentAbbreviation)
-                    .foregroundStyle(AppColors.dnpText)
-                Spacer(minLength: 0)
-                resultText(for: entry)
-            }}
-            .font(AppFonts.gameLogHeader)
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
-
-            Text(String(localized: "gamelog.dnp", defaultValue: "DNP"))
-                .font(AppFonts.gameLogCell)
-                .foregroundStyle(AppColors.dnpText)
-        }}
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(AppColors.dnpBackground)
-        .appCard()
-    }}
-
-    // MARK: - Helpers
-
-    private func resultText(for entry: GameEntry) -> some View {{
-        let color: Color = entry.result.isWin ? .green : .red
-        let winLoss: String = entry.result.isWin
-            ? String(localized: "W", defaultValue: "W")
-            : String(localized: "L", defaultValue: "L")
-        return Text(winLoss + " " + entry.result.displayScore)
-            .foregroundStyle(color.opacity(0.9))
-    }}
-
-    private static let dateFormatter: DateFormatter = {{
-        let formatter = DateFormatter()
-        formatter.dateFormat = "M/d"
-        return formatter
-    }}()
-}}
-
-// MARK: - GameLogErrorView
-
-struct GameLogErrorView: View {{
-    let error: Error
-    let onRetry: () -> Void
-
-    var body: some View {{
-        VStack(spacing: 10) {{
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.callout)
-                .foregroundStyle(.white.opacity(AppOpacity.separator))
-                .accessibilityHidden(true)
-            Text(String(localized: "Failed to load game log", defaultValue: "Failed to load game log"))
-                .font(.caption)
-                .foregroundStyle(.white.opacity(AppOpacity.secondary))
-            Text(error.localizedDescription)
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(AppOpacity.separator))
-                .multilineTextAlignment(.center)
-            Button(action: onRetry) {{
-                Text(String(localized: "Retry", defaultValue: "Retry"))
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 6)
-                    .background(.white.opacity(AppOpacity.faint))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .foregroundStyle(.white)
-            }}
-        }}
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
-        .appCard()
-    }}
+private struct NullScoringCalculator: ScoringCalculator {{
+    func score(for entry: GameEntry) -> Double {{ 0 }}
 }}
 """
 
-write(os.path.join(out_dir, "App/Sources/Features/Board/Views/GameLogViews.swift"), gamelog_views)
+write(os.path.join(out_dir, "App/Sources/Core/Sport", f"SportConfiguration+{swift_name}.swift"), sport_config)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8b. SportPositionMap+<Sport>.swift  (BKSCore owns SportPositionMap base struct)
@@ -1039,8 +815,7 @@ write(os.path.join(out_dir, "App/Sources/Features/Board/Views/GameLogViews.swift
 #     Fully-wired entry point + DI container + Firebase wiring.
 # ─────────────────────────────────────────────────────────────────────────────
 
-bootstrap_app = header() + f"""\
-import BackgroundTasks
+bootstrap_app = header() + f"""import BackgroundTasks
 import BKSCore
 import BKSUICore
 import OSLog
@@ -1083,7 +858,7 @@ struct {type_prefix}App: App {{
     @State private var isErasingCache = false
     /// True once refreshEntitlement() has completed. Guards the board from fetching
     /// before the backend has confirmed the user's subscription state, preventing
-    /// spurious 402 responses for users on non-expiring tiers.
+    /// spurious 402 responses for users on non-expiring tiers (e.g. Insider).
     @State private var entitlementReady = false
     #if DEBUG
     @State private var frameMonitor = FrameDropMonitor()
@@ -1217,7 +992,9 @@ struct {type_prefix}App: App {{
                 defer {{ Perf.end("AppLaunchPostFirstFrame", id: appLaunchID, startedAt: appLaunchStart) }}
 
                 authStore.send(.checkStoredCredential)
+                Self.logger.debug("AppTask: checkStoredCredential sent (\\(Date().timeIntervalSince(t0), privacy: .public)s)")
                 profileStore.send(.onAppear)
+                Self.logger.debug("AppTask: profileStore.onAppear sent (\\(Date().timeIntervalSince(t0), privacy: .public)s)")
 
                 let log = Self.logger
                 await Perf.measure("SubscriptionRefresh") {{
@@ -1226,7 +1003,12 @@ struct {type_prefix}App: App {{
                 log.debug("AppTask: refreshEntitlement done (\\(Date().timeIntervalSince(t0), privacy: .public)s)")
 
                 entitlementReady = true
+                Self.logger.debug("AppTask: entitlementReady=true (\\(Date().timeIntervalSince(t0), privacy: .public)s)")
 
+                // Push registration is independent of subscription state — fire after
+                // entitlementReady so it never blocks the board from fetching.
+                // On first launch requestAuthorization() awaits the system alert; keeping
+                // it out of the entitlement gate prevents an indefinite block.
                 Task {{
                     await Perf.measure("PushNotificationRegister") {{
                         await BKSAppScaffold.registerForPushNotifications()
@@ -1244,9 +1026,13 @@ struct {type_prefix}App: App {{
                 #endif
             }}
             .onChange(of: authSessionResolved) {{ _, resolved in
+                Self.logger.debug("authSessionResolved changed → \\(resolved, privacy: .public) session=\\(String(describing: authStore.state.session), privacy: .public)")
                 if resolved, case .authenticated = authStore.state.session {{
                     Task {{ await syncPreferencesToServer() }}
                 }}
+            }}
+            .onChange(of: entitlementReady) {{ _, ready in
+                Self.logger.debug("entitlementReady changed → \\(ready, privacy: .public)")
             }}
             .onReceive(
                 NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
@@ -1284,6 +1070,8 @@ struct {type_prefix}App: App {{
 
     // MARK: - Preference sync
 
+    /// Pushes locally-stored notification preferences to the server immediately after
+    /// auth resolves. Guards against divergence when a toggle was made while offline.
     private func syncPreferencesToServer() async {{
         let svc = (UIApplication.shared.delegate as? AppDelegate)?
             .container?.resolve(UserPreferencesServiceProtocol.self)
@@ -1304,6 +1092,8 @@ struct {type_prefix}App: App {{
     }}
 
     private func forceRefreshGameData() {{
+        // Keys from services defined in this repo — authoritative source of truth.
+        // "daily_analysis_v2" is owned by BKSCore.DailyAnalysisService (private constant).
         let gameDataKeys = boardService.cacheKeys + ["daily_analysis_v2"]
         Task.detached(priority: .userInitiated) {{ [storage] in
             for key in gameDataKeys {{
@@ -1334,23 +1124,25 @@ struct {type_prefix}App: App {{
     }}
 
     private var consentTermRows: [TermRow] {{
-        // MANUAL: replace these with sport-specific consent terms.
         [
             TermRow(
-                icon: "calendar",
-                title: String(localized: "consent.term.daily.title", defaultValue: "Daily picks, every game day"),
+                icon: "{slug}.fill",
+                title: String(localized: "consent.term.daily.title",
+                              defaultValue: "Daily picks, every game day"),
                 detail: String(localized: "consent.term.daily.detail",
-                               defaultValue: "Board and prop opportunities updated each morning.")
+                               defaultValue: "Board, projections, and prop opportunities updated each morning.")
             ),
             TermRow(
                 icon: "arrow.clockwise",
-                title: String(localized: "consent.term.cancel.title", defaultValue: "Cancel any time"),
+                title: String(localized: "consent.term.cancel.title",
+                              defaultValue: "Cancel any time"),
                 detail: String(localized: "consent.term.cancel.detail",
                                defaultValue: "No commitment. Cancel before renewal and you won't be charged.")
             ),
             TermRow(
                 icon: "creditcard",
-                title: String(localized: "consent.term.billing.title", defaultValue: "$2.99 / month after trial"),
+                title: String(localized: "consent.term.billing.title",
+                              defaultValue: "$2.99 / month after trial"),
                 detail: String(localized: "consent.term.billing.detail",
                                defaultValue: "Billed monthly through your App Store account.")
             )
@@ -1490,8 +1282,7 @@ write(os.path.join(bootstrap_dir, "DependencyContainer.swift"), bootstrap_contai
 
 fcm_gameday     = fcm.get("gamedayTopic", "gameday")
 
-gameday_topic_manager_swift = header() + f"""\
-import FirebaseMessaging
+gameday_topic_manager_swift = header() + f"""import FirebaseMessaging
 import Foundation
 import OSLog
 
@@ -1499,13 +1290,13 @@ import OSLog
 
 /// Manages the date-scoped FCM gameday topic subscription.
 ///
-/// Subscribes to today's topic (`{fcm_gameday}_YYYYMMDD`) and unsubscribes from
+/// Subscribes to today's topic (`gameday_YYYYMMDD`) and unsubscribes from
 /// yesterday's on every foreground resume, but only when the date has changed
 /// since the last successful subscription. Safe to call repeatedly — the
 /// guard on `lastSubscribedDate` makes it idempotent within a single day.
 ///
-/// Date boundary uses America/New_York so a user in a western timezone
-/// foregrounding after midnight ET gets the correct topic.
+/// Date boundary uses America/New_York ({league} game-day timezone) so a user in
+/// a western timezone foregrounding after midnight ET gets the correct topic.
 @MainActor
 final class GamedayTopicManager {{
 
@@ -1531,10 +1322,10 @@ final class GamedayTopicManager {{
         let lastSubscribed = defaults.string(forKey: lastSubscribedKey)
         guard lastSubscribed != today else {{ return }}
 
-        subscribe(to: "{fcm_gameday}_\\(today)")
+        subscribe(to: "gameday_\\(today)")
 
         if let lastDate = lastSubscribed {{
-            unsubscribe(from: "{fcm_gameday}_\\(lastDate)")
+            unsubscribe(from: "gameday_\\(lastDate)")
         }}
 
         defaults.set(today, forKey: lastSubscribedKey)
@@ -1653,16 +1444,11 @@ struct Player: Codable, Equatable, Hashable, Identifiable, Filterable {
 }
 """
 
-opportunity_swift = header() + """\
-import Foundation
+opportunity_swift = header() + f"""import Foundation
 import BKSCore
 
-// MARK: - Opportunity
-//
-// Sport-specific opportunity model. Add fields matching your get_opportunities API response.
-// MANUAL IMPLEMENTATION REQUIRED — this stub is not overwritten on re-scaffold.
-
-struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable, OpportunityProtocol, InjuryTracking {
+struct Opportunity: Codable, Equatable, Hashable, Identifiable,
+                   Filterable, InjuryTracking {{
     let id: String
     let displayName: String
     let team: String
@@ -1673,11 +1459,7 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable, Oppo
 
     // Core scoring
     let opportunityScore: Double?
-    let opportunityTier: TierLevel        // non-optional per OpportunityProtocol
-    let playerTierDk: TierLevel?
-    let playerTierFd: TierLevel?
-    let mode: String
-    let platforms: [String]
+    let opportunityTier: TierLevel
 
     // Key signals
     let injuryStatus: InjuryStatus?
@@ -1685,24 +1467,164 @@ struct Opportunity: Codable, Equatable, Hashable, Identifiable, Filterable, Oppo
     let isHome: Bool
     let gameDateTime: Date?
 
-    // Top picks
+    // Top pick signals
     let isTopPick: Bool
     let topPickRank: Int?
+    let topPickReasons: [String]
 
-    var additionalSearchFields: [String] { [opponentAbbr] }
+    // {swift_name}-specific playoff signals
+    let playoffRotationMultiplier: Double?
+    let rotationTier: RotationTier?
+    let playoffTrendTrust: Double?
+    let playoffGamesPlayed: Int?
 
-    // MARK: - Sport-specific fields
-    // Add fields here that are unique to this sport's opportunity data.
+    // Game context
+    let battingOrder: Int?
+    let probablePitcher: String?
+    let parkFactor: Double?
 
-    // MARK: - Prop lines
-    // PropLine and RotationTier must be defined here (or in a companion file) because
-    // the generated view layer (PropLinesCard, rotationTierPill) references them directly.
-    // Remove or replace these for sports that don't use prop lines / rotation tiers.
-}
+    // {league} trend slopes
+    let trendHits: Double?
+    let trendHR: Double?
+    let trendRBI: Double?
+    let trendRuns: Double?
+    let trendSB: Double?
+    let trendDoubles: Double?
+    let trendTB: Double?
+
+    // Season per-game averages
+    let seasonHitsPG: Double?
+    let seasonHRPG: Double?
+    let seasonRBIPG: Double?
+    let seasonRunsPG: Double?
+    let seasonSBPG: Double?
+    let seasonBBPG: Double?
+    let seasonKPG: Double?
+    let seasonAvg: Double?
+
+    // Advanced {league} metrics
+    let wobaProxy: Double?
+    let obpProxy: Double?
+    let avgPaPerGame: Double?
+    let playoffWobaProxy: Double?
+    let playoffObpProxy: Double?
+    let playoffAvgPaPerGame: Double?
+
+    // Model confidence and streak context from the board endpoint
+    let confidenceScore: Double?
+    let hotStreak: Int?
+    let coldStreak: Int?
+
+    // Sportsbook prop lines — keyed by market key e.g. "hits_0.5", "home_runs_0.5"
+    let propLines: [String: PropLine]?
+
+    var additionalSearchFields: [String] {{ [opponentAbbr] }}
+
+    // swiftlint:disable:next function_body_length
+    init(
+        id: String,
+        displayName: String,
+        team: String,
+        position: String?,
+        opponentAbbr: String,
+        headshotURL: URL?,
+        externalPersonID: Int?,
+        opportunityScore: Double?,
+        opportunityTier: TierLevel,
+        injuryStatus: InjuryStatus?,
+        isSurging: Bool,
+        isHome: Bool,
+        gameDateTime: Date? = nil,
+        isTopPick: Bool = false,
+        topPickRank: Int? = nil,
+        topPickReasons: [String] = [],
+        playoffRotationMultiplier: Double? = nil,
+        rotationTier: RotationTier? = nil,
+        playoffTrendTrust: Double? = nil,
+        playoffGamesPlayed: Int? = nil,
+        battingOrder: Int? = nil,
+        probablePitcher: String? = nil,
+        parkFactor: Double? = nil,
+        trendHits: Double? = nil,
+        trendHR: Double? = nil,
+        trendRBI: Double? = nil,
+        trendRuns: Double? = nil,
+        trendSB: Double? = nil,
+        trendDoubles: Double? = nil,
+        trendTB: Double? = nil,
+        seasonHitsPG: Double? = nil,
+        seasonHRPG: Double? = nil,
+        seasonRBIPG: Double? = nil,
+        seasonRunsPG: Double? = nil,
+        seasonSBPG: Double? = nil,
+        seasonBBPG: Double? = nil,
+        seasonKPG: Double? = nil,
+        seasonAvg: Double? = nil,
+        wobaProxy: Double? = nil,
+        obpProxy: Double? = nil,
+        avgPaPerGame: Double? = nil,
+        playoffWobaProxy: Double? = nil,
+        playoffObpProxy: Double? = nil,
+        playoffAvgPaPerGame: Double? = nil,
+        confidenceScore: Double? = nil,
+        hotStreak: Int? = nil,
+        coldStreak: Int? = nil,
+        propLines: [String: PropLine]? = nil
+    ) {{
+        self.id = id
+        self.displayName = displayName
+        self.team = team
+        self.position = position
+        self.opponentAbbr = opponentAbbr
+        self.headshotURL = headshotURL
+        self.externalPersonID = externalPersonID
+        self.opportunityScore = opportunityScore
+        self.opportunityTier = opportunityTier
+        self.injuryStatus = injuryStatus
+        self.isSurging = isSurging
+        self.isHome = isHome
+        self.gameDateTime = gameDateTime
+        self.isTopPick = isTopPick
+        self.topPickRank = topPickRank
+        self.topPickReasons = topPickReasons
+        self.playoffRotationMultiplier = playoffRotationMultiplier
+        self.rotationTier = rotationTier
+        self.playoffTrendTrust = playoffTrendTrust
+        self.playoffGamesPlayed = playoffGamesPlayed
+        self.battingOrder = battingOrder
+        self.probablePitcher = probablePitcher
+        self.parkFactor = parkFactor
+        self.trendHits = trendHits
+        self.trendHR = trendHR
+        self.trendRBI = trendRBI
+        self.trendRuns = trendRuns
+        self.trendSB = trendSB
+        self.trendDoubles = trendDoubles
+        self.trendTB = trendTB
+        self.seasonHitsPG = seasonHitsPG
+        self.seasonHRPG = seasonHRPG
+        self.seasonRBIPG = seasonRBIPG
+        self.seasonRunsPG = seasonRunsPG
+        self.seasonSBPG = seasonSBPG
+        self.seasonBBPG = seasonBBPG
+        self.seasonKPG = seasonKPG
+        self.seasonAvg = seasonAvg
+        self.wobaProxy = wobaProxy
+        self.obpProxy = obpProxy
+        self.avgPaPerGame = avgPaPerGame
+        self.playoffWobaProxy = playoffWobaProxy
+        self.playoffObpProxy = playoffObpProxy
+        self.playoffAvgPaPerGame = playoffAvgPaPerGame
+        self.confidenceScore = confidenceScore
+        self.hotStreak = hotStreak
+        self.coldStreak = coldStreak
+        self.propLines = propLines
+    }}
+}}
 
 // MARK: - PropLine
 
-struct PropLine: Codable, Equatable, Hashable {
+struct PropLine: Codable, Equatable, Hashable {{
     let stat: String
     let line: Double
     let overOdds: Int
@@ -1711,32 +1633,24 @@ struct PropLine: Codable, Equatable, Hashable {
     let calibratedProbOver: Double
     let hasEdge: Bool
     let displayLabel: String
-}
+}}
 
 // MARK: - RotationTier
-// Sport-specific: remove for sports without pitching rotation tiers.
 
-enum RotationTier: String, Codable, Equatable, Hashable {
+enum RotationTier: String, Codable, Equatable, Hashable {{
     case ace
     case rotation
     case bullpen
     case closer
     case swingman
-}
+}}
 """
 
-projection_swift = header() + """\
+projection_swift = header() + f"""import BKSCore
 import Foundation
-import BKSCore
-
-// MARK: - Projection
-//
-// Sport-specific projection model conforming to ProjectionProtocol.
-// Required protocol fields are pre-populated — add sport-specific fields below the marker.
-// This stub is not overwritten on re-scaffold (write_if_absent).
 
 struct Projection: Codable, Equatable, Hashable, Identifiable,
-                   Filterable, ProjectionProtocol, InjuryTracking {
+                   Filterable, InjuryTracking {{
     let id: String
     let displayName: String
     let team: String
@@ -1744,42 +1658,194 @@ struct Projection: Codable, Equatable, Hashable, Identifiable,
     let headshotURL: URL?
     let externalPersonID: Int?
 
-    // Core scoring — required by ProjectionProtocol
-    let projectionScore: Double          // DK fantasy points (non-optional per protocol)
-    let projectedScoreFd: Double?
-    let projectionTier: TierLevel        // non-optional per protocol
-    let playerTierDk: TierLevel?
-    let playerTierFd: TierLevel?
-    let mode: String
-    let platforms: [String]
+    // Core scoring
+    let rankingScore: Double
     let playFadeRecommendation: PlayFadeRecommendation?
 
-    // Key signals — required by ProjectionProtocol
+    // Key signals
     let injuryStatus: InjuryStatus?
     let isSurging: Bool
 
-    // Schedule — required by ProjectionProtocol
+    // Schedule
     let upcomingGames: [ProjectedGame]?
     let homeGameCount: Int?
     let awayGameCount: Int?
     let avgOpponentStrength: Double?
 
-    // Streak signals — required by ProjectionProtocol
+    // Streak signals
     let hotStreak: Int?
     let coldStreak: Int?
 
-    // Trend — required by ProjectionProtocol
+    // Trend
     let trendDirection: TrendDirection?
-    let confidenceScoreDk: Double?
-    let confidenceScoreFd: Double?
+    let trendScore: Double?
+    let confidenceScore: Double?
     let consistencyScore: Double?
     let usageEfficiencySignal: UsageEfficiencySignal?
 
-    var additionalSearchFields: [String] { [] }
+    // Trend slopes ({league}-specific: rolling-window linear regression per category)
+    let trendHits: Double?
+    let trendHR: Double?
+    let trendRBI: Double?
+    let trendRuns: Double?
+    let trendSB: Double?
+    let trendDoubles: Double?
+    let trendTB: Double?
 
-    // MARK: - Sport-specific fields
-    // Add fields here that are unique to this sport's projection data.
-}
+    // Season per-game averages
+    let seasonHitsPG: Double?
+    let seasonHRPG: Double?
+    let seasonRBIPG: Double?
+    let seasonRunsPG: Double?
+    let seasonSBPG: Double?
+    let seasonBBPG: Double?
+    let seasonKPG: Double?
+    let seasonAvg: Double?
+
+    // Season totals
+    let seasonH: Int?
+    let seasonHR: Int?
+    let seasonRBI: Int?
+    let seasonR: Int?
+    let seasonTB: Int?
+    let season2B: Int?
+    let season3B: Int?
+    let seasonSB: Int?
+    let seasonBB: Int?
+    let seasonK: Int?
+    let seasonAB: Int?
+    let seasonGP: Int?
+
+    // Advanced {league} metrics
+    let wobaProxy: Double?
+    let obpProxy: Double?
+    let avgPaPerGame: Double?
+    let seasonOBP: Double?
+    let seasonSLG: Double?
+    let seasonOPS: Double?
+    let seasonWAR: Double?
+    let seasonXBHRate: Double?
+    let seasonBBRate: Double?
+
+    // swiftlint:disable:next function_default_parameter_at_end function_body_length
+    init(
+        id: String,
+        displayName: String,
+        team: String,
+        position: String?,
+        headshotURL: URL?,
+        externalPersonID: Int?,
+        rankingScore: Double,
+        playFadeRecommendation: PlayFadeRecommendation? = nil,
+        injuryStatus: InjuryStatus?,
+        isSurging: Bool,
+        upcomingGames: [ProjectedGame]? = nil,
+        homeGameCount: Int? = nil,
+        awayGameCount: Int? = nil,
+        avgOpponentStrength: Double? = nil,
+        hotStreak: Int? = nil,
+        coldStreak: Int? = nil,
+        trendDirection: TrendDirection? = nil,
+        trendScore: Double? = nil,
+        confidenceScore: Double? = nil,
+        consistencyScore: Double? = nil,
+        usageEfficiencySignal: UsageEfficiencySignal? = nil,
+        trendHits: Double? = nil,
+        trendHR: Double? = nil,
+        trendRBI: Double? = nil,
+        trendRuns: Double? = nil,
+        trendSB: Double? = nil,
+        trendDoubles: Double? = nil,
+        trendTB: Double? = nil,
+        seasonHitsPG: Double? = nil,
+        seasonHRPG: Double? = nil,
+        seasonRBIPG: Double? = nil,
+        seasonRunsPG: Double? = nil,
+        seasonSBPG: Double? = nil,
+        seasonBBPG: Double? = nil,
+        seasonKPG: Double? = nil,
+        seasonAvg: Double? = nil,
+        seasonH: Int? = nil,
+        seasonHR: Int? = nil,
+        seasonRBI: Int? = nil,
+        seasonR: Int? = nil,
+        seasonTB: Int? = nil,
+        season2B: Int? = nil,
+        season3B: Int? = nil,
+        seasonSB: Int? = nil,
+        seasonBB: Int? = nil,
+        seasonK: Int? = nil,
+        seasonAB: Int? = nil,
+        seasonGP: Int? = nil,
+        wobaProxy: Double? = nil,
+        obpProxy: Double? = nil,
+        avgPaPerGame: Double? = nil,
+        seasonOBP: Double? = nil,
+        seasonSLG: Double? = nil,
+        seasonOPS: Double? = nil,
+        seasonWAR: Double? = nil,
+        seasonXBHRate: Double? = nil,
+        seasonBBRate: Double? = nil
+    ) {{
+        self.id = id
+        self.displayName = displayName
+        self.team = team
+        self.position = position
+        self.headshotURL = headshotURL
+        self.externalPersonID = externalPersonID
+        self.rankingScore = rankingScore
+        self.playFadeRecommendation = playFadeRecommendation
+        self.injuryStatus = injuryStatus
+        self.isSurging = isSurging
+        self.upcomingGames = upcomingGames
+        self.homeGameCount = homeGameCount
+        self.awayGameCount = awayGameCount
+        self.avgOpponentStrength = avgOpponentStrength
+        self.hotStreak = hotStreak
+        self.coldStreak = coldStreak
+        self.trendDirection = trendDirection
+        self.trendScore = trendScore
+        self.confidenceScore = confidenceScore
+        self.consistencyScore = consistencyScore
+        self.usageEfficiencySignal = usageEfficiencySignal
+        self.trendHits = trendHits
+        self.trendHR = trendHR
+        self.trendRBI = trendRBI
+        self.trendRuns = trendRuns
+        self.trendSB = trendSB
+        self.trendDoubles = trendDoubles
+        self.trendTB = trendTB
+        self.seasonHitsPG = seasonHitsPG
+        self.seasonHRPG = seasonHRPG
+        self.seasonRBIPG = seasonRBIPG
+        self.seasonRunsPG = seasonRunsPG
+        self.seasonSBPG = seasonSBPG
+        self.seasonBBPG = seasonBBPG
+        self.seasonKPG = seasonKPG
+        self.seasonAvg = seasonAvg
+        self.seasonH = seasonH
+        self.seasonHR = seasonHR
+        self.seasonRBI = seasonRBI
+        self.seasonR = seasonR
+        self.seasonTB = seasonTB
+        self.season2B = season2B
+        self.season3B = season3B
+        self.seasonSB = seasonSB
+        self.seasonBB = seasonBB
+        self.seasonK = seasonK
+        self.seasonAB = seasonAB
+        self.seasonGP = seasonGP
+        self.wobaProxy = wobaProxy
+        self.obpProxy = obpProxy
+        self.avgPaPerGame = avgPaPerGame
+        self.seasonOBP = seasonOBP
+        self.seasonSLG = seasonSLG
+        self.seasonOPS = seasonOPS
+        self.seasonWAR = seasonWAR
+        self.seasonXBHRate = seasonXBHRate
+        self.seasonBBRate = seasonBBRate
+    }}
+}}
 """
 
 # PlayoffSeries lives in BKSCore (Sources/Models/PlayoffBracket.swift) as a public struct.
@@ -1809,920 +1875,453 @@ write(os.path.join(models_dir, "LeagueState.swift"), league_state_swift)
 write_if_absent(os.path.join(models_dir, "Opportunity.swift"), opportunity_swift)
 write_if_absent(os.path.join(models_dir, "Projection.swift"), projection_swift)
 
+# ── Props feed models (LLM-enriched board props) ──────────────────────────────
+
+top_prop_opportunity_swift = header() + f"""import Foundation
+
+// MARK: - TopPropOpportunity
+
+struct TopPropOpportunity: Decodable, Equatable, Hashable, Identifiable {{
+    var id: String {{ "\\(playerID)_\\(market)" }}
+
+    let playerID: String
+    let playerName: String
+    let team: String?
+    let position: String?
+    let gameID: String?
+    let market: String
+    /// Raw stat category from the server (e.g. "hits", "strikeouts", "total_bases").
+    /// Prefer this over parsing the market string.
+    let stat: String?
+    /// Canonical prop line. Sourced from the first bookmaker entry; falls back to
+    /// parsing the market key (e.g. "hits_0.5" → 0.5) when bookmakers is absent.
+    let line: Double
+    let direction: PropDirection
+    let ourProbability: Double
+    let marketProbability: Double
+    let edgePP: Double
+    let predictedValue: Double?
+    let displayLabel: String?
+    let bookmakers: [String: BookmakerLine]?
+    let instinctAgrees: Bool?
+    let instinctConfidence: InstinctConfidence?
+    let instinctSuggestedValue: Double?
+    let instinctInsight: String?
+    /// True when the server's LLM ranked this prop below confidence threshold after math scoring.
+    /// Use this as the orange-badge gate — it is stable even when `blackkatt_instinct` is absent.
+    let llmFade: Bool
+    /// True when Haiku nominated this prop from the near-miss pool; did not clear the math threshold.
+    let llmNominated: Bool
+
+    // MARK: - Coding keys
+
+    enum CodingKeys: String, CodingKey {{
+        case playerID = "player_id"
+        case playerName = "player_name"
+        case team
+        case position
+        case gameID = "game_id"
+        case market
+        case stat
+        case blackkattInstinct = "blackkatt_instinct"
+        case bookmakers
+        case llmFade = "llm_fade"
+        case llmNominated = "llm_nominated"
+    }}
+
+    private enum InstinctKeys: String, CodingKey {{
+        case direction
+        case predictedValue = "predicted_value"
+        case probability
+        case marketProbability = "market_probability"
+        case edgePP = "edge_pp"
+        case displayLabel = "display_label"
+        case agrees
+        case confidence
+        case suggestedValue = "suggested_value"
+        case insight
+    }}
+
+    init(from decoder: Decoder) throws {{
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        playerID = try container.decode(String.self, forKey: .playerID)
+        playerName = try container.decode(String.self, forKey: .playerName)
+        team = try container.decodeIfPresent(String.self, forKey: .team)
+        position = try container.decodeIfPresent(String.self, forKey: .position)
+        gameID = try container.decodeIfPresent(String.self, forKey: .gameID)
+        market = try container.decode(String.self, forKey: .market)
+        stat = try container.decodeIfPresent(String.self, forKey: .stat)
+        bookmakers = try container.decodeIfPresent([String: BookmakerLine].self, forKey: .bookmakers)
+
+        // blackkatt_instinct may be absent when Haiku enrichment fails — degrade gracefully
+        // rather than throwing and dropping the entire top_prop_opportunities array.
+        if let instinct = try? container.nestedContainer(keyedBy: InstinctKeys.self, forKey: .blackkattInstinct) {{
+            let rawDirection = try instinct.decode(String.self, forKey: .direction)
+            direction = PropDirection(rawValue: rawDirection) ?? .over
+            ourProbability = try instinct.decode(Double.self, forKey: .probability)
+            marketProbability = try instinct.decode(Double.self, forKey: .marketProbability)
+            edgePP = try instinct.decode(Double.self, forKey: .edgePP)
+            predictedValue = try instinct.decodeIfPresent(Double.self, forKey: .predictedValue)
+            displayLabel = try instinct.decodeIfPresent(String.self, forKey: .displayLabel)
+            instinctAgrees = try instinct.decodeIfPresent(Bool.self, forKey: .agrees)
+            instinctConfidence = try instinct.decodeIfPresent(InstinctConfidence.self, forKey: .confidence)
+            instinctSuggestedValue = try instinct.decodeIfPresent(Double.self, forKey: .suggestedValue)
+            instinctInsight = try instinct.decodeIfPresent(String.self, forKey: .insight)
+        }} else {{
+            direction = .over
+            ourProbability = 0
+            marketProbability = 0
+            edgePP = 0
+            predictedValue = nil
+            displayLabel = nil
+            instinctAgrees = nil
+            instinctConfidence = nil
+            instinctSuggestedValue = nil
+            instinctInsight = nil
+        }}
+        llmFade = try container.decodeIfPresent(Bool.self, forKey: .llmFade) ?? false
+        llmNominated = try container.decodeIfPresent(Bool.self, forKey: .llmNominated) ?? false
+
+        // Derive canonical line from bookmakers, falling back to parsing the market key.
+        // All supported books post the same line for standard 0.5/1.5 markets so book
+        // choice doesn't matter here; min key for determinism.
+        if let firstLine = bookmakers?.min(by: {{ $0.key < $1.key }})?.value.line {{
+            line = firstLine
+        }} else {{
+            line = market.split(separator: "_").last.flatMap {{ Double($0) }} ?? 0.5
+        }}
+    }}
+
+    // MARK: - Display helpers
+
+    /// Human-readable subtitle combining market name, prop line, and projected value.
+    /// Uses server-provided displayLabel when available (substituting the raw stat id
+    /// for a display-friendly name), constructing locally otherwise and appending
+    /// predictedValue so the user can see the projected stat total (e.g. "proj 1.0").
+    var marketSubtitle: String {{
+        if let label = displayLabel {{
+            return Self.humanizeStatID(in: label)
+        }}
+        let name = market.split(separator: "_").dropLast().joined(separator: " ").capitalized
+        let dir = direction == .over ? "O" : "U"
+        let lineStr = line.truncatingRemainder(dividingBy: 1) == 0
+            ? String(format: "%.0f", line)
+            : String(format: "%.1f", line)
+        var subtitle = "\\(name) · \\(dir) \\(lineStr)"
+        if let proj = predictedValue {{
+            let projStr = proj.truncatingRemainder(dividingBy: 1) == 0
+                ? String(format: "%.0f", proj)
+                : String(format: "%.1f", proj)
+            subtitle += " · proj \\(projStr)"
+        }}
+        return subtitle
+    }}
+
+    /// Compact right-side label: "nn% Over n.n Hits"
+    var propLineLabel: String {{
+        let pct = Int(ourProbability * 100)
+        let dir = direction == .over ? "Over" : "Under"
+        let lineStr = line.truncatingRemainder(dividingBy: 1) == 0
+            ? String(format: "%.0f", line)
+            : String(format: "%.1f", line)
+        return "\\(pct)% \\(dir) \\(lineStr) \\(statDisplayName)"
+    }}
+
+    /// Replaces any known raw stat id token (e.g. "TOTAL_BASES", "total_bases") within
+    /// a server-provided label string with its display-friendly equivalent.
+    private static func humanizeStatID(in label: String) -> String {{
+        let table: [(id: String, display: String)] = [
+            ("total_bases", String(localized: "prop.stat.total_bases", defaultValue: "Total Bases")),
+            ("hits_allowed", String(localized: "prop.stat.hits_allowed", defaultValue: "Hits Allowed")),
+            ("earned_runs", String(localized: "prop.stat.earned_runs", defaultValue: "Earned Runs")),
+            ("pitching_outs", String(localized: "prop.stat.pitching_outs", defaultValue: "Pitching Outs")),
+            ("stolen_bases", String(localized: "prop.stat.stolen_bases", defaultValue: "Stolen Bases")),
+            ("home_runs", String(localized: "prop.stat.home_runs", defaultValue: "Home Runs")),
+            ("strikeouts", String(localized: "prop.stat.strikeouts", defaultValue: "Strikeouts")),
+            ("hits", String(localized: "prop.stat.hits", defaultValue: "Hits")),
+            ("rbis", String(localized: "prop.stat.rbis", defaultValue: "RBIs")),
+            ("runs", String(localized: "prop.stat.runs", defaultValue: "Runs")),
+            ("walks", String(localized: "prop.stat.walks", defaultValue: "Walks")),
+        ]
+        var result = label
+        for entry in table {{
+            result = result.replacingOccurrences(
+                of: entry.id,
+                with: entry.display,
+                options: .caseInsensitive
+            )
+        }}
+        return result
+    }}
+
+    /// UX-friendly display name for the stat category (e.g. "total_bases" → "Total Bases").
+    var statDisplayName: String {{
+        switch stat {{
+        case "hits":
+            return String(localized: "prop.stat.hits", defaultValue: "Hits")
+        case "strikeouts":
+            return String(localized: "prop.stat.strikeouts", defaultValue: "Strikeouts")
+        case "total_bases":
+            return String(localized: "prop.stat.total_bases", defaultValue: "Total Bases")
+        case "rbis":
+            return String(localized: "prop.stat.rbis", defaultValue: "RBIs")
+        case "runs":
+            return String(localized: "prop.stat.runs", defaultValue: "Runs")
+        case "walks":
+            return String(localized: "prop.stat.walks", defaultValue: "Walks")
+        case "stolen_bases":
+            return String(localized: "prop.stat.stolen_bases", defaultValue: "Stolen Bases")
+        case "home_runs":
+            return String(localized: "prop.stat.home_runs", defaultValue: "Home Runs")
+        case "pitching_outs":
+            return String(localized: "prop.stat.pitching_outs", defaultValue: "Pitching Outs")
+        case "hits_allowed":
+            return String(localized: "prop.stat.hits_allowed", defaultValue: "Hits Allowed")
+        case "earned_runs":
+            return String(localized: "prop.stat.earned_runs", defaultValue: "Earned Runs")
+        default:
+            guard let raw = stat else {{
+                return String(localized: "prop.stat.unknown", defaultValue: "Props")
+            }}
+            return raw.split(separator: "_").map(\\.capitalized).joined(separator: " ")
+        }}
+    }}
+
+    /// Edge tier derived from edgePP. Single call site — do not recompute inline.
+    var tier: PropEdgeTier {{ PropEdgeTier(edgePP: edgePP) }}
+
+    /// Typed stat category. Returns nil for unrecognized server stat strings.
+    var statCategory: PropStatCategory? {{ PropStatCategory(rawStat: stat) }}
+
+    /// Best available American odds for the model's recommended direction across all bookmakers.
+    var bestOdds: Int? {{
+        guard let books = bookmakers, !books.isEmpty else {{ return nil }}
+        return direction == .over
+            ? books.values.map(\\.overOdds).max()
+            : books.values.map(\\.underOdds).max()
+    }}
+}}
+
+// MARK: - BookmakerLine
+
+struct BookmakerLine: Codable, Equatable, Hashable {{
+    let line: Double
+    let overOdds: Int
+    let underOdds: Int
+
+    enum CodingKeys: String, CodingKey {{
+        case line
+        case overOdds = "over_odds"
+        case underOdds = "under_odds"
+    }}
+}}
+
+// MARK: - PropDirection
+
+enum PropDirection: String, Codable, Equatable, Hashable {{
+    case over
+    case under
+}}
+
+// MARK: - InstinctConfidence
+
+enum InstinctConfidence: String, Codable, Equatable, Hashable {{
+    case high
+    case medium
+    case low
+
+    var displayLabel: String {{
+        switch self {{
+        case .high:
+            return String(localized: "prop.instinct.confidence.high", defaultValue: "High Confidence")
+        case .medium:
+            return String(localized: "prop.instinct.confidence.medium", defaultValue: "Medium Confidence")
+        case .low:
+            return String(localized: "prop.instinct.confidence.low", defaultValue: "Low Confidence")
+        }}
+    }}
+}}
+"""
+
+prop_slate_synthesis_swift = f"""// Copyright 2026 Black Katt Technologies Inc.
+// iOS {deploy_tgt}+
+
+// MARK: - PropSlateSynthesis
+
+/// Cross-prop strategy summary produced by the server's Sonnet pass.
+/// Present only after ~12:30 PM ET and absent when the Sonnet call fails (non-fatal).
+struct PropSlateSynthesis: Equatable {{
+
+    // MARK: - Pick
+
+    /// One conviction-ranked prop entry from the server's reranking pass.
+    /// Order reflects Sonnet's conviction ranking — do NOT assume index correspondence
+    /// with `top_prop_opportunities` (which is math-sorted by edge_pp).
+    /// Match by `playerID + market` if cross-referencing.
+    struct Pick: Equatable {{
+        let playerID: String
+        let market: String
+        let conviction: SlateConviction
+        let convictionReason: String
+    }}
+
+    // MARK: - Fields
+
+    let rankedPicks: [Pick]
+    let dailyPropNarrative: String
+    let contradictions: [String]
+}}
+
+// MARK: - SlateConviction
+
+enum SlateConviction: String, Equatable {{
+    case high
+    case medium
+    case low
+}}
+"""
+
+prop_edge_tier_swift = header() + f"""import SwiftUI
+
+// MARK: - PropEdgeTier
+
+/// Single source of truth for edge-tier ranking and color.
+/// All card strips, divider dots, and row strips read `stripColor` from here.
+/// Do not add a second color mapping anywhere in the UI layer.
+enum PropEdgeTier: Int, CaseIterable, Comparable {{
+    case subdued  // < 2pp
+    case lean     // ≥ 2pp
+    case solid    // ≥ 5pp
+    case strong   // ≥ 8pp
+    case elite    // ≥ 12pp
+
+    init(edgePP: Double) {{
+        switch edgePP {{
+        case ..<2:   self = .subdued
+        case ..<5:   self = .lean
+        case ..<8:   self = .solid
+        case ..<12:  self = .strong
+        default:     self = .elite
+        }}
+    }}
+
+    /// Color used for left-edge strips, tier divider dots, and edge value text.
+    /// Change here only; do not duplicate this mapping.
+    var stripColor: Color {{
+        switch self {{
+        case .elite:   return Color(red: 1.000, green: 0.843, blue: 0.000) // gold
+        case .strong:  return Color(red: 0.753, green: 0.753, blue: 0.753) // silver
+        case .solid:   return Color(red: 0.804, green: 0.498, blue: 0.196) // bronze
+        case .lean:    return Color(red: 1.000, green: 0.929, blue: 0.000) // yellow
+        case .subdued: return Color(red: 0.533, green: 0.529, blue: 0.502) // gray
+        }}
+    }}
+
+    /// User-visible tier label shown in dividers and hero badge.
+    var label: String {{
+        switch self {{
+        case .elite:
+            return String(localized: "prop.tier.elite", defaultValue: "ELITE EDGE")
+        case .strong:
+            return String(localized: "prop.tier.strong", defaultValue: "STRONG EDGE")
+        case .solid:
+            return String(localized: "prop.tier.solid", defaultValue: "SOLID EDGE")
+        case .lean:
+            return String(localized: "prop.tier.lean", defaultValue: "LEAN")
+        case .subdued:
+            return String(localized: "prop.tier.subdued", defaultValue: "SUBDUED")
+        }}
+    }}
+
+    static func < (lhs: Self, rhs: Self) -> Bool {{
+        lhs.rawValue < rhs.rawValue
+    }}
+}}
+"""
+
+prop_stat_category_swift = header() + f"""import Foundation
+
+// MARK: - PropStatCategory
+
+/// Typed stat category for prop filtering and display.
+/// `rawValue` strings must match the server's `stat` field exactly.
+/// CaseIterable order drives filter chip display order in the sheet.
+///
+/// Persistence trap: `selectedStatCategories` is stored in UserDefaults by rawValue.
+/// If a rawValue is renamed to track a server change, bump `PropFeedFilterPersistence.key`
+/// to `"propFeedFilter.v2"` or stored filters will silently hide non-matching props.
+enum PropStatCategory: String, CaseIterable, Codable, Hashable, Identifiable {{
+    case hits          = "hits"
+    case rbis          = "rbis"
+    case totalBases    = "total_bases"
+    case homeRuns      = "home_runs"
+    case runs          = "runs"
+    case walks         = "walks"
+    case stolenBases   = "stolen_bases"
+    case strikeouts    = "strikeouts"
+    case pitchingOuts  = "pitching_outs"
+    case hitsAllowed   = "hits_allowed"
+    case earnedRuns    = "earned_runs"
+
+    var id: String {{ rawValue }}
+
+    var shortLabel: String {{
+        switch self {{
+        case .hits:
+            return String(localized: "prop.stat.hits", defaultValue: "Hits")
+        case .rbis:
+            return String(localized: "prop.stat.rbis", defaultValue: "RBI")
+        case .totalBases:
+            return String(localized: "prop.stat.total_bases", defaultValue: "Total Bases")
+        case .homeRuns:
+            return String(localized: "prop.stat.home_runs", defaultValue: "Home Runs")
+        case .runs:
+            return String(localized: "prop.stat.runs", defaultValue: "Runs")
+        case .walks:
+            return String(localized: "prop.stat.walks", defaultValue: "Walks")
+        case .stolenBases:
+            return String(localized: "prop.stat.stolen_bases", defaultValue: "Stolen Bases")
+        case .strikeouts:
+            return String(localized: "prop.stat.strikeouts", defaultValue: "Strikeouts")
+        case .pitchingOuts:
+            return String(localized: "prop.stat.pitching_outs", defaultValue: "Pitching Outs")
+        case .hitsAllowed:
+            return String(localized: "prop.stat.hits_allowed", defaultValue: "Hits Allowed")
+        case .earnedRuns:
+            return String(localized: "prop.stat.earned_runs", defaultValue: "Earned Runs")
+        }}
+    }}
+
+    var isBatterStat: Bool {{
+        switch self {{
+        case .hits, .rbis, .totalBases, .homeRuns, .runs, .walks, .stolenBases:
+            return true
+        case .strikeouts, .pitchingOuts, .hitsAllowed, .earnedRuns:
+            return false
+        }}
+    }}
+
+    init?(rawStat: String?) {{
+        guard let raw = rawStat else {{ return nil }}
+        self.init(rawValue: raw)
+    }}
+}}
+"""
+
+write_if_absent(os.path.join(models_dir, "TopPropOpportunity.swift"), top_prop_opportunity_swift)
+write_if_absent(os.path.join(models_dir, "PropSlateSynthesis.swift"), prop_slate_synthesis_swift)
+write_if_absent(os.path.join(models_dir, "PropEdgeTier.swift"), prop_edge_tier_swift)
+write_if_absent(os.path.join(models_dir, "PropStatCategory.swift"), prop_stat_category_swift)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9c. Services
 # ─────────────────────────────────────────────────────────────────────────────
 
 services_dir = os.path.join(out_dir, "App/Sources/Core/Services")
 
-trendings_service_swift = header() + f"""\
-import Alamofire
-import BKSCore
-import Foundation
-import OSLog
 
-// MARK: - TrendingsServiceProtocol
 
-protocol TrendingsServiceProtocol {{
-    func fetchPlayers(fields: [String]?) async throws -> [Player]
-    func loadCachedPlayers() throws -> [Player]?
-    func loadCachedFetchDate() throws -> Date?
-}}
 
-extension TrendingsServiceProtocol {{
-    func fetchPlayers() async throws -> [Player] {{
-        try await fetchPlayers(fields: nil)
-    }}
-}}
-
-// MARK: - TrendingsService
-
-final class TrendingsService: TrendingsServiceProtocol {{
-    private let network: NetworkProtocol
-    private let storage: StorageProtocol
-    private let configuration: ConfigurationProtocol
-    private let sportConfiguration: any SportConfigurationProtocol
-    private let logger = os.Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "TrendingsService"
-    )
-    private let signposter = OSSignposter(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "TrendingsService"
-    )
-
-    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)trending_v1" }}
-    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)trending_v1_date" }}
-
-    init(
-        network: NetworkProtocol,
-        storage: StorageProtocol,
-        configuration: ConfigurationProtocol,
-        sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
-    ) {{
-        self.network = network
-        self.storage = storage
-        self.configuration = configuration
-        self.sportConfiguration = sportConfiguration
-    }}
-
-    func fetchPlayers(fields: [String]? = nil) async throws -> [Player] {{
-        let url = configuration.value(for: .getPlayersURL)
-
-        let requestFields = fields ?? sportConfiguration.trendingFields
-        var parameters: Parameters?
-        if !requestFields.isEmpty {{
-            parameters = ["fields": requestFields.joined(separator: ",")]
-        }}
-
-        let fetchStart = Date.now
-        let fetchInterval = signposter.beginInterval("fetchPlayers")
-        defer {{ signposter.endInterval("fetchPlayers", fetchInterval) }}
-
-        try Task.checkCancellation()
-        let response: PlayersResponse = try await network.get(url, parameters: parameters)
-
-        let sorted = response.data.compactMap(mapPlayer).sorted {{ $0.displayName < $1.displayName }}
-        let elapsed = Date.now.timeIntervalSince(fetchStart)
-        logger
-            .info(
-                "Fetched \\(sorted.count, privacy: .public) players in 1 call (\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
-            )
-
-        do {{
-            try storage.save(sorted, forKey: cacheKey, in: .file)
-            try storage.save(Date.now, forKey: cacheDateKey, in: .file)
-        }} catch {{
-            logger.warning("Failed to cache players: \\(error.diagnosticDescription, privacy: .public)")
-        }}
-
-        return sorted
-    }}
-
-    func loadCachedPlayers() throws -> [Player]? {{
-        try storage.load(forKey: cacheKey, from: .file)
-    }}
-
-    func loadCachedFetchDate() throws -> Date? {{
-        try storage.load(forKey: cacheDateKey, from: .file)
-    }}
-
-    // MARK: - Mapping
-
-    private func mapPlayer(_ dto: PlayerDTO) -> Player? {{
-        Player(
-            id: String(dto.id),
-            displayName: "\\(dto.firstName) \\(dto.lastName)",
-            team: dto.team,
-            position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
-            headshotURL: dto.headshotURL,
-            externalPersonID: dto.externalPersonID,
-            playerTier: dto.playerTier,
-            avgFantasyScore: dto.avgFantasyScore,
-            avgFantasyScoreHome: dto.avgFantasyScoreHome,
-            avgFantasyScoreAway: dto.avgFantasyScoreAway,
-            avgMinutes: dto.avgMinutes,
-            recentGameScores: dto.recentGameScores,
-            trendScore: dto.trendScore,
-            trendDirection: dto.trendDirection,
-            trendAcceleration: dto.trendAcceleration,
-            hotStreak: dto.hotStreak,
-            isSurging: dto.isSurging,
-            surgingCategoryCount: dto.surgingCategoryCount,
-            confidenceScore: dto.confidenceScore,
-            consistencyScore: dto.consistencyScore,
-            playoffDataConfidence: dto.playoffDataConfidence,
-            injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
-            previousInjuryStatus: dto.previousInjuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
-            injuryStatusChangedAt: dto.injuryStatusChangedAt.flatMap {{ Self.parseISODate($0) }},
-            isReturnGameWindow: dto.isReturnGameWindow,
-            daysSinceReturn: dto.daysSinceReturn,
-            isRoleChange: dto.isRoleChange,
-            usageEfficiencySignal: dto.usageEfficiencySignal.flatMap {{ UsageEfficiencySignal(rawValue: $0) }}
-        )
-    }}
-
-    private static func parseISODate(_ string: String) -> Date? {{
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: string) {{ return date }}
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: string)
-    }}
-}}
-
-// MARK: - Player DTOs
-
-private struct PlayersResponse: Decodable {{
-    let data: [PlayerDTO]
-}}
-
-private struct PlayerDTO: Decodable {{
-    let id: Int
-    let firstName: String
-    let lastName: String
-    let team: String
-    let position: String?
-    let headshotURL: URL?
-    let externalPersonID: Int?
-    let playerTier: String?
-    let avgFantasyScore: Double?
-    let avgFantasyScoreHome: Double?
-    let avgFantasyScoreAway: Double?
-    let avgMinutes: Double?
-    let recentGameScores: [Double]?
-    let trendScore: Double?
-    let trendDirection: TrendDirection?
-    let trendAcceleration: Double?
-    let hotStreak: Int?
-    let isSurging: Bool?
-    let surgingCategoryCount: Int?
-    let confidenceScore: Double?
-    let consistencyScore: Double?
-    let playoffDataConfidence: Double?
-    let injuryStatus: String?
-    let previousInjuryStatus: String?
-    let injuryStatusChangedAt: String?
-    let isReturnGameWindow: Bool?
-    let daysSinceReturn: Int?
-    let isRoleChange: Bool?
-    let usageEfficiencySignal: String?
-
-    enum CodingKeys: String, CodingKey {{
-        case id
-        case firstName = "first_name"
-        case lastName = "last_name"
-        case team, position
-        case headshotURL = "headshot_url"
-        case externalPersonID = "{external_id_key}"
-        case playerTier = "player_tier"
-        case avgFantasyScore = "avg_fantasy_score"
-        case avgFantasyScoreHome = "avg_fantasy_score_home"
-        case avgFantasyScoreAway = "avg_fantasy_score_away"
-        case avgMinutes = "avg_minutes"
-        case recentGameScores = "recent_game_scores"
-        case trendScore = "trend_score"
-        case trendDirection = "trend_direction"
-        case trendAcceleration = "trend_acceleration"
-        case hotStreak = "hot_streak"
-        case isSurging = "is_surging"
-        case surgingCategoryCount = "surging_category_count"
-        case confidenceScore = "confidence_score"
-        case consistencyScore = "consistency_score"
-        case playoffDataConfidence = "playoff_data_confidence"
-        case injuryStatus = "injury_status"
-        case previousInjuryStatus = "previous_injury_status"
-        case injuryStatusChangedAt = "injury_status_changed_at"
-        case isReturnGameWindow = "is_return_game_window"
-        case daysSinceReturn = "days_since_return"
-        case isRoleChange = "is_role_change"
-        case usageEfficiencySignal = "usage_efficiency_signal"
-    }}
-
-    init(from decoder: Decoder) throws {{
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(Int.self, forKey: .id)
-        firstName = try container.decode(String.self, forKey: .firstName)
-        lastName = try container.decode(String.self, forKey: .lastName)
-        if let teamString = try? container.decode(String.self, forKey: .team) {{
-            team = teamString
-        }} else if let teamDict = try? container.decode([String: AnyCodableValue].self, forKey: .team) {{
-            team = teamDict["abbreviation"]?.stringValue
-                ?? teamDict["abbr"]?.stringValue
-                ?? teamDict["full_name"]?.stringValue
-                ?? teamDict["name"]?.stringValue
-                ?? teamDict["city"]?.stringValue
-                ?? "?"
-        }} else {{
-            team = "?"
-        }}
-        position = try container.decodeIfPresent(String.self, forKey: .position)
-        headshotURL = try container.decodeIfPresent(URL.self, forKey: .headshotURL)
-        externalPersonID = try container.decodeIfPresent(Int.self, forKey: .externalPersonID)
-        playerTier = try container.decodeIfPresent(String.self, forKey: .playerTier)
-        avgFantasyScore = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScore)
-        avgFantasyScoreHome = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScoreHome)
-        avgFantasyScoreAway = try container.decodeIfPresent(Double.self, forKey: .avgFantasyScoreAway)
-        avgMinutes = try container.decodeIfPresent(Double.self, forKey: .avgMinutes)
-        recentGameScores = try container.decodeIfPresent([Double].self, forKey: .recentGameScores)
-        trendScore = try container.decodeIfPresent(Double.self, forKey: .trendScore)
-        trendDirection = try container.decodeIfPresent(TrendDirection.self, forKey: .trendDirection)
-        trendAcceleration = try container.decodeIfPresent(Double.self, forKey: .trendAcceleration)
-        hotStreak = try container.decodeIfPresent(Int.self, forKey: .hotStreak)
-        isSurging = try container.decodeIfPresent(Bool.self, forKey: .isSurging)
-        surgingCategoryCount = try container.decodeIfPresent(Int.self, forKey: .surgingCategoryCount)
-        confidenceScore = try container.decodeIfPresent(Double.self, forKey: .confidenceScore)
-        consistencyScore = try container.decodeIfPresent(Double.self, forKey: .consistencyScore)
-        playoffDataConfidence = try container.decodeIfPresent(Double.self, forKey: .playoffDataConfidence)
-        injuryStatus = try container.decodeIfPresent(String.self, forKey: .injuryStatus)
-        previousInjuryStatus = try container.decodeIfPresent(String.self, forKey: .previousInjuryStatus)
-        injuryStatusChangedAt = try container.decodeIfPresent(String.self, forKey: .injuryStatusChangedAt)
-        isReturnGameWindow = try container.decodeIfPresent(Bool.self, forKey: .isReturnGameWindow)
-        daysSinceReturn = try container.decodeIfPresent(Int.self, forKey: .daysSinceReturn)
-        isRoleChange = try container.decodeIfPresent(Bool.self, forKey: .isRoleChange)
-        usageEfficiencySignal = try container.decodeIfPresent(String.self, forKey: .usageEfficiencySignal)
-    }}
-}}
-
-// MARK: - AnyCodableValue
-
-/// Lightweight wrapper for decoding JSON values of mixed types (String, Int,
-/// Double, Bool) when the exact schema is unknown — used for the polymorphic
-/// `team` field which may arrive as a dictionary with heterogeneous values.
-private enum AnyCodableValue: Decodable {{
-    case string(String)
-    case int(Int)
-    case double(Double)
-    case bool(Bool)
-
-    init(from decoder: Decoder) throws {{
-        let container = try decoder.singleValueContainer()
-        if let value = try? container.decode(String.self) {{
-            self = .string(value)
-        }} else if let value = try? container.decode(Int.self) {{
-            self = .int(value)
-        }} else if let value = try? container.decode(Double.self) {{
-            self = .double(value)
-        }} else if let value = try? container.decode(Bool.self) {{
-            self = .bool(value)
-        }} else {{
-            self = .string("")
-        }}
-    }}
-
-    var stringValue: String? {{
-        switch self {{
-        case let .string(value): value.isEmpty ? nil : value
-        case let .int(value): String(value)
-        case let .double(value): String(value)
-        case .bool: nil
-        }}
-    }}
-}}
-
-// MARK: - TrendingsServiceError
-
-enum TrendingsServiceError: LocalizedError {{
-    case noTeamsFound
-    case unauthenticated
-
-    var errorDescription: String? {{
-        switch self {{
-        case .noTeamsFound:
-            "No {league} teams were found in the response."
-        case .unauthenticated:
-            "You must be signed in to load player data."
-        }}
-    }}
-}}
-"""
-
-opportunities_service_swift = header() + f"""\
-import Alamofire
-import BKSCore
-import BKSUICore
-import Foundation
-import OSLog
-
-// MARK: - OpportunitiesServiceProtocol
-
-protocol OpportunitiesServiceProtocol {{
-    /// Fetches a single page and returns the raw page result including server total.
-    func fetchOpportunitiesPage(
-        limit: Int?, offset: Int?, platform: String?, mode: String?, fields: [String]?
-    ) async throws -> OpportunitiesPageResult
-    func loadCachedOpportunities() throws -> [Opportunity]?
-    func loadCachedOpportunitiesFetchDate() throws -> Date?
-    func loadCachedSeasonMode() throws -> SeasonMode?
-}}
-
-extension OpportunitiesServiceProtocol {{
-    func fetchOpportunitiesPage() async throws -> OpportunitiesPageResult {{
-        try await fetchOpportunitiesPage(limit: nil, offset: nil, platform: nil, mode: nil, fields: nil)
-    }}
-}}
-
-// MARK: - OpportunitiesPageResult
-
-struct OpportunitiesPageResult {{
-    let opportunities: [Opportunity]
-    let seasonMode: SeasonMode
-    let total: Int
-    let offset: Int
-    let limit: Int
-}}
-
-// MARK: - OpportunitiesService
-
-final class OpportunitiesService: OpportunitiesServiceProtocol {{
-    private let network: NetworkProtocol
-    private let storage: StorageProtocol
-    private let configuration: ConfigurationProtocol
-    private let sportConfiguration: any SportConfigurationProtocol
-    private let logger = os.Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "OpportunitiesService"
-    )
-    private let signposter = OSSignposter(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "OpportunitiesService"
-    )
-    private let coalescer = FetchCoalescer<OpportunitiesPageResult>()
-
-    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v3" }}
-    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)opportunities_v3_date" }}
-    private var seasonModeCacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)season_mode_v1" }}
-
-    private static let iso8601Full: ISO8601DateFormatter = {{
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fmt
-    }}()
-
-    private static let iso8601Plain: ISO8601DateFormatter = {{
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime]
-        return fmt
-    }}()
-
-    private static func parseISO8601(_ string: String?) -> Date? {{
-        guard let string else {{ return nil }}
-        return iso8601Full.date(from: string) ?? iso8601Plain.date(from: string)
-    }}
-
-    init(
-        network: NetworkProtocol,
-        storage: StorageProtocol,
-        configuration: ConfigurationProtocol,
-        sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
-    ) {{
-        self.network = network
-        self.storage = storage
-        self.configuration = configuration
-        self.sportConfiguration = sportConfiguration
-    }}
-
-    func fetchOpportunitiesPage(
-        limit: Int? = nil,
-        offset: Int? = nil,
-        platform: String? = nil,
-        mode: String? = nil,
-        fields: [String]? = nil
-    ) async throws -> OpportunitiesPageResult {{
-        let currentOffset = offset ?? 0
-        // Coalesce concurrent page-0 calls so only one Cloud Run cold-start fires.
-        if currentOffset == 0 {{
-            return try await coalescer.run(logger: logger, label: "fetchOpportunitiesPage") {{
-                try await self._fetchPage(limit: limit, offset: 0, platform: platform, mode: mode, fields: fields)
-            }}
-        }}
-        return try await _fetchPage(limit: limit, offset: currentOffset, platform: platform, mode: mode, fields: fields)
-    }}
-
-    private func _fetchPage(
-        limit: Int?,
-        offset: Int,
-        platform: String?,
-        mode: String?,
-        fields: [String]?
-    ) async throws -> OpportunitiesPageResult {{
-        let url = configuration.checkedURL(for: .getOpportunitiesURL)
-        let params = sportConfiguration.opportunityParams
-        let pageSize = limit ?? params.limit
-        let requestFields = fields ?? sportConfiguration.opportunityFields
-
-        let fetchInterval = signposter.beginInterval("fetchOpportunitiesPage")
-        defer {{ signposter.endInterval("fetchOpportunitiesPage", fetchInterval) }}
-
-        try Task.checkCancellation()
-
-        var parameters: Parameters = [
-            "limit": pageSize,
-            "offset": offset,
-            "mode": mode ?? params.mode,
-        ]
-        if let platform {{ parameters["platform"] = platform }}
-        if !requestFields.isEmpty {{ parameters["fields"] = requestFields.joined(separator: ",") }}
-
-        let response: OpportunitiesResponse = try await network.get(url, parameters: parameters)
-        let mapped = response.data.compactMap(mapOpportunity)
-        let seasonMode = response.seasonMode ?? .regularSeason
-        let total = response.total ?? mapped.count
-
-        logger.info("Fetched \\(mapped.count, privacy: .public) opportunities at offset \\(offset, privacy: .public) (total: \\(total, privacy: .public))")
-
-        if offset == 0 {{
-            do {{
-                try storage.save(mapped, forKey: cacheKey, in: .file)
-                try storage.save(Date.now, forKey: cacheDateKey, in: .file)
-                try storage.save(seasonMode, forKey: seasonModeCacheKey, in: .file)
-            }} catch {{
-                let msg = "Failed to cache opportunities: \\(error.diagnosticDescription)"
-                logger.warning("\\(msg, privacy: .public)")
-                DiagnosticLogger.error(msg, category: "OpportunitiesService")
-            }}
-        }}
-
-        return OpportunitiesPageResult(
-            opportunities: mapped,
-            seasonMode: seasonMode,
-            total: total,
-            offset: offset,
-            limit: pageSize
-        )
-    }}
-
-    func loadCachedOpportunities() throws -> [Opportunity]? {{
-        try storage.load(forKey: cacheKey, from: .file)
-    }}
-
-    func loadCachedOpportunitiesFetchDate() throws -> Date? {{
-        try storage.load(forKey: cacheDateKey, from: .file)
-    }}
-
-    func loadCachedSeasonMode() throws -> SeasonMode? {{
-        try storage.load(forKey: seasonModeCacheKey, from: .file)
-    }}
-
-    // MARK: - Mapping
-
-    // swiftlint:disable:next function_body_length
-    private func mapOpportunity(_ dto: OpportunityDTO) -> Opportunity? {{
-        let tier: TierLevel
-        if let tierStr = dto.opportunityTier, let mapped = TierLevel(serverValue: tierStr) {{
-            tier = mapped
-        }} else {{
-            logger.warning("Unknown opportunity tier '\\(dto.opportunityTier ?? "nil", privacy: .public)' for \\(dto.firstName, privacy: .public) \\(dto.lastName, privacy: .public) — defaulting to .bottom")
-            tier = .bottom
-        }}
-        return Opportunity(
-            id: String(dto.id),
-            displayName: "\\(dto.firstName) \\(dto.lastName)",
-            team: dto.team,
-            position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
-            opponentAbbr: dto.opponentAbbr,
-            headshotURL: dto.headshotURL,
-            externalPersonID: dto.externalPersonID,
-            opportunityScore: dto.opportunityScore,
-            opportunityTier: tier,
-            playerTierDk: dto.playerTier.flatMap {{ TierLevel(serverValue: $0) }},
-            playerTierFd: dto.playerTierFd.flatMap {{ TierLevel(serverValue: $0) }},
-            mode: dto.mode ?? "",
-            platforms: dto.platform.map {{ [$0] }} ?? ["dk"],
-            injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
-            isSurging: dto.isSurging ?? false,
-            isHome: dto.isHome ?? false,
-            gameDateTime: Self.parseISO8601(dto.gameDateTime),
-            playoffRotationMultiplier: dto.playoffRotationMultiplier,
-            rotationTier: dto.rotationTier.flatMap {{ RotationTier(rawValue: $0) }},
-            playoffTrendTrust: dto.playoffTrendTrust,
-            playoffGamesPlayed: dto.playoffGamesPlayed
-            // Sport-specific fields: add additional Opportunity init args here
-            // to match your sport's API fields (see OpportunityDTO below).
-        )
-    }}
-}}
-
-// MARK: - Opportunity DTOs
-
-private struct OpportunitiesResponse: Decodable {{
-    let data: [OpportunityDTO]
-    let seasonMode: SeasonMode?
-    let total: Int?
-    let offset: Int?
-    let limit: Int?
-
-    enum CodingKeys: String, CodingKey {{
-        case data
-        case seasonMode = "season_mode"
-        case total
-        case offset
-        case limit
-    }}
-}}
-
-private struct OpportunityDTO: Decodable {{
-    let id: Int
-    let firstName: String
-    let lastName: String
-    let team: String
-    let position: String?
-    let opponentAbbr: String
-    let headshotURL: URL?
-    let externalPersonID: Int?
-
-    let opportunityScore: Double?
-    let opportunityTier: String?
-    let playerTier: String?
-    let playerTierFd: String?
-    let mode: String?
-    let platform: String?
-
-    let injuryStatus: String?
-    let isSurging: Bool?
-    let isHome: Bool?
-    let gameDateTime: String?
-
-    let playoffRotationMultiplier: Double?
-    let rotationTier: String?
-    let playoffTrendTrust: Double?
-    let playoffGamesPlayed: Int?
-
-    // MARK: - Sport-specific DTO fields
-    // Add fields here that your sport's opportunity API returns.
-    // Remove any that your API does not provide.
-
-    enum CodingKeys: String, CodingKey {{
-        case id
-        case firstName = "first_name"
-        case lastName = "last_name"
-        case team
-        case position
-        case opponentAbbr = "opponent_abbr"
-        case headshotURL = "headshot_url"
-        case externalPersonID = "{external_id_key}"
-        case opportunityScore = "opportunity_score"
-        case opportunityTier = "opportunity_tier"
-        case playerTier = "player_tier"
-        case playerTierFd = "player_tier_fd"
-        case mode
-        case platform
-        case injuryStatus = "injury_status"
-        case isSurging = "is_surging"
-        case isHome = "is_home"
-        case gameDateTime = "game_datetime"
-        case playoffRotationMultiplier = "playoff_rotation_multiplier"
-        case rotationTier = "rotation_tier"
-        case playoffTrendTrust = "playoff_trend_trust"
-        case playoffGamesPlayed = "playoff_games_played"
-    }}
-}}
-"""
-
-write_if_absent(os.path.join(services_dir, "TrendingsService.swift"), trendings_service_swift)
-write_if_absent(os.path.join(services_dir, "OpportunitiesService.swift"), opportunities_service_swift)
-
-projections_service_swift = header() + f"""\
-import Alamofire
-import BKSCore
-import Foundation
-import OSLog
-
-// MARK: - ProjectionsServiceProtocol
-
-protocol ProjectionsServiceProtocol {{
-    func fetchProjections(fields: [String]?) async throws -> [Projection]
-    func loadCachedProjections() throws -> [Projection]?
-    func loadCachedProjectionsFetchDate() throws -> Date?
-}}
-
-extension ProjectionsServiceProtocol {{
-    func fetchProjections() async throws -> [Projection] {{
-        try await fetchProjections(fields: nil)
-    }}
-}}
-
-// MARK: - ProjectionsService
-
-final class ProjectionsService: ProjectionsServiceProtocol {{
-    private let network: NetworkProtocol
-    private let storage: StorageProtocol
-    private let configuration: ConfigurationProtocol
-    private let sportConfiguration: any SportConfigurationProtocol
-    private let logger = os.Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "ProjectionsService"
-    )
-    private let signposter = OSSignposter(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "ProjectionsService"
-    )
-
-    private var cacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v3" }}
-    private var cacheDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)projections_v3_date" }}
-    private let coalescer = FetchCoalescer<[Projection]>()
-
-    init(
-        network: NetworkProtocol,
-        storage: StorageProtocol,
-        configuration: ConfigurationProtocol,
-        sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
-    ) {{
-        self.network = network
-        self.storage = storage
-        self.configuration = configuration
-        self.sportConfiguration = sportConfiguration
-    }}
-
-    func fetchProjections(fields: [String]? = nil) async throws -> [Projection] {{
-        try await coalescer.run(logger: logger, label: "fetchProjections") {{
-            try await self._fetchProjections(fields: fields)
-        }}
-    }}
-
-    private func _fetchProjections(fields: [String]?) async throws -> [Projection] {{
-        let url = configuration.checkedURL(for: .getProjectionsURL)
-
-        let params = sportConfiguration.projectionParams
-        var parameters: Parameters = [
-            "lookahead": params.lookahead,
-            "mode": params.mode,
-        ]
-        if let fields, !fields.isEmpty {{
-            parameters["fields"] = fields.joined(separator: ",")
-        }}
-
-        let fetchStart = Date.now
-        let fetchInterval = signposter.beginInterval("fetchProjections")
-        defer {{ signposter.endInterval("fetchProjections", fetchInterval) }}
-
-        try Task.checkCancellation()
-        let response: ProjectionsResponse = try await network.get(url, parameters: parameters)
-
-        let mapped = response.players.compactMap(mapProjection)
-        let elapsed = Date.now.timeIntervalSince(fetchStart)
-        logger.info(
-            "Fetched \\(mapped.count, privacy: .public) projections in 1 call (\\(String(format: \\"%.2f\\", elapsed), privacy: .public)s)"
-        )
-
-        do {{
-            try storage.save(mapped, forKey: cacheKey, in: .file)
-            try storage.save(Date.now, forKey: cacheDateKey, in: .file)
-        }} catch {{
-            logger.warning("Failed to cache projections: \\(error.diagnosticDescription, privacy: .public)")
-        }}
-
-        return mapped
-    }}
-
-    func loadCachedProjections() throws -> [Projection]? {{
-        try storage.load(forKey: cacheKey, from: .file)
-    }}
-
-    func loadCachedProjectionsFetchDate() throws -> Date? {{
-        try storage.load(forKey: cacheDateKey, from: .file)
-    }}
-
-    // MARK: - Mapping
-
-    private func mapProjection(_ dto: ProjectionPlayerDTO) -> Projection? {{
-        guard let tier = bestTier(from: dto.games) else {{ return nil }}
-        let projectionScore = dto.games.compactMap(\\.projectionScore).max() ?? dto.avgFantasyScore ?? 0
-
-        let upcomingGames: [ProjectedGame] = dto.games.enumerated().compactMap {{ index, game in
-            ProjectedGame(
-                id: "\\(dto.id)-game-\\(index)",
-                gameDate: parseDate(game.date),
-                opponentAbbr: game.opponent,
-                isHome: game.isHome ?? false,
-                opponentStrength: game.opportunityScore,
-                projectedScoreDk: game.predictedFPDk,
-                projectedScoreFd: game.predictedFPFd,
-                fpFloorDk: game.fpFloorDk,
-                fpFloorFd: game.fpFloorFd,
-                fpCeilingDk: game.fpCeilingDk,
-                fpCeilingFd: game.fpCeilingFd
-            )
-        }}
-
-        return Projection(
-            id: String(dto.id),
-            displayName: "\\(dto.firstName) \\(dto.lastName)",
-            team: dto.team,
-            position: dto.position.flatMap {{ $0.isEmpty ? nil : $0 }},
-            headshotURL: dto.headshotURL,
-            externalPersonID: dto.externalPersonID,
-            projectionScore: projectionScore,
-            projectedScoreFd: dto.games.compactMap(\\.predictedFPFd).max(),
-            projectionTier: tier,
-            playerTierDk: dto.playerTierDk.flatMap {{ TierLevel(serverValue: $0) }},
-            playerTierFd: dto.playerTierFd.flatMap {{ TierLevel(serverValue: $0) }},
-            mode: sportConfiguration.projectionParams.mode,
-            platforms: dto.games.compactMap(\\.predictedFPFd).isEmpty ? ["dk"] : ["dk", "fd"],
-            playFadeRecommendation: dto.playFadeRecommendation,
-            injuryStatus: dto.injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
-            isSurging: (dto.hotStreak ?? 0) > 0,
-            upcomingGames: upcomingGames.isEmpty ? nil : upcomingGames,
-            homeGameCount: upcomingGames.filter(\\.isHome).count,
-            awayGameCount: upcomingGames.filter {{ !$0.isHome }}.count,
-            avgOpponentStrength: upcomingGames.compactMap(\\.opponentStrength).average,
-            hotStreak: dto.hotStreak,
-            coldStreak: dto.coldStreak,
-            trendDirection: dto.trendDirection,
-            confidenceScoreDk: dto.confidenceScore,
-            confidenceScoreFd: dto.confidenceScoreFd,
-            consistencyScore: nil,
-            usageEfficiencySignal: nil
-        )
-    }}
-
-    private func bestTier(from games: [ProjectedGameDTO]) -> TierLevel? {{
-        let tiers = games.compactMap {{ TierLevel(serverValue: $0.projectionTier ?? "") }}
-        return tiers.min {{
-            (TierLevel.allCases.firstIndex(of: $0) ?? Int.max) <
-            (TierLevel.allCases.firstIndex(of: $1) ?? Int.max)
-        }}
-    }}
-
-    private func parseDate(_ string: String) -> Date {{
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter.date(from: string) ?? Date.now
-    }}
-}}
-
-// MARK: - FlexDouble
-//
-// Decodes a Double from either a JSON number or a numeric string.
-// Some backend stat fields (e.g. season_avg, woba_proxy, OBP/SLG/OPS/WAR, trend slopes)
-// may arrive as strings like ".333" instead of a JSON number. Using FlexDouble? on those
-// fields prevents a single malformed value from failing the entire projections response.
-//
-// Usage in DTOs:  let seasonAvg: FlexDouble?
-// Usage at mapping site:  seasonAvg: dto.seasonAvg?.value
-
-private struct FlexDouble: Decodable {{
-    let value: Double
-
-    init(from decoder: Decoder) throws {{
-        let container = try decoder.singleValueContainer()
-        if let num = try? container.decode(Double.self) {{
-            value = num
-        }} else if let str = try? container.decode(String.self), let num = Double(str) {{
-            value = num
-        }} else {{
-            throw DecodingError.typeMismatch(
-                Double.self,
-                DecodingError.Context(
-                    codingPath: decoder.codingPath,
-                    debugDescription: "Expected Double or numeric String"
-                )
-            )
-        }}
-    }}
-}}
-
-// MARK: - DTOs
-
-private struct ProjectionsResponse: Decodable {{
-    let platform: String
-    let mode: String
-    let lookahead: Int
-    let dates: [String]
-    let players: [ProjectionPlayerDTO]
-}}
-
-private struct ProjectionPlayerDTO: Decodable {{
-    let id: Int
-    let firstName: String
-    let lastName: String
-    let position: String?
-    let team: String
-    let externalPersonID: Int?
-    let headshotURL: URL?
-    let avgFantasyScore: Double?
-    let trendDirection: TrendDirection?
-    let trendScore: Double?
-    let confidenceScore: Double?
-    let confidenceScoreFd: Double?
-    let hotStreak: Int?
-    let coldStreak: Int?
-    let injuryStatus: String?
-    let playFadeRecommendation: PlayFadeRecommendation?
-    // MARK: Sport-specific stat fields
-    // Add FlexDouble? fields here for any numeric stat that the backend may send as a string.
-    // Example (MLB baseball):
-    //   let trendHits: FlexDouble?
-    //   let seasonAvg: FlexDouble?
-    //   let seasonOBP: FlexDouble?
-    //   let wobaProxy: FlexDouble?
-    // At the mapping site use: trendHits: dto.trendHits?.value
-    let playerTierDk: String?
-    let playerTierFd: String?
-    let games: [ProjectedGameDTO]
-
-    enum CodingKeys: String, CodingKey {{
-        case id
-        case firstName = "first_name"
-        case lastName = "last_name"
-        case position
-        case team
-        case externalPersonID = "{external_id_key}"
-        case headshotURL = "headshot_url"
-        case avgFantasyScore = "avg_fantasy_score"
-        case trendDirection = "trend_direction"
-        case trendScore = "trend_score"
-        case confidenceScore = "confidence_score"
-        case confidenceScoreFd = "confidence_score_fd"
-        case hotStreak = "hot_streak"
-        case coldStreak = "cold_streak"
-        case injuryStatus = "injury_status"
-        case playFadeRecommendation = "play_fade_recommendation"
-        case playerTierDk = "player_tier_dk"
-        case playerTierFd = "player_tier_fd"
-        case games
-    }}
-}}
-
-private struct ProjectedGameDTO: Decodable {{
-    let date: String
-    let opponent: String
-    let isHome: Bool?
-    let predictedFPDk: Double?
-    let predictedFPFd: Double?
-    let fpFloorDk: Double?
-    let fpFloorFd: Double?
-    let fpCeilingDk: Double?
-    let fpCeilingFd: Double?
-    let confidenceBand: Double?
-    let projectionScore: Double?
-    let projectionTier: String?
-    let opportunityScore: Double?
-    let opportunityTier: String?
-    let opportunityPercentile: Double?
-    let isBackToBack: Bool?
-    let teamRestDays: Int?
-    let blowoutProb: Double?
-    let vegasImpliedTeamTotal: Double?
-    let vegasOverUnder: Double?
-    let vegasSpread: Double?
-    let matchupMultiplier: Double?
-
-    enum CodingKeys: String, CodingKey {{
-        case date
-        case opponent
-        case isHome = "is_home"
-        case predictedFPDk = "predicted_fp_dk"
-        case predictedFPFd = "predicted_fp_fd"
-        case fpFloorDk = "fp_floor_dk"
-        case fpFloorFd = "fp_floor_fd"
-        case fpCeilingDk = "fp_ceiling_dk"
-        case fpCeilingFd = "fp_ceiling_fd"
-        case confidenceBand = "confidence_band"
-        case projectionScore = "projection_score"
-        case projectionTier = "projection_tier"
-        case opportunityScore = "opportunity_score"
-        case opportunityTier = "opportunity_tier"
-        case opportunityPercentile = "opportunity_percentile"
-        case isBackToBack = "is_back_to_back"
-        case teamRestDays = "team_rest_days"
-        case blowoutProb = "blowout_prob"
-        case vegasImpliedTeamTotal = "vegas_implied_team_total"
-        case vegasOverUnder = "vegas_over_under"
-        case vegasSpread = "vegas_spread"
-        case matchupMultiplier = "matchup_multiplier"
-    }}
-}}
-
-// MARK: - Helpers
-
-private extension Array where Element == Double {{
-    var average: Double? {{
-        isEmpty ? nil : reduce(0, +) / Double(count)
-    }}
-}}
-"""
 
 # Extract gamelog stat fields from YAML — drives GameEntry+Sport and GamesService mapping
 gamelog_stats = gamelog.get("stats", [])
@@ -2751,6 +2350,7 @@ def stat_accessor_line(s):
 stat_accessor_lines = "\n".join(stat_accessor_line(s) for s in gamelog_stats if not s.get("isPlayingTime"))
 
 # Build projected stat accessors (non-minutes stats that appear in display)
+display = gamelog.get("display", {})
 all_display_stats = display.get("primary", []) + display.get("secondary", [])
 proj_stat_keys = [s["key"] for s in all_display_stats if s["key"] not in ("dk", "minutes")]
 proj_accessor_lines = "\n".join(
@@ -2817,11 +2417,9 @@ def average_property_lines(averages, percentages, stats):
 
 gamelog_average_properties = average_property_lines(gamelog_averages, gamelog_percentages, gamelog_stats)
 
-games_service_swift = header() + f"""\
-import Alamofire
-import BKSCore
+games_service_swift = header() + f"""import BKSCore
+import BKSUICore
 import Foundation
-import OSLog
 
 // MARK: - GamesServiceProtocol
 
@@ -2833,23 +2431,8 @@ protocol GamesServiceProtocol: BKSCore.GamesServiceProtocol {{
 
 final class GamesService: GamesServiceProtocol {{
 
-    private let network: NetworkProtocol
-    private let firebaseNetwork: NetworkProtocol
     private let storage: StorageProtocol
-    private let configuration: ConfigurationProtocol
     private let sportConfiguration: any SportConfigurationProtocol
-    private let logger = os.Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "GamesService"
-    )
-
-    private static let gameLogCachePrefix = "game_log_"
-    private static let dateFormatter: DateFormatter = {{
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter
-    }}()
 
     init(
         network: NetworkProtocol,
@@ -2858,101 +2441,38 @@ final class GamesService: GamesServiceProtocol {{
         configuration: ConfigurationProtocol,
         sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
     ) {{
-        self.network = network
-        self.firebaseNetwork = firebaseNetwork
         self.storage = storage
-        self.configuration = configuration
         self.sportConfiguration = sportConfiguration
     }}
 
     // MARK: - Public
 
+    // Game log fetching is not currently surfaced in the app.
+    // These stubs satisfy BKSCore.GamesServiceProtocol requirements.
+    func fetchGameLog(playerID: String, teamID: String, postseason: Bool) async throws -> PlayerGameLog {{
+        throw GamesServiceError.noCompletedGames
+    }}
+
     func fetchGameLog(playerID: String, teamID: String) async throws -> PlayerGameLog {{
-        let baseURL = configuration.value(for: .gameLogBaseURL)
-        let season = currentSeason()
-
-        let response: StatsResponse = try await network.get(
-            "\\(baseURL)/stats",
-            parameters: [
-                "player_ids[]": playerID,
-                "seasons[]": season,
-                "per_page": 100,
-            ]
-        )
-
-        let entries = response.data.compactMap {{ mapGameEntry($0, teamID: teamID) }}
-        let sorted = entries.sorted {{ $0.gameDate > $1.gameDate }}
-
-        let gameLog = PlayerGameLog(
-            playerID: playerID,
-            entries: sorted,
-            fetchedAt: Date()
-        )
-
-        cacheGameLog(gameLog)
-        return gameLog
+        throw GamesServiceError.noCompletedGames
     }}
 
     func fetchGameLogs(playerIDs: [String], startDate: Date) async throws -> [PlayerGameLog] {{
-        let baseURL = configuration.value(for: .gameLogBaseURL)
-        let dateString = Self.dateFormatter.string(from: startDate)
-
-        var entriesByPlayerID: [String: [GameEntry]] = [:]
-
-        var cursor: Int?
-        repeat {{
-            try Task.checkCancellation()
-            var params: Parameters = [
-                "player_ids[]": playerIDs,
-                "per_page": 100,
-                "start_date": dateString,
-            ]
-            if let cursor {{
-                params["cursor"] = cursor
-            }}
-
-            let response: StatsResponse = try await network.get(
-                "\\(baseURL)/stats",
-                parameters: params
-            )
-
-            for stat in response.data {{
-                guard let team = stat.team, let entry = mapGameEntry(stat, teamID: String(team.id)) else {{
-                    continue
-                }}
-                entriesByPlayerID[String(stat.player.id), default: []].append(entry)
-            }}
-
-            cursor = response.meta.nextCursor
-        }} while cursor != nil
-
-        let now = Date()
-        return playerIDs.compactMap {{ playerID in
-            guard let entries = entriesByPlayerID[playerID], !entries.isEmpty else {{ return nil }}
-            let log = PlayerGameLog(
-                playerID: playerID,
-                entries: entries.sorted {{ $0.gameDate > $1.gameDate }},
-                fetchedAt: now
-            )
-            cacheGameLog(log)
-            return log
-        }}
+        []
     }}
 
-    private func cacheGameLog(_ log: PlayerGameLog) {{
-        do {{
-            try storage.save(log, forKey: Self.gameLogCachePrefix + log.playerID, in: .file)
-        }} catch {{
-            logger.warning("Failed to cache game log for player \\(log.playerID, privacy: .public): \\(error.diagnosticDescription, privacy: .public)")
-        }}
+    // Playoff bracket data is not currently surfaced in the app.
+    // This stub satisfies the BKSCore.GamesServiceProtocol requirement.
+    func fetchPlayoffBracket() async throws -> [PlayoffSeries] {{
+        []
     }}
 
     func loadCachedGameLog(playerID: String) throws -> PlayerGameLog? {{
-        try storage.load(forKey: Self.gameLogCachePrefix + playerID, from: .file)
+        nil
     }}
 
     // Schedule data is now owned by BoardService (get-board). This stub satisfies the
-    // BKSCore protocol requirement; callers should use BoardServiceProtocol.loadCachedTodaySchedule().
+    // BKSCore protocol requirement; callers should use BoardService.loadCachedTodaySchedule().
     func fetchTodaySchedule() async throws -> TodaySchedule {{
         throw GamesServiceError.noScheduleFound
     }}
@@ -2960,266 +2480,6 @@ final class GamesService: GamesServiceProtocol {{
     func loadCachedTodaySchedule() throws -> TodaySchedule? {{
         let key = "\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1"
         return try storage.load(forKey: key, from: .file)
-    }}
-
-    func fetchPlayoffBracket() async throws -> [PlayoffSeries] {{
-        let url: String = configuration.value(for: .getPlayoffBracketURL)
-        let response: BracketResponse = try await firebaseNetwork.get(url, parameters: nil)
-        let series = response.series.map {{ dto in
-            PlayoffSeries(
-                seriesID: dto.seriesID,
-                higherSeedTeam: dto.higherSeedTeam,
-                lowerSeedTeam: dto.lowerSeedTeam,
-                winsHigherSeed: dto.winsHigherSeed,
-                winsLowerSeed: dto.winsLowerSeed,
-                gamesPlayed: dto.gamesPlayed,
-                status: dto.status,
-                roundNumber: dto.roundNumber,
-                roundName: dto.roundName,
-                conference: dto.conference,
-                gameResults: []
-            )
-        }}
-        do {{
-            try storage.save(series, forKey: "{slug}_playoff_bracket_v1", in: .file)
-        }} catch {{
-            logger.warning("Failed to cache playoff bracket: \\(error.localizedDescription, privacy: .public)")
-        }}
-        logger.info("Fetched playoff bracket: \\(series.count, privacy: .public) series")
-        return series
-    }}
-
-    // MARK: - Mapping
-
-    // swiftlint:disable:next function_body_length
-    private func mapGameEntry(_ stat: StatDTO, teamID: String) -> GameEntry? {{
-        guard let game = stat.game else {{ return nil }}
-
-        let gameDate = parseDate(game.date ?? "")
-
-        let isHome: Bool = {{
-            if let homeAbbr = game.homeTeam?.abbreviation {{
-                return homeAbbr.uppercased() == teamID.uppercased()
-            }}
-            if let homeID = game.homeTeamID {{
-                return sportConfiguration.teamAbbreviation(for: homeID).uppercased() == teamID.uppercased()
-            }}
-            return false
-        }}()
-
-        let opponent = isHome ? game.visitorTeam : game.homeTeam
-        let opponentName = opponent?.fullName ?? ""
-        let opponentAbbr: String = {{
-            if let abbr = opponent?.abbreviation, !abbr.isEmpty {{
-                return abbr
-            }}
-            let oppID = isHome ? game.visitorTeamID : game.homeTeamID
-            if let oppID {{
-                return sportConfiguration.teamAbbreviation(for: oppID)
-            }}
-            return ""
-        }}()
-
-        let teamScore = isHome ? (game.homeTeamScore ?? 0) : (game.visitorTeamScore ?? 0)
-        let opponentScore = isHome ? (game.visitorTeamScore ?? 0) : (game.homeTeamScore ?? 0)
-        let won = teamScore > opponentScore
-
-        let result: GameResult = won
-            ? .win(teamScore: teamScore, opponentScore: opponentScore)
-            : .loss(teamScore: teamScore, opponentScore: opponentScore)
-
-        return GameEntry(
-            gameID: String(game.id),
-            gameDate: gameDate,
-            opponent: opponentName,
-            opponentAbbreviation: opponentAbbr,
-            isHomeGame: isHome,
-            result: result,
-            minutes: stat.min ?? "0",
-            stats: [
-{stats_dict_lines}
-            ]
-        )
-    }}
-
-    private func parseDate(_ string: String) -> Date {{
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: string) {{ return date }}
-        formatter.formatOptions = [.withInternetDateTime]
-        if let date = formatter.date(from: string) {{ return date }}
-
-        let dayFormatter = DateFormatter()
-        dayFormatter.dateFormat = "yyyy-MM-dd"
-        return dayFormatter.date(from: String(string.prefix(10))) ?? Date()
-    }}
-
-    private func parseDateOnly(_ dateString: String) -> Date {{
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        return formatter.date(from: String(dateString.prefix(10))) ?? Date()
-    }}
-
-    private func currentSeason() -> Int {{
-        let calendar = Calendar.current
-        let now = Date()
-        let year = calendar.component(.year, from: now)
-        let month = calendar.component(.month, from: now)
-        return month >= 3 ? year : year - 1
-    }}
-
-}}
-
-// MARK: - DTOs
-
-private struct StatsResponse: Decodable {{
-    let data: [StatDTO]
-    let meta: StatsMetaDTO
-}}
-
-private struct StatDTO: Decodable {{
-    let id: Int
-    let player: StatPlayerDTO
-    let game: GameInfoDTO?
-    let team: StatsTeamDTO?
-
-    let atBats: Int?
-    let single: Int?
-    let double: Int?
-    let triple: Int?
-    let homeRun: Int?
-    let rbi: Int?
-    let run: Int?
-    let walk: Int?
-    let hitByPitch: Int?
-    let stolenBase: Int?
-    let sacrificeFly: Int?
-    let sacrificeHit: Int?
-
-    let inningsPitched: Double?
-    let strikeoutPitching: Int?
-    let win: Int?
-    let earnedRunAllowed: Int?
-    let hitAgainst: Int?
-    let walkAgainst: Int?
-    let hitBatsmanAgainst: Int?
-    let completeGame: Int?
-    let completeGameShutout: Int?
-    let noHitter: Int?
-
-    let plusMinus: Int?
-
-    enum CodingKeys: String, CodingKey {{
-        case id, player, game, team
-        case atBats = "at_bats"
-        case single
-        case double
-        case triple
-        case homeRun = "home_run"
-        case rbi
-        case run
-        case walk
-        case hitByPitch = "hit_by_pitch"
-        case stolenBase = "stolen_base"
-        case sacrificeFly = "sacrifice_fly"
-        case sacrificeHit = "sacrifice_hit"
-        case inningsPitched = "innings_pitched"
-        case strikeoutPitching = "strikeout_pitching"
-        case win
-        case earnedRunAllowed = "earned_run_allowed"
-        case hitAgainst = "hit_against"
-        case walkAgainst = "walk_against"
-        case hitBatsmanAgainst = "hit_batsman_against"
-        case completeGame = "complete_game"
-        case completeGameShutout = "complete_game_shutout"
-        case noHitter = "no_hitter"
-        case plusMinus = "plus_minus"
-    }}
-}}
-
-private struct StatPlayerDTO: Decodable {{
-    let id: Int
-}}
-
-private struct GameInfoDTO: Decodable {{
-    let id: Int
-    let date: String?
-    let season: Int?
-    let status: String?
-    let homeTeamScore: Int?
-    let visitorTeamScore: Int?
-    let homeTeam: StatsTeamDTO?
-    let visitorTeam: StatsTeamDTO?
-    let homeTeamID: Int?
-    let visitorTeamID: Int?
-
-    enum CodingKeys: String, CodingKey {{
-        case id, date, season, status
-        case homeTeamScore = "home_team_score"
-        case visitorTeamScore = "visitor_team_score"
-        case homeTeam = "home_team"
-        case visitorTeam = "visitor_team"
-        case homeTeamID = "home_team_id"
-        case visitorTeamID = "visitor_team_id"
-    }}
-}}
-
-private struct StatsTeamDTO: Decodable {{
-    let id: Int
-    let abbreviation: String
-    let city: String
-    let name: String
-    let fullName: String
-
-    enum CodingKeys: String, CodingKey {{
-        case id, abbreviation, city, name
-        case fullName = "full_name"
-    }}
-}}
-
-private struct StatsMetaDTO: Decodable {{
-    let nextCursor: Int?
-    let perPage: Int
-
-    enum CodingKeys: String, CodingKey {{
-        case nextCursor = "next_cursor"
-        case perPage = "per_page"
-    }}
-}}
-
-// MARK: - Playoff Bracket DTOs
-
-private struct BracketResponse: Decodable {{
-    let series: [SeriesDTO]
-}}
-
-private struct SeriesDTO: Decodable {{
-    let seriesID: String
-    let roundNumber: Int
-    let roundName: String
-    let conference: String
-    let higherSeedTeam: String
-    let lowerSeedTeam: String
-    let winsHigherSeed: Int
-    let winsLowerSeed: Int
-    let status: String
-    let gamesPlayed: Int
-
-    enum CodingKeys: String, CodingKey {{
-        case seriesID = "series_id"
-        case roundNumber = "round_number"
-        case roundName = "round_name"
-        case conference
-        case higherSeedTeam = "higher_seed_team"
-        case lowerSeedTeam = "lower_seed_team"
-        case winsHigherSeed = "wins_higher_seed"
-        case winsLowerSeed = "wins_lower_seed"
-        case status
-        case gamesPlayed = "games_played"
     }}
 }}
 
@@ -3243,175 +2503,775 @@ enum GamesServiceError: LocalizedError {{
 }}
 """
 
-playoff_service_swift = header() + f"""\
+
+write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
+
+# ── BoardService (board endpoint: schedule + players + odds + props) ──────────
+
+board_service_swift = f"""// Copyright 2026 Black Katt Technologies Inc.
+// iOS {deploy_tgt}+
+// swiftlint:disable file_length
+
+import Alamofire
 import BKSCore
+import BKSUICore
 import Foundation
 import OSLog
 
-// MARK: - PlayoffServiceProtocol
+// MARK: - BoardServiceProtocol
 
-protocol PlayoffServiceProtocol {{
-    func fetchLeagueState() async throws -> LeagueState
-    func fetchBracket() async throws -> [PlayoffSeries]
-    func loadCachedLeagueState() throws -> LeagueState?
-    func loadCachedBracket() throws -> [PlayoffSeries]?
+protocol BoardServiceProtocol {{
+    /// Fetches today's board (games + optional embedded analysis). Not paginated.
+    func fetchBoard() async throws -> BoardPageResult
+    /// Reads the today schedule written by the most recent `fetchBoard` call from disk cache.
+    func loadCachedTodaySchedule() throws -> TodaySchedule?
+    /// All storage keys written by this service. Used by force-refresh to invalidate on-disk caches.
+    var cacheKeys: [String] {{ get }}
 }}
 
-// MARK: - PlayoffService
+// MARK: - BoardPageResult
 
-final class PlayoffService: PlayoffServiceProtocol {{
+struct BoardPageResult {{
+    let date: String
+    let seasonMode: SeasonMode
+    let games: [ScheduledGame]
+    let dailyAnalysis: DailyAnalysis?
+    let scheduleSyncedAt: String?
+    let topPropOpportunities: [TopPropOpportunity]?
+    let propSlateSynthesis: PropSlateSynthesis?
+    let projections: [Projection]
+}}
 
+// MARK: - BoardService
+
+final class BoardService: BoardServiceProtocol {{
     private let network: NetworkProtocol
     private let storage: StorageProtocol
     private let configuration: ConfigurationProtocol
+    private let sportConfiguration: any SportConfigurationProtocol
     private let logger = os.Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
-        category: "PlayoffService"
+        category: "BoardService"
     )
+    private let signposter = OSSignposter(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "BoardService"
+    )
+    private let coalescer = FetchCoalescer<BoardPageResult>()
 
-    private static let leagueStateCacheKey = "{slug}_league_state_v1"
-    private static let bracketCacheKey = "{slug}_playoff_bracket_v1"
+    private var seasonModeKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)season_mode_v1" }}
+    private var scheduleCacheKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1" }}
+    private var scheduleDateKey: String {{ "\\(sportConfiguration.cacheKeyPrefix)today_schedule_v1_date" }}
+
+    var cacheKeys: [String] {{ [seasonModeKey, scheduleCacheKey, scheduleDateKey] }}
 
     init(
         network: NetworkProtocol,
         storage: StorageProtocol,
-        configuration: ConfigurationProtocol
+        configuration: ConfigurationProtocol,
+        sportConfiguration: any SportConfigurationProtocol = SportConfiguration.{slug}
     ) {{
         self.network = network
         self.storage = storage
         self.configuration = configuration
+        self.sportConfiguration = sportConfiguration
     }}
 
-    // MARK: - Public
-
-    func fetchLeagueState() async throws -> LeagueState {{
-        let url = configuration.value(for: .getLeagueStateURL)
-        let response: LeagueStateResponse = try await network.get(url, parameters: nil)
-        let state = LeagueState(
-            mode: SeasonMode(rawValue: response.mode) ?? .regularSeason,
-            playoffRound: response.playoffRound,
-            playoffStartDate: response.playoffStartDate,
-            regularSeasonEndDate: response.regularSeasonEndDate,
-            season: response.season
-        )
-        do {{
-            try storage.save(state, forKey: Self.leagueStateCacheKey, in: .file)
-        }} catch {{
-            logger.warning("Failed to cache league state: \\(error.diagnosticDescription, privacy: .public)")
+    func fetchBoard() async throws -> BoardPageResult {{
+        try await coalescer.run(logger: logger, label: "fetchBoard") {{
+            try await self._fetchBoard()
         }}
-        logger.info("Fetched league state: \\(response.mode, privacy: .public)")
-        return state
     }}
 
-    func fetchBracket() async throws -> [PlayoffSeries] {{
-        let url = configuration.value(for: .getPlayoffBracketURL)
-        let response: BracketResponse = try await network.get(url, parameters: nil)
-        let series = response.series.map(mapSeries)
-        do {{
-            try storage.save(series, forKey: Self.bracketCacheKey, in: .file)
-        }} catch {{
-            logger.warning("Failed to cache playoff bracket: \\(error.diagnosticDescription, privacy: .public)")
+    private func _fetchBoard() async throws -> BoardPageResult {{
+        let url = configuration.checkedURL(for: .getBoardURL)
+        let fetchInterval = signposter.beginInterval("fetchBoard")
+        defer {{ signposter.endInterval("fetchBoard", fetchInterval) }}
+        try Task.checkCancellation()
+
+        let response: BoardResponse = try await network.get(url)
+        let games = response.games.map(mapGame)
+        let seasonMode = SeasonMode(rawValue: response.seasonMode) ?? .regularSeason
+        let dailyAnalysis = response.analysis.flatMap {{ assembleAnalysis($0) }}
+        let topProps = response.topPropOpportunities
+        let slateSynthesis = response.propSlateSynthesis.map {{ dto in
+            PropSlateSynthesis(
+                rankedPicks: dto.rankedPicks.map {{
+                    PropSlateSynthesis.Pick(
+                        playerID: $0.playerID,
+                        market: $0.market,
+                        conviction: SlateConviction(rawValue: $0.conviction) ?? .low,
+                        convictionReason: $0.convictionReason
+                    )
+                }},
+                dailyPropNarrative: dto.dailyPropNarrative,
+                contradictions: dto.contradictions
+            )
         }}
-        logger.info("Fetched playoff bracket: \\(series.count, privacy: .public) series")
-        return series
-    }}
+        let projections = (response.playerProjections ?? [:]).compactMap {{ key, dto in
+            dto.toProjection(id: key)
+        }}
 
-    func loadCachedLeagueState() throws -> LeagueState? {{
-        try storage.load(forKey: Self.leagueStateCacheKey, from: .file)
-    }}
-
-    func loadCachedBracket() throws -> [PlayoffSeries]? {{
-        try storage.load(forKey: Self.bracketCacheKey, from: .file)
-    }}
-
-    // MARK: - Mapping
-
-    private func mapSeries(_ dto: SeriesDTO) -> PlayoffSeries {{
-        PlayoffSeries(
-            seriesID: dto.seriesID,
-            roundNumber: dto.roundNumber,
-            roundName: dto.roundName,
-            conference: dto.conference,
-            higherSeedTeam: dto.higherSeedTeam,
-            lowerSeedTeam: dto.lowerSeedTeam,
-            higherSeed: dto.higherSeed,
-            lowerSeed: dto.lowerSeed,
-            winsHigherSeed: dto.winsHigherSeed,
-            winsLowerSeed: dto.winsLowerSeed,
-            status: SeriesStatus(rawValue: dto.status) ?? .scheduled,
-            winner: dto.winner,
-            gamesPlayed: dto.gamesPlayed,
-            eliminationGameNext: dto.eliminationGameNext,
-            homeCourt: dto.homeCourtPattern
+        logger.info(
+            "fetchBoard: games=\\(games.count, privacy: .public) projections=\\(projections.count, privacy: .public) analysis=\\(dailyAnalysis != nil ? "yes" : "no", privacy: .public) topProps=\\(topProps?.count ?? 0, privacy: .public) slateSynthesis=\\(slateSynthesis != nil ? "yes" : "no", privacy: .public)"
         )
+
+        writeScheduleCache(games: games, date: response.date, seasonMode: seasonMode)
+
+        return BoardPageResult(
+            date: response.date,
+            seasonMode: seasonMode,
+            games: games,
+            dailyAnalysis: dailyAnalysis,
+            scheduleSyncedAt: response.scheduleSyncedAt,
+            topPropOpportunities: topProps,
+            propSlateSynthesis: slateSynthesis,
+            projections: projections
+        )
+    }}
+
+    // MARK: - Cache
+
+    private func writeScheduleCache(games: [ScheduledGame], date: String, seasonMode: SeasonMode) {{
+        let schedule = TodaySchedule(date: date, gameCount: games.count, games: games)
+        let now = Date.now
+        do {{
+            try storage.save(seasonMode, forKey: seasonModeKey, in: .file)
+            try storage.save(schedule, forKey: scheduleCacheKey, in: .file)
+            try storage.save(now, forKey: scheduleDateKey, in: .file)
+        }} catch {{
+            let msg = "BoardService: failed to write disk caches: \\(error.diagnosticDescription)"
+            logger.warning("\\(msg, privacy: .public)")
+            DiagnosticLogger.error(msg, category: "BoardService")
+        }}
+    }}
+
+    func loadCachedTodaySchedule() throws -> TodaySchedule? {{
+        try storage.load(forKey: scheduleCacheKey, from: .file)
+    }}
+
+    // MARK: - Analysis assembly
+
+    /// Assembles a DailyAnalysis from the embedded board analysis DTO.
+    /// Returns nil if date parsing fails so a bad analysis field never crashes board load.
+    private func assembleAnalysis(_ dto: BoardAnalysisDTO) -> DailyAnalysis? {{
+        guard let generatedAt = parseISO8601Full(dto.generatedAt) else {{
+            logger.warning("BoardService: could not parse analysis generated_at '\\(dto.generatedAt, privacy: .public)'")
+            return nil
+        }}
+        let insights = assembleGameInsights(dto.gameInsights)
+        return DailyAnalysis(
+            date: dto.date,
+            cached: false,
+            slateInsight: dto.slateInsight ?? "",
+            slateNarrativeSections: nil,
+            topProjections: dto.topProjections ?? [],
+            keyTrends: dto.keyTrends ?? [],
+            emergingPlays: dto.emergingPlays ?? [],
+            dataConfidence: dto.dataConfidence,
+            gameInsights: insights,
+            generatedAt: generatedAt,
+            model: dto.model
+        )
+    }}
+
+    private func assembleGameInsights(_ dtos: [String: BoardGameInsightDTO]?) -> [String: GameInsight]? {{
+        guard let dtos, !dtos.isEmpty else {{
+            logger.debug("BoardService: assembleGameInsights — dtos nil or empty, returning nil")
+            return nil
+        }}
+        logger.debug("BoardService: assembleGameInsights — keys=[\\(dtos.keys.sorted().joined(separator: ", "), privacy: .public)]")
+        var insights: [String: GameInsight] = [:]
+        for (key, dto) in dtos {{
+            guard let generatedAt = parseISO8601Full(dto.generatedAt) else {{
+                logger.warning("BoardService: dropping game_insight \\(key, privacy: .public): invalid date")
+                continue
+            }}
+            insights[key] = GameInsight(
+                gameId: dto.gameId,
+                homeTeam: dto.homeTeam,
+                awayTeam: dto.awayTeam,
+                generatedAt: generatedAt,
+                gameEnvironment: dto.gameEnvironment,
+                lineMovementSignal: dto.lineMovementSignal,
+                matchupNarrative: dto.matchupNarrative,
+                keyPlayers: dto.keyPlayers,
+                gameStackTargets: dto.gameStackTargets,
+                injuryFlags: dto.injuryFlags
+            )
+        }}
+        return insights.isEmpty ? nil : insights
+    }}
+
+    // MARK: - Game / odds mapping
+
+    private func mapGame(_ dto: BoardGameDTO) -> ScheduledGame {{
+        ScheduledGame(
+            id: dto.gameID,
+            homeTeamAbbr: dto.homeTeamAbbr,
+            visitorTeamAbbr: dto.visitorTeamAbbr,
+            status: dto.status,
+            gameType: dto.gameType,
+            gameDatetime: parseISO8601(dto.gameDatetime) ?? .distantFuture,
+            homeOdds: dto.homeOdds.map(mapOdds),
+            visitorOdds: dto.visitorOdds.map(mapOdds),
+            homeProjTotal: dto.homeProjTotal,
+            visitorProjTotal: dto.visitorProjTotal,
+            projTotal: dto.projTotal,
+            bkWinner: dto.bkWinner,
+            bkWinnerConfidence: dto.bkWinnerConfidence,
+            bkSpreadPick: dto.bkSpreadPick,
+            bkSpreadPickCovers: dto.bkSpreadPickCovers,
+            bkSpreadConfidence: dto.bkSpreadConfidence,
+            isDoubleheader: dto.isDoubleheader,
+            gameSequence: dto.gameSequence,
+            scoringTier: dto.scoringTier
+        )
+    }}
+
+    private func mapOdds(_ dto: BoardGameSideOddsDTO) -> GameSideOdds {{
+        GameSideOdds(
+            impliedTeamTotal: dto.impliedTeamTotal,
+            overUnder: dto.overUnder,
+            spread: dto.spread,
+            isFavorite: dto.isFavorite ?? false,
+            marketWinProb: dto.marketWinProb,
+            divergence: dto.divergence
+        )
+    }}
+
+    // MARK: - Date parsing
+
+    private static let iso8601WithOffset: ISO8601DateFormatter = {{
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        return fmt
+    }}()
+
+    private static let iso8601Full: ISO8601DateFormatter = {{
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fmt
+    }}()
+
+    private func parseISO8601(_ string: String?) -> Date? {{
+        guard let string else {{ return nil }}
+        return Self.iso8601WithOffset.date(from: string)
+            ?? Self.iso8601Full.date(from: string)
+    }}
+
+    private func parseISO8601Full(_ string: String) -> Date? {{
+        Self.iso8601Full.date(from: string)
+            ?? Self.iso8601WithOffset.date(from: string)
     }}
 }}
 
-// MARK: - DTOs
+// MARK: - Response DTOs
 
-private struct LeagueStateResponse: Decodable {{
-    let mode: String
-    let playoffRound: Int?
-    let playoffStartDate: String?
-    let regularSeasonEndDate: String?
-    let season: Int?
+private struct BoardResponse: Decodable {{
+    let date: String
+    let seasonMode: String
+    let gameCount: Int
+    let games: [BoardGameDTO]
+    let scheduleSyncedAt: String?
+    let analysis: BoardAnalysisDTO?
+    let topPropOpportunities: [TopPropOpportunity]?
+    let playerProjections: [String: ProjectionPlayerDTO]?
+    let propSlateSynthesis: PropSlateSynthesisDTO?
 
     enum CodingKeys: String, CodingKey {{
-        case mode
-        case playoffRound = "playoff_round"
-        case playoffStartDate = "playoff_start_date"
-        case regularSeasonEndDate = "regular_season_end_date"
-        case season
+        case date
+        case seasonMode = "season_mode"
+        case gameCount = "game_count"
+        case games
+        case scheduleSyncedAt = "schedule_synced_at"
+        case analysis
+        case topPropOpportunities = "top_prop_opportunities"
+        case playerProjections = "player_projections"
+        case propSlateSynthesis = "prop_slate_synthesis"
     }}
 }}
 
-private struct BracketResponse: Decodable {{
-    let series: [SeriesDTO]
+private struct BoardAnalysisDTO: Decodable {{
+    let date: String
+    let generatedAt: String
+    let model: String?
+    let dataConfidence: String?
+    let slateInsight: String?
+    let topProjections: [String]?
+    let keyTrends: [String]?
+    let emergingPlays: [String]?
+    let gameInsights: [String: BoardGameInsightDTO]?
+
+    enum CodingKeys: String, CodingKey {{
+        case date
+        case generatedAt = "generated_at"
+        case model
+        case dataConfidence = "data_confidence"
+        case slateInsight = "slate_insight"
+        case topProjections = "top_projections"
+        case keyTrends = "key_trends"
+        case emergingPlays = "emerging_plays"
+        case gameInsights = "game_insights"
+    }}
+
+    init(from decoder: Decoder) throws {{
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        date = try container.decode(String.self, forKey: .date)
+        generatedAt = try container.decode(String.self, forKey: .generatedAt)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        dataConfidence = try container.decodeIfPresent(String.self, forKey: .dataConfidence)
+        slateInsight = try container.decodeIfPresent(String.self, forKey: .slateInsight)
+        topProjections = try container.decodeIfPresent([String].self, forKey: .topProjections)
+        keyTrends = try container.decodeIfPresent([String].self, forKey: .keyTrends)
+        emergingPlays = try container.decodeIfPresent([String].self, forKey: .emergingPlays)
+
+        // Decode game_insights entry-by-entry; a bad entry is skipped rather than failing the whole DTO.
+        if let insightsContainer = try? container.nestedContainer(
+            keyedBy: DynamicKey.self, forKey: .gameInsights
+        ) {{
+            var parsed: [String: BoardGameInsightDTO] = [:]
+            for key in insightsContainer.allKeys {{
+                if let dto = try? insightsContainer.decode(BoardGameInsightDTO.self, forKey: key) {{
+                    parsed[key.stringValue] = dto
+                }}
+            }}
+            gameInsights = parsed.isEmpty ? nil : parsed
+        }} else {{
+            gameInsights = nil
+        }}
+    }}
 }}
 
-private struct SeriesDTO: Decodable {{
-    let seriesID: String
-    let roundNumber: Int
-    let roundName: String
-    let conference: String
-    let higherSeedTeam: String
-    let lowerSeedTeam: String
-    let higherSeed: Int
-    let lowerSeed: Int
-    let winsHigherSeed: Int
-    let winsLowerSeed: Int
+private struct PropSlateSynthesisDTO: Decodable {{
+    let rankedPicks: [SlatePickDTO]
+    let dailyPropNarrative: String
+    let contradictions: [String]
+
+    enum CodingKeys: String, CodingKey {{
+        case rankedPicks = "ranked_picks"
+        case dailyPropNarrative = "daily_prop_narrative"
+        case contradictions
+    }}
+
+    init(from decoder: Decoder) throws {{
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        rankedPicks = try container.decodeIfPresent([SlatePickDTO].self, forKey: .rankedPicks) ?? []
+        dailyPropNarrative = try container.decode(String.self, forKey: .dailyPropNarrative)
+        contradictions = try container.decodeIfPresent([String].self, forKey: .contradictions) ?? []
+    }}
+}}
+
+private struct SlatePickDTO: Decodable {{
+    let playerID: String
+    let market: String
+    let conviction: String
+    let convictionReason: String
+
+    enum CodingKeys: String, CodingKey {{
+        case playerID = "player_id"
+        case market
+        case conviction
+        case convictionReason = "conviction_reason"
+    }}
+}}
+
+private struct BoardGameInsightDTO: Decodable {{
+    let gameId: String
+    let homeTeam: String
+    let awayTeam: String
+    let generatedAt: String
+    let gameEnvironment: GameInsight.GameEnvironment
+    let lineMovementSignal: GameInsight.LineMovementSignal
+    let matchupNarrative: String
+    let keyPlayers: [String]
+    let gameStackTargets: [String]
+    let injuryFlags: [String]
+
+    enum CodingKeys: String, CodingKey {{
+        case gameId = "game_id"
+        case homeTeam = "home_team"
+        case awayTeam = "away_team"
+        case generatedAt = "generated_at"
+        case gameEnvironment = "game_environment"
+        case lineMovementSignal = "line_movement_signal"
+        case matchupNarrative = "matchup_narrative"
+        case keyPlayers = "key_players"
+        case gameStackTargets = "game_stack_targets"
+        case injuryFlags = "injury_flags"
+    }}
+
+    init(from decoder: Decoder) throws {{
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        gameId = try container.decode(String.self, forKey: .gameId)
+        homeTeam = try container.decode(String.self, forKey: .homeTeam)
+        awayTeam = try container.decode(String.self, forKey: .awayTeam)
+        generatedAt = try container.decode(String.self, forKey: .generatedAt)
+        gameEnvironment = (try? container.decode(
+            GameInsight.GameEnvironment.self, forKey: .gameEnvironment
+        )) ?? .neutral
+        lineMovementSignal = (try? container.decode(
+            GameInsight.LineMovementSignal.self, forKey: .lineMovementSignal
+        )) ?? .neutral
+        matchupNarrative = try container.decode(String.self, forKey: .matchupNarrative)
+        keyPlayers = (try container.decodeIfPresent([String].self, forKey: .keyPlayers)) ?? []
+        gameStackTargets = (try container.decodeIfPresent([String].self, forKey: .gameStackTargets)) ?? []
+        injuryFlags = (try container.decodeIfPresent([String].self, forKey: .injuryFlags)) ?? []
+    }}
+}}
+
+private struct BoardGameDTO: Decodable {{
+    let gameID: Int
+    let gameType: String
+    let homeTeamAbbr: String
+    let visitorTeamAbbr: String
+    let gameDatetime: String
+    let isDoubleheader: Bool
+    let gameSequence: Int
     let status: String
-    let winner: String?
-    let gamesPlayed: Int
-    let eliminationGameNext: Bool
-    let homeCourtPattern: [String: Bool]
+    let homeOdds: BoardGameSideOddsDTO?
+    let visitorOdds: BoardGameSideOddsDTO?
+    let bkWinner: String?
+    let bkWinnerConfidence: Double?
+    let bkSpreadPick: String?
+    let bkSpreadPickCovers: Bool?
+    let bkSpreadConfidence: Double?
+    let projTotal: Double?
+    let homeProjTotal: Double?
+    let visitorProjTotal: Double?
+    let scoringTier: ScoringTier?
 
     enum CodingKeys: String, CodingKey {{
-        case seriesID = "series_id"
-        case roundNumber = "round_number"
-        case roundName = "round_name"
-        case conference
-        case higherSeedTeam = "higher_seed_team"
-        case lowerSeedTeam = "lower_seed_team"
-        case higherSeed = "higher_seed"
-        case lowerSeed = "lower_seed"
-        case winsHigherSeed = "wins_higher_seed"
-        case winsLowerSeed = "wins_lower_seed"
+        case gameID = "game_id"
+        case gameType = "game_type"
+        case homeTeamAbbr = "home_team_abbr"
+        case visitorTeamAbbr = "visitor_team_abbr"
+        case gameDatetime = "game_datetime"
+        case isDoubleheader = "is_doubleheader"
+        case gameSequence = "game_sequence"
         case status
-        case winner
-        case gamesPlayed = "games_played"
-        case eliminationGameNext = "elimination_game_next"
-        case homeCourtPattern = "home_court_pattern"
+        case homeOdds = "home_odds"
+        case visitorOdds = "visitor_odds"
+        case bkWinner = "bk_winner"
+        case bkWinnerConfidence = "bk_winner_confidence"
+        case bkSpreadPick = "bk_spread_pick"
+        case bkSpreadPickCovers = "bk_spread_pick_covers"
+        case bkSpreadConfidence = "bk_spread_confidence"
+        case projTotal = "proj_total"
+        case homeProjTotal = "home_proj_total"
+        case visitorProjTotal = "visitor_proj_total"
+        case scoringTier = "scoring_tier"
+    }}
+}}
+
+private struct BoardGameSideOddsDTO: Decodable {{
+    let impliedTeamTotal: Double
+    let overUnder: Double
+    let spread: Double
+    let isFavorite: Bool?
+    let marketWinProb: Double?
+    let divergence: Double?
+
+    enum CodingKeys: String, CodingKey {{
+        case impliedTeamTotal = "implied_team_total"
+        case overUnder = "over_under"
+        case spread
+        case isFavorite = "is_favorite"
+        case marketWinProb = "market_win_prob"
+        case divergence
+    }}
+}}
+
+private struct DynamicKey: CodingKey {{
+    var stringValue: String
+    var intValue: Int? {{ nil }}
+    init(stringValue: String) {{ self.stringValue = stringValue }}
+    init?(intValue: Int) {{ nil }}
+}}
+
+private struct PropLineDTO: Decodable {{
+    let stat: String
+    let line: Double
+    let overOdds: Int
+    let underOdds: Int
+    let calibratedProbOver: Double
+    let hasEdge: Bool
+    let displayLabel: String
+
+    enum CodingKeys: String, CodingKey {{
+        case stat, line
+        case overOdds = "over_odds"
+        case underOdds = "under_odds"
+        case calibratedProbOver = "calibrated_prob_over"
+        case hasEdge = "has_edge"
+        case displayLabel = "display_label"
+    }}
+}}
+
+// MARK: - Projection DTOs (embedded in board response)
+
+/// Decodes a Double from either a JSON number or a numeric string.
+/// Handles backend inconsistency where fields like season_avg arrive as strings.
+struct FlexDouble: Decodable {{
+    let value: Double
+
+    init(from decoder: Decoder) throws {{
+        let container = try decoder.singleValueContainer()
+        if let num = try? container.decode(Double.self) {{
+            value = num
+        }} else if let str = try? container.decode(String.self), let num = Double(str) {{
+            value = num
+        }} else {{
+            throw DecodingError.typeMismatch(
+                Double.self,
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Expected Double or numeric String"
+                )
+            )
+        }}
+    }}
+}}
+
+struct ProjectionPlayerDTO: Decodable {{
+    let id: Int?
+    let firstName: String?
+    let lastName: String?
+    let position: String?
+    let team: String?
+    let externalPersonID: Int?
+    let headshotURL: URL?
+    let trendDirection: TrendDirection?
+    let trendScore: Double?
+    let confidenceScore: Double?
+    let hotStreak: Int?
+    let coldStreak: Int?
+    let injuryStatus: String?
+    let playFadeRecommendation: PlayFadeRecommendation?
+    let games: [ProjectedGameDTO]?
+
+    let trendHits: FlexDouble?
+    let trendHR: FlexDouble?
+    let trendRBI: FlexDouble?
+    let trendRuns: FlexDouble?
+    let trendSB: FlexDouble?
+    let trendDoubles: FlexDouble?
+    let trendTB: FlexDouble?
+
+    let seasonHitsPG: FlexDouble?
+    let seasonHRPG: FlexDouble?
+    let seasonRBIPG: FlexDouble?
+    let seasonRunsPG: FlexDouble?
+    let seasonSBPG: FlexDouble?
+    let seasonBBPG: FlexDouble?
+    let seasonKPG: FlexDouble?
+    let seasonAvg: FlexDouble?
+
+    let seasonH: Int?
+    let seasonHR: Int?
+    let seasonRBI: Int?
+    let seasonR: Int?
+    let seasonTB: Int?
+    let season2B: Int?
+    let season3B: Int?
+    let seasonSB: Int?
+    let seasonBB: Int?
+    let seasonK: Int?
+    let seasonAB: Int?
+    let seasonGP: Int?
+
+    let wobaProxy: FlexDouble?
+    let obpProxy: FlexDouble?
+    let avgPaPerGame: FlexDouble?
+    let seasonOBP: FlexDouble?
+    let seasonSLG: FlexDouble?
+    let seasonOPS: FlexDouble?
+    let seasonWAR: FlexDouble?
+    let seasonXBHRate: FlexDouble?
+    let seasonBBRate: FlexDouble?
+
+    enum CodingKeys: String, CodingKey {{
+        case id
+        case firstName = "first_name"
+        case lastName = "last_name"
+        case position
+        case team
+        case externalPersonID = "mlb_person_id"
+        case headshotURL = "headshot_url"
+        case trendDirection = "trend_direction"
+        case trendScore = "trend_score"
+        case confidenceScore = "confidence_score"
+        case hotStreak = "hot_streak"
+        case coldStreak = "cold_streak"
+        case injuryStatus = "injury_status"
+        case playFadeRecommendation = "play_fade_recommendation"
+        case games
+        case trendHits = "trend_hits"
+        case trendHR = "trend_hr"
+        case trendRBI = "trend_rbi"
+        case trendRuns = "trend_runs"
+        case trendSB = "trend_sb"
+        case trendDoubles = "trend_doubles"
+        case trendTB = "trend_tb"
+        case seasonHitsPG = "season_hits_pg"
+        case seasonHRPG = "season_hr_pg"
+        case seasonRBIPG = "season_rbi_pg"
+        case seasonRunsPG = "season_runs_pg"
+        case seasonSBPG = "season_sb_pg"
+        case seasonBBPG = "season_bb_pg"
+        case seasonKPG = "season_k_pg"
+        case seasonAvg = "season_avg"
+        case seasonH = "season_h"
+        case seasonHR = "season_hr"
+        case seasonRBI = "season_rbi"
+        case seasonR = "season_r"
+        case seasonTB = "season_tb"
+        case season2B = "season_2b"
+        case season3B = "season_3b"
+        case seasonSB = "season_sb"
+        case seasonBB = "season_bb"
+        case seasonK = "season_k"
+        case seasonAB = "season_ab"
+        case seasonGP = "season_gp"
+        case wobaProxy = "woba_proxy"
+        case obpProxy = "obp_proxy"
+        case avgPaPerGame = "avg_pa_per_game"
+        case seasonOBP = "season_obp"
+        case seasonSLG = "season_slg"
+        case seasonOPS = "season_ops"
+        case seasonWAR = "season_war"
+        case seasonXBHRate = "season_xbh_rate"
+        case seasonBBRate = "season_bb_rate"
+    }}
+}}
+
+struct ProjectedGameDTO: Decodable {{
+    let date: String
+    let opponent: String
+    let isHome: Bool?
+    let opportunityScore: Double?
+    let isBackToBack: Bool?
+    let teamRestDays: Int?
+    let blowoutProb: Double?
+    let vegasImpliedTeamTotal: Double?
+    let vegasOverUnder: Double?
+    let vegasSpread: Double?
+    let matchupMultiplier: Double?
+
+    enum CodingKeys: String, CodingKey {{
+        case date
+        case opponent
+        case isHome = "is_home"
+        case opportunityScore = "opp_ranking_score"
+        case isBackToBack = "is_back_to_back"
+        case teamRestDays = "team_rest_days"
+        case blowoutProb = "blowout_prob"
+        case vegasImpliedTeamTotal = "vegas_implied_team_total"
+        case vegasOverUnder = "vegas_over_under"
+        case vegasSpread = "vegas_spread"
+        case matchupMultiplier = "matchup_multiplier"
+    }}
+}}
+
+// MARK: - Projection mapping
+
+extension ProjectionPlayerDTO {{
+    private static let dateFormatter: DateFormatter = {{
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        return fmt
+    }}()
+
+    // swiftlint:disable:next function_body_length
+    func toProjection(id: String) -> Projection? {{
+        let games = self.games ?? []
+        guard !games.isEmpty else {{ return nil }}
+        let rankingScore = games.compactMap(\\.opportunityScore).max() ?? 0
+
+        let upcomingGames: [ProjectedGame] = games.enumerated().compactMap {{ index, game in
+            let date = Self.dateFormatter.date(from: game.date) ?? .now
+            return ProjectedGame(
+                id: "\\(id)-game-\\(index)",
+                gameDate: date,
+                opponentAbbr: game.opponent,
+                isHome: game.isHome ?? false,
+                opponentStrength: game.opportunityScore
+            )
+        }}
+
+        return Projection(
+            id: id,
+            displayName: [firstName, lastName]
+                .compactMap {{ $0?.isEmpty == false ? $0 : nil }}
+                .joined(separator: " "),
+            team: team ?? "",
+            position: position.flatMap {{ $0.isEmpty ? nil : $0 }},
+            headshotURL: headshotURL,
+            externalPersonID: externalPersonID,
+            rankingScore: rankingScore,
+            playFadeRecommendation: playFadeRecommendation,
+            injuryStatus: injuryStatus.flatMap {{ InjuryStatus(rawValue: $0) }},
+            isSurging: (hotStreak ?? 0) > 0,
+            upcomingGames: upcomingGames.isEmpty ? nil : upcomingGames,
+            homeGameCount: upcomingGames.filter(\\.isHome).count,
+            awayGameCount: upcomingGames.filter {{ !$0.isHome }}.count,
+            avgOpponentStrength: upcomingGames.compactMap(\\.opponentStrength).average,
+            hotStreak: hotStreak,
+            coldStreak: coldStreak,
+            trendDirection: trendDirection,
+            trendScore: trendScore,
+            confidenceScore: confidenceScore,
+            trendHits: trendHits?.value,
+            trendHR: trendHR?.value,
+            trendRBI: trendRBI?.value,
+            trendRuns: trendRuns?.value,
+            trendSB: trendSB?.value,
+            trendDoubles: trendDoubles?.value,
+            trendTB: trendTB?.value,
+            seasonHitsPG: seasonHitsPG?.value,
+            seasonHRPG: seasonHRPG?.value,
+            seasonRBIPG: seasonRBIPG?.value,
+            seasonRunsPG: seasonRunsPG?.value,
+            seasonSBPG: seasonSBPG?.value,
+            seasonBBPG: seasonBBPG?.value,
+            seasonKPG: seasonKPG?.value,
+            seasonAvg: seasonAvg?.value,
+            seasonH: seasonH,
+            seasonHR: seasonHR,
+            seasonRBI: seasonRBI,
+            seasonR: seasonR,
+            seasonTB: seasonTB,
+            season2B: season2B,
+            season3B: season3B,
+            seasonSB: seasonSB,
+            seasonBB: seasonBB,
+            seasonK: seasonK,
+            seasonAB: seasonAB,
+            seasonGP: seasonGP,
+            wobaProxy: wobaProxy?.value,
+            obpProxy: obpProxy?.value,
+            avgPaPerGame: avgPaPerGame?.value,
+            seasonOBP: seasonOBP?.value,
+            seasonSLG: seasonSLG?.value,
+            seasonOPS: seasonOPS?.value,
+            seasonWAR: seasonWAR?.value,
+            seasonXBHRate: seasonXBHRate?.value,
+            seasonBBRate: seasonBBRate?.value
+        )
+    }}
+}}
+
+// MARK: - Helpers
+
+extension Array where Element == Double {{
+    var average: Double? {{
+        isEmpty ? nil : reduce(0, +) / Double(count)
     }}
 }}
 """
 
-# ProjectionsService is NOT written by default. BoardState.makeReduce no longer takes a
-# projections service — the template variable above is kept for reference but should only
-# be emitted for sports that genuinely need a separate projections endpoint.
-write(os.path.join(services_dir, "GamesService.swift"), games_service_swift)
-# PlayoffService merged into GamesService — fetchPlayoffBracket() is now in GamesService
-# write(os.path.join(services_dir, "PlayoffService.swift"), playoff_service_swift)
+write_if_absent(os.path.join(services_dir, "BoardService.swift"), board_service_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9d. Core Utilities files (continued)
@@ -3424,55 +3284,118 @@ utilities_dir = os.path.join(out_dir, "App/Sources/Core/Utilities")
 # 9d-ii. Sport-specific model extensions
 # ─────────────────────────────────────────────────────────────────────────────
 
-game_entry_basketball_swift = header() + f"""\
-import BKSCore
+game_entry_basketball_swift = header() + f"""import BKSCore
 
 // MARK: - GameEntry {swift_name} stat accessors
 
 public extension GameEntry {{
-{stat_accessor_lines}
+    var single: Int           {{ stats["single"] ?? 0 }}
+    var double: Int           {{ stats["double"] ?? 0 }}
+    var triple: Int           {{ stats["triple"] ?? 0 }}
+    var homeRun: Int           {{ stats["homeRun"] ?? 0 }}
+    var rbi: Int           {{ stats["rbi"] ?? 0 }}
+    var run: Int           {{ stats["run"] ?? 0 }}
+    var walk: Int           {{ stats["walk"] ?? 0 }}
+    var hitByPitch: Int           {{ stats["hitByPitch"] ?? 0 }}
+    var stolenBase: Int           {{ stats["stolenBase"] ?? 0 }}
+    var sacrificeFly: Int           {{ stats["sacrificeFly"] ?? 0 }}
+    var sacrificeHit: Int           {{ stats["sacrificeHit"] ?? 0 }}
+    var inningsPitched: Double           {{ Double(stats["inningsPitched"] ?? 0) / 10.0 }}
+    var strikeoutPitching: Int           {{ stats["strikeoutPitching"] ?? 0 }}
+    var win: Int           {{ stats["win"] ?? 0 }}
+    var earnedRunAllowed: Int           {{ stats["earnedRunAllowed"] ?? 0 }}
+    var hitAgainst: Int           {{ stats["hitAgainst"] ?? 0 }}
+    var walkAgainst: Int           {{ stats["walkAgainst"] ?? 0 }}
+    var hitBatsmanAgainst: Int           {{ stats["hitBatsmanAgainst"] ?? 0 }}
+    var completeGame: Int           {{ stats["completeGame"] ?? 0 }}
+    var completeGameShutout: Int           {{ stats["completeGameShutout"] ?? 0 }}
+    var noHitter: Int           {{ stats["noHitter"] ?? 0 }}
 
-    /// Total official at-bats (1B + 2B + 3B + HR). Derived from hit components
-    /// because the server does not store atBats directly in the stats dict.
     var atBats: Int {{
         (stats["single"] ?? 0) + (stats["double"] ?? 0) + (stats["triple"] ?? 0) + (stats["homeRun"] ?? 0)
     }}
-
     var hits: Int {{ single + double + triple + homeRun }}
 
-    /// Sport-specific DNP check. A hitter with zero at-bats and a pitcher with zero
-    /// innings pitched did not play. Uses raw dict access because `atBats` is computed.
+    /// Sport-specific DNP check. Overrides the BKSCore default.
     var isDNP: Bool {{ (stats["single"] ?? 0) == 0 && inningsPitched == 0.0 }}
 }}
 
 // MARK: - PlayerGameLog {swift_name} averages
 
 public extension PlayerGameLog {{
-{gamelog_average_properties}
+    var averageHomeRuns: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.homeRun }}) / Double(entries.count)
+    }}
+
+    var averageRBI: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.rbi }}) / Double(entries.count)
+    }}
+
+    var averageInningsPitched: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return entries.reduce(0.0) {{ $0 + $1.inningsPitched }} / Double(entries.count)
+    }}
+
+    var averageStrikeouts: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.strikeoutPitching }}) / Double(entries.count)
+    }}
+
+    var averageHits: Double {{
+        guard !entries.isEmpty else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.hits }}) / Double(entries.count)
+    }}
+
+    var averageBattingAverage: Double {{
+        let totalAB = entries.reduce(0) {{ $0 + $1.atBats }}
+        guard totalAB > 0 else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.hits }}) / Double(totalAB)
+    }}
+
+    var averageERA: Double {{
+        let totalIP = entries.reduce(0.0) {{ $0 + $1.inningsPitched }}
+        guard totalIP > 0 else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.earnedRunAllowed }}) * 9.0 / totalIP
+    }}
+
+    var winPercentage: Double {{
+        let decisionsGames = entries.filter {{ $0.inningsPitched > 0 }}.count
+        guard decisionsGames > 0 else {{ return 0 }}
+        return Double(entries.reduce(0) {{ $0 + $1.win }}) / Double(decisionsGames)
+    }}
 }}
 """
 
 # proj_accessor_lines drives the legacy camelCase group (locally-computed stat lines,
 # matching GameEntry stat keys). The snake_case API group below must be maintained
 # manually per sport — keys come from the server projected_stats schema, not YAML.
-projected_stat_line_basketball_swift = header() + f"""\
-import BKSCore
+projected_stat_line_basketball_swift = header() + f"""import BKSCore
 
 // MARK: - ProjectedStatLine {swift_name} stat accessors
 
 public extension ProjectedStatLine {{
-    // MARK: - Server projected_stats keys (snake_case from API response)
-    // Sport-specific: replace with this sport's server-side projected_stats field names.
-    var hits: Double?              {{ stats["hits"] }}
-    var homeRuns: Double?          {{ stats["home_runs"] }}
-    var rbis: Double?              {{ stats["rbis"] }}
-    var runs: Double?              {{ stats["runs"] }}
-    var stolenBases: Double?       {{ stats["stolen_bases"] }}
-    var walks: Double?             {{ stats["walks"] }}
+    // Server-side projected_stats keys (snake_case from API response)
+    var hits: Double?             {{ stats["hits"] }}
+    var homeRuns: Double?         {{ stats["home_runs"] }}
+    var rbis: Double?             {{ stats["rbis"] }}
+    var runs: Double?             {{ stats["runs"] }}
+    var stolenBases: Double?      {{ stats["stolen_bases"] }}
+    var walks: Double?            {{ stats["walks"] }}
 
-    // MARK: - Legacy camelCase accessors (locally-computed stat lines)
-    // These match GameEntry stat keys. Generated from gamelog.display YAML.
-{proj_accessor_lines}
+    // Legacy camelCase accessors (kept for compatibility with locally-computed stat lines)
+    var homeRun: Double?          {{ stats["homeRun"] }}
+    var rbi: Double?              {{ stats["rbi"] }}
+    var run: Double?              {{ stats["run"] }}
+    var single: Double?           {{ stats["single"] }}
+    var double: Double?           {{ stats["double"] }}
+    var triple: Double?           {{ stats["triple"] }}
+    var stolenBase: Double?       {{ stats["stolenBase"] }}
+    var walk: Double?             {{ stats["walk"] }}
+    var inningsPitched: Double?   {{ stats["inningsPitched"] }}
+    var strikeoutPitching: Double? {{ stats["strikeoutPitching"] }}
+    var earnedRunAllowed: Double? {{ stats["earnedRunAllowed"] }}
 }}
 """
 
@@ -3606,22 +3529,21 @@ struct BoardEntry: Identifiable, Equatable, Hashable, BoardEntryDisplayable {{
 
 # ── BoardEntryBuilder.swift ──────────────────────────────────────────────────────────
 
-board_entry_builder_swift = header() + f"""import Foundation
+board_entry_builder_swift = header() + f"""import BKSCore
+import Foundation
 import OSLog
-import BKSCore
 
 // MARK: - BoardEntryBuilder
 
 private let logger = os.Logger(subsystem: "{bundle_id}", category: "BoardEntryBuilder")
 
-private let dateFormatter: DateFormatter = {{
+private let todayDateParser: DateFormatter = {{
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd"
     formatter.locale = Locale(identifier: "en_US_POSIX")
     return formatter
 }}()
 
-// swiftlint:disable:next type_body_length
 enum BoardEntryBuilder {{
 
     static func build(
@@ -3630,16 +3552,20 @@ enum BoardEntryBuilder {{
         opportunities: [Opportunity],
         todayDateString: String?
     ) -> [BoardEntry] {{
-        // Primary join: external person ID when available on both sides.
+        // Parse the server date string once; compare game dates with Calendar rather than
+        // round-tripping each Date back through a DateFormatter per game.
+        let todayDate = todayDateString.flatMap {{ todayDateParser.date(from: $0) }}
+
+        // Primary join: {league} person ID when available on both sides.
         // Fallback: displayName+team when externalPersonID is nil everywhere.
         let hasIDOnProj = projections.contains {{ $0.externalPersonID != nil }}
         let hasIDOnOpp  = opportunities.contains {{ $0.externalPersonID != nil }}
 
         if hasIDOnProj && hasIDOnOpp {{
-            return buildByID(projections: projections, opportunities: opportunities, todayDateString: todayDateString)
+            return buildByID(projections: projections, opportunities: opportunities, todayDate: todayDate)
         }} else {{
             logger.warning("externalPersonID nil on all records — falling back to name+team join")
-            return buildByName(projections: projections, opportunities: opportunities, todayDateString: todayDateString)
+            return buildByName(projections: projections, opportunities: opportunities, todayDate: todayDate)
         }}
     }}
 
@@ -3648,7 +3574,7 @@ enum BoardEntryBuilder {{
     private static func buildByID(
         projections: [Projection],
         opportunities: [Opportunity],
-        todayDateString: String?
+        todayDate: Date?
     ) -> [BoardEntry] {{
         var projMap: [Int: Projection] = [:]
         for proj in projections {{
@@ -3662,7 +3588,7 @@ enum BoardEntryBuilder {{
         }}
         let allIDs = Set(projMap.keys).union(oppMap.keys)
         let entries = allIDs.compactMap {{ pid in
-            makeEntry(id: String(pid), proj: projMap[pid], opp: oppMap[pid], todayDateString: todayDateString)
+            makeEntry(id: String(pid), proj: projMap[pid], opp: oppMap[pid], todayDate: todayDate)
         }}
         logger.debug("ID join: \\(entries.count, privacy: .public) entries (projections: \\(projections.count, privacy: .public), opportunities: \\(opportunities.count, privacy: .public))")
         return entries
@@ -3673,7 +3599,7 @@ enum BoardEntryBuilder {{
     private static func buildByName(
         projections: [Projection],
         opportunities: [Opportunity],
-        todayDateString: String?
+        todayDate: Date?
     ) -> [BoardEntry] {{
         var projByName: [String: Projection] = [:]
         for proj in projections {{
@@ -3689,7 +3615,7 @@ enum BoardEntryBuilder {{
             let key = nameKey(opp.displayName, opp.team)
             let proj = projByName[key]
             if proj != nil {{ usedKeys.insert(key) }}
-            if let entry = makeEntry(id: opp.id, proj: proj, opp: opp, todayDateString: todayDateString) {{
+            if let entry = makeEntry(id: opp.id, proj: proj, opp: opp, todayDate: todayDate) {{
                 entries.append(entry)
             }}
         }}
@@ -3698,7 +3624,7 @@ enum BoardEntryBuilder {{
         for proj in projections {{
             let key = nameKey(proj.displayName, proj.team)
             guard !usedKeys.contains(key) else {{ continue }}
-            if let entry = makeEntry(id: proj.id, proj: proj, opp: nil, todayDateString: todayDateString) {{
+            if let entry = makeEntry(id: proj.id, proj: proj, opp: nil, todayDate: todayDate) {{
                 entries.append(entry)
             }}
         }}
@@ -3718,11 +3644,12 @@ enum BoardEntryBuilder {{
         id: String,
         proj: Projection?,
         opp: Opportunity?,
-        todayDateString: String?
+        todayDate: Date?
     ) -> BoardEntry? {{
-        let tonightGame: ProjectedGame? = proj.flatMap {{ projection in
-            guard let today = todayDateString else {{ return nil }}
-            return projection.upcomingGames?.first {{ dateFormatter.string(from: $0.gameDate) == today }}
+        let tonightGame: ProjectedGame? = todayDate.flatMap {{ today in
+            proj?.upcomingGames?.first {{
+                Calendar.current.isDate($0.gameDate, inSameDayAs: today)
+            }}
         }}
 
         let confidenceScore = proj?.confidenceScore
@@ -3817,6 +3744,8 @@ struct BoardLoadResult {{
     let scheduleSyncedAt: String?
     /// Server-ranked prop opportunities. Nil before ~12:30 PM ET.
     let topPropOpportunities: [TopPropOpportunity]?
+    /// Cross-prop strategy summary from the server's Sonnet pass. Nil before ~12:30 PM ET.
+    let propSlateSynthesis: PropSlateSynthesis?
 }}
 
 // MARK: - BoardViewMode
@@ -3838,25 +3767,24 @@ enum BoardIntent: CancellableIntent {{
     case backgroundRefreshRequested
     case entriesLoaded(BoardLoadResult)
     case loadFailed(Error)
-    case searchTextChanged(String)
-    case positionFilterChanged(String?)
-    case tierFilterChanged(TierLevel?)
-    case viewModeChanged(BoardViewMode)
     case navigationPathChanged(NavigationPath)
     case pushNotificationTapped(String)
     case deepLinkHandled
     case refreshBannerExpired
     case diskCacheLoaded(BoardLoadResult)
+    /// Paint cached board state as soon as BoardView mounts — before entitlement is known.
+    /// Must not chain .backgroundRefreshRequested; the network fetch is gated separately
+    /// on entitlementReady to preserve the 402 guard.
+    case hydrateFromDisk
     /// User committed a new prop feed filter from the filter sheet.
     case propFeedFilterChanged(PropFeedFilter)
 
     var cancelsInFlightWork: Bool {{
         switch self {{
         // Pure synchronous mutations — never interrupt long-running fetches.
-        case .navigationPathChanged, .searchTextChanged, .positionFilterChanged,
-             .tierFilterChanged, .viewModeChanged, .pushNotificationTapped,
+        case .navigationPathChanged, .pushNotificationTapped,
              .deepLinkHandled, .refreshBannerExpired, .diskCacheLoaded,
-             .propFeedFilterChanged:
+             .hydrateFromDisk, .propFeedFilterChanged:
             false
         // backgroundRefreshRequested is cancellable so the Store tracks it in
         // currentTask. This lets a subsequent .refreshRequested cancel it, and
@@ -3878,15 +3806,10 @@ import SwiftUI
 
 // MARK: - BoardState
 
-// swiftlint:disable:next type_body_length
 struct BoardState {{
     var navigationPath = NavigationPath()
     var loadState: ViewState<[BoardEntry]> = .loading
     var allEntries: [BoardEntry] = []
-    var filteredEntries: [BoardEntry] = []
-    var searchText = ""
-    var selectedPosition: String?
-    var selectedTier: TierLevel?
     var lastUpdated: Date?
     var lockTime: Date?
     var gameCount: Int = 0
@@ -3898,14 +3821,24 @@ struct BoardState {{
     var serverDateString: String?
     /// ISO 8601 UTC timestamp of the last sync_today_games run. Used for "last updated" on the schedule strip.
     var scheduleSyncedAt: String?
-    var viewMode: BoardViewMode = .props
-    var groupedEntries: [(position: String, picks: [BoardEntry])] = []
     /// Server-ranked prop opportunities. Nil before ~12:30 PM ET.
     var topPropOpportunities: [TopPropOpportunity]?
+    /// Cross-prop strategy summary from the server's Sonnet pass. Nil before ~12:30 PM ET.
+    var propSlateSynthesis: PropSlateSynthesis?
     var dailyAnalysis: DailyAnalysis?
-    var playoffSeries: [PlayoffSeries] = []
     /// True while a background network refresh is in flight after serving a disk-cache hit.
     var isBackgroundRefreshing: Bool = false
+
+    // MARK: - Props feed state
+
+    /// Active filter for the props feed. Loaded from UserDefaults on first use.
+    var propFeedFilter: PropFeedFilter = PropFeedFilterPersistence.load()
+    /// Top 3 props from the filtered+sorted set. Updated by recomputeFilteredProps only.
+    private(set) var bestBetProps: [TopPropOpportunity] = []
+    /// Full filtered+sorted prop list (all tiers). Updated by recomputeFilteredProps only.
+    private(set) var filteredTopProps: [TopPropOpportunity] = []
+    /// Count of top-10 unfiltered props hidden by the active filter. Drives filter badge.
+    private(set) var hiddenHighValueCount: Int = 0
 
     private static let stalenessThreshold = CacheFreshness.defaultThreshold
 
@@ -3950,11 +3883,16 @@ struct BoardState {{
                     return nil
                 }}
                 logger.debug("onAppear — triggering fetch (isNewDay: \\(isNewDay, privacy: .public) lastUpdated: \\(lastUpdatedDesc, privacy: .public))")
-                // Seed the games strip from disk before the full board cache check.
-                if let schedule = try? boardService.loadCachedTodaySchedule() {{
-                    state.todayGames = schedule.games.sorted {{ $0.gameDatetime < $1.gameDatetime }}
-                    state.gameCount = schedule.games.count
-                    state.serverDateString = schedule.date
+                // If hydrateFromDisk already painted the board (.loaded but no lastUpdated),
+                // skip the loading-skeleton reset and go straight to a background refresh
+                // so the cached content stays visible during the network round-trip.
+                if case .loaded = state.loadState, state.lastUpdated == nil {{
+                    logger.debug("onAppear — disk already hydrated, background refresh starting")
+                    state.isBackgroundRefreshing = true
+                    return await fetchAll(
+                        boardService: boardService,
+                        analysisService: analysisService
+                    )
                 }}
                 state.loadState = .loading
                 // Await disk first. If a cache hit is found, .diskCacheLoaded commits
@@ -3978,10 +3916,10 @@ struct BoardState {{
             case .refreshRequested:
                 state.isBackgroundRefreshing = false
                 state.allEntries = []
-                state.filteredEntries = []
                 state.todayGames = []
                 state.dailyAnalysis = nil
                 state.topPropOpportunities = nil
+                state.propSlateSynthesis = nil
                 state.loadState = .loading
                 return await fetchAll(
                     boardService: boardService,
@@ -3989,7 +3927,11 @@ struct BoardState {{
                 )
 
             case .backgroundRefreshRequested:
-                // Skip if a fetch is already in flight — the in-flight result will be fresher.
+                // .backgroundRefreshRequested is cancellable (cancelsInFlightWork = true),
+                // so the Store cancels any prior in-flight task before running this one.
+                // The .loading guard below is a secondary safety net for the rare window
+                // where a fetch started so recently that loadState is already .loading
+                // but the prior task hasn't been registered in currentTask yet.
                 if case .loading = state.loadState {{ return nil }}
                 // Keep loadState as-is so the live board is not replaced by a skeleton.
                 // isBackgroundRefreshing signals the banner overlay instead.
@@ -4001,14 +3943,8 @@ struct BoardState {{
 
             case let .entriesLoaded(result):
                 state.isBackgroundRefreshing = false
-                let built = BoardEntryBuilder.build(
-                    players: [],
-                    projections: result.projections,
-                    opportunities: [],
-                    todayDateString: result.serverDateString
-                )
-                state.allEntries = built
-                state.loadState = .loaded(built)
+                state.allEntries = result.entries
+                state.loadState = .loaded(result.entries)
                 state.lastUpdated = .now
                 state.todayGames = result.games.sorted {{ $0.gameDatetime < $1.gameDatetime }}
                 state.gameCount = result.games.count
@@ -4017,10 +3953,13 @@ struct BoardState {{
                 state.gameOdds = result.gameOdds
                 state.serverDateString = result.serverDateString
                 if let syncedAt = result.scheduleSyncedAt {{ state.scheduleSyncedAt = syncedAt }}
-                state.playoffSeries = result.playoffSeries
                 if let analysis = result.dailyAnalysis {{ state.dailyAnalysis = analysis }}
                 if let props = result.topPropOpportunities {{ state.topPropOpportunities = props }}
-                applyFilters(&state, positionMap: positionMap)
+                state.propSlateSynthesis = result.propSlateSynthesis
+                // ORDERING: must be called after topPropOpportunities is assigned above.
+                // Do NOT call recomputeFilteredProps from .diskCacheLoaded — that result
+                // always carries topPropOpportunities == nil and produces a silent empty feed.
+                recomputeFilteredProps(&state)
                 return nil
 
             case let .loadFailed(error):
@@ -4042,34 +3981,48 @@ struct BoardState {{
                 state.isBackgroundRefreshing = false
                 return nil
 
-            case let .searchTextChanged(text):
-                state.searchText = text
-                applyFilters(&state, positionMap: positionMap)
-                return nil
-
-            case let .positionFilterChanged(position):
-                state.selectedPosition = position
-                applyFilters(&state, positionMap: positionMap)
-                return nil
-
-            case let .tierFilterChanged(tier):
-                state.selectedTier = tier
-                applyFilters(&state, positionMap: positionMap)
-                return nil
-
-            case let .viewModeChanged(mode):
-                state.viewMode = mode
-                applyFilters(&state, positionMap: positionMap)
-                return nil
-
             case let .navigationPathChanged(path):
                 state.navigationPath = path
+                return nil
+
+            case let .propFeedFilterChanged(newFilter):
+                state.propFeedFilter = newFilter
+                PropFeedFilterPersistence.save(newFilter)
+                recomputeFilteredProps(&state)
                 return nil
 
             case .pushNotificationTapped:
                 return nil
 
             case .deepLinkHandled:
+                return nil
+
+            case .hydrateFromDisk:
+                // Fires as soon as BoardView mounts, before entitlement is known.
+                // Paints cached games/analysis so the board isn't blank during the
+                // StoreKit refresh. Returns nil — must NOT chain .backgroundRefreshRequested
+                // because entitlement is not yet confirmed (fetchBoard would 402).
+                // The network fetch is triggered separately by .onAppear once
+                // entitlementReady flips true.
+                guard state.lastUpdated == nil else {{
+                    // Real data already loaded (e.g. foreground restore); skip.
+                    return nil
+                }}
+                guard let diskResult = await loadFromDisk(
+                    boardService: boardService,
+                    analysisService: analysisService
+                ) else {{ return nil }}
+                // Apply disk state directly — do not go through .diskCacheLoaded,
+                // which would chain .backgroundRefreshRequested before entitlement is ready.
+                state.allEntries = diskResult.entries
+                state.loadState = .loaded(diskResult.entries)
+                state.todayGames = diskResult.games.sorted {{ $0.gameDatetime < $1.gameDatetime }}
+                state.gameCount = diskResult.games.count
+                state.lockTime = diskResult.lockTime
+                state.seasonMode = diskResult.seasonMode
+                state.gameOdds = diskResult.gameOdds
+                state.serverDateString = diskResult.serverDateString
+                if let analysis = diskResult.dailyAnalysis {{ state.dailyAnalysis = analysis }}
                 return nil
 
             case let .diskCacheLoaded(result):
@@ -4083,13 +4036,13 @@ struct BoardState {{
                 state.serverDateString = result.serverDateString
                 if let analysis = result.dailyAnalysis {{ state.dailyAnalysis = analysis }}
                 state.isBackgroundRefreshing = true
-                applyFilters(&state, positionMap: positionMap)
                 // Return .backgroundRefreshRequested rather than awaiting fetchAll inline.
                 // This lets the Store commit the disk-cache state immediately (giving
                 // SwiftUI a frame to render it), then process the network fetch as a
-                // separate reduce iteration.
+                // separate reduce iteration. Previously, awaiting fetchAll here meant the
+                // snapshot wasn't committed until the network returned — the intermediate
+                // disk-cache render never occurred.
                 return .backgroundRefreshRequested
-
             }}
         }}
     }}
@@ -4134,7 +4087,8 @@ struct BoardState {{
             playoffSeries: [],
             totalOpportunities: 0,
             scheduleSyncedAt: nil,
-            topPropOpportunities: nil
+            topPropOpportunities: nil,
+            propSlateSynthesis: nil
         )
     }}
 
@@ -4146,6 +4100,7 @@ struct BoardState {{
 
     // MARK: - Async fetch
 
+    // swiftlint:disable:next function_body_length
     nonisolated private static func fetchAll(
         boardService: BoardServiceProtocol,
         analysisService: DailyAnalysisServiceProtocol
@@ -4174,89 +4129,75 @@ struct BoardState {{
         }}
 
         let lockTime = page.games.map(\\.gameDatetime).min()
+        let serverDateString = page.date.isEmpty ? nil : page.date
+
+        // Run build + sort on the cooperative thread pool (nonisolated context) —
+        // keeps MainActor free during the CPU-bound join and sort.
+        let built = BoardEntryBuilder.build(
+            players: [],
+            projections: page.projections,
+            opportunities: [],
+            todayDateString: serverDateString
+        )
 
         return .entriesLoaded(BoardLoadResult(
-            entries: [],
+            entries: built,
             projections: page.projections,
             games: page.games,
             lockTime: lockTime,
             seasonMode: page.seasonMode,
             gameOdds: buildGameOdds(from: page.games),
-            serverDateString: page.date.isEmpty ? nil : page.date,
+            serverDateString: serverDateString,
             dailyAnalysis: page.dailyAnalysis,
             playoffSeries: [],
             totalOpportunities: 0,
             scheduleSyncedAt: page.scheduleSyncedAt,
-            topPropOpportunities: page.topPropOpportunities
+            topPropOpportunities: page.topPropOpportunities,
+            propSlateSynthesis: page.propSlateSynthesis
         ))
     }}
 
-    // MARK: - Filtering
+    // MARK: - Props feed compute
 
-    private static func applyFilters(_ state: inout Self, positionMap: SportPositionMap) {{
-        #if DEBUG
-        let applyFiltersStart = Date()
-        let applyFiltersID = Perf.begin("BoardApplyFilters")
-        defer {{ Perf.end("BoardApplyFilters", id: applyFiltersID, startedAt: applyFiltersStart) }}
-        #endif
-        let search = state.searchText.lowercased()
-        let chip = state.selectedPosition
-        let tierFilter = state.selectedTier
-
-        let base = state.allEntries
-            .filter {{ $0.isPlayingTonight }}
-            .filter {{ entry in
-                let matchesSearch = search.isEmpty || entry.searchHaystack.contains(search)
-
-                let matchesChip: Bool = {{
-                    guard let chip, chip != "All" else {{ return true }}
-                    return positionMap.matchesChip(chip, position: entry.position)
-                }}()
-
-                let matchesTier: Bool = {{
-                    guard let tierFilter else {{ return true }}
-                    return entry.opportunityTier == tierFilter
-                }}()
-
-                return matchesSearch && matchesChip && matchesTier
-            }}
-            .sorted {{ lhs, rhs in
-                switch (lhs.opportunityScore, rhs.opportunityScore) {{
-                case let (lScore?, rScore?): return lScore > rScore
-                case (.some, .none): return true
-                case (.none, .some): return false
-                case (.none, .none):
-                    let tierA = lhs.opportunityTier?.tierSortOrder ?? Int.max
-                    let tierB = rhs.opportunityTier?.tierSortOrder ?? Int.max
-                    return tierA < tierB
-                }}
-            }}
-
-        state.filteredEntries = base
-        state.groupedEntries = buildGroupedEntries(from: base, positionMap: positionMap)
-    }}
-
-    private static func buildGroupedEntries(
-        from entries: [BoardEntry],
-        positionMap: SportPositionMap
-    ) -> [(position: String, picks: [BoardEntry])] {{
-        // Single O(M) pass: bucket each entry into every chip it matches, then
-        // map over filterChips to restore the canonical chip order.
-        var buckets: [String: [BoardEntry]] = [:]
-        for entry in entries {{
-            for chip in positionMap.filterChips where positionMap.matchesChip(chip, position: entry.position) {{
-                buckets[chip, default: []].append(entry)
-            }}
+    /// Recomputes bestBetProps, filteredTopProps, and hiddenHighValueCount from
+    /// topPropOpportunities and propFeedFilter.
+    ///
+    /// Call AFTER state.topPropOpportunities is assigned in .entriesLoaded.
+    /// Do NOT call from .diskCacheLoaded — that result always carries nil topPropOpportunities.
+    private static func recomputeFilteredProps(_ state: inout Self) {{
+        guard let all = state.topPropOpportunities, !all.isEmpty else {{
+            state.filteredTopProps = []
+            state.bestBetProps = []
+            state.hiddenHighValueCount = 0
+            return
         }}
-        return positionMap.filterChips.compactMap {{ chip in
-            guard var picks = buckets[chip], !picks.isEmpty else {{ return nil }}
-            picks.sort {{
-                let tierA = $0.opportunityTier?.tierSortOrder ?? Int.max
-                let tierB = $1.opportunityTier?.tierSortOrder ?? Int.max
-                if tierA != tierB {{ return tierA < tierB }}
-                return ($0.opportunityScore ?? 0) > ($1.opportunityScore ?? 0)
+
+        let filter = state.propFeedFilter
+
+        let filtered = all
+            .filter {{ prop in
+                let matchesStat = filter.selectedStatCategories.isEmpty
+                    || filter.selectedStatCategories.contains(prop.statCategory ?? .hits)
+                let meetsTier = prop.tier >= filter.minimumTier
+                let meetsInstinct = !filter.instinctAgreesOnly
+                    || prop.instinctAgrees == true
+                return matchesStat && meetsTier && meetsInstinct
             }}
-            return (position: chip, picks: picks)
+            .sorted {{ $0.edgePP > $1.edgePP }}
+
+        state.filteredTopProps = filtered
+        state.bestBetProps = Array(filtered.prefix(3))
+
+        if filter.isActive {{
+            let top10IDs = Set(
+                all.sorted {{ $0.edgePP > $1.edgePP }}
+                    .prefix(10)
+                    .map {{ $0.id }}
+            )
+            let filteredIDs = Set(filtered.map {{ $0.id }})
+            state.hiddenHighValueCount = top10IDs.subtracting(filteredIDs).count
+        }} else {{
+            state.hiddenHighValueCount = 0
         }}
     }}
 }}
@@ -4266,6 +4207,7 @@ struct BoardState {{
 
 board_view_swift = header() + f"""import BKSCore
 import BKSUICore
+import OSLog
 import SwiftUI
 
 // MARK: - BoardView
@@ -4287,20 +4229,10 @@ struct BoardView: View {{
     @State private var selectedGame: ScheduledGame?
     @State private var bannerDismissTask: Task<Void, Never>?
     private let notificationLogger = PushNotificationLogger.shared
-
-    private var searchBinding: Binding<String> {{
-        Binding(
-            get: {{ store.state.searchText }},
-            set: {{ store.send(.searchTextChanged($0)) }}
-        )
-    }}
-
-    private var viewModeBinding: Binding<BoardViewMode> {{
-        Binding(
-            get: {{ store.state.viewMode }},
-            set: {{ store.send(.viewModeChanged($0)) }}
-        )
-    }}
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "{bundle_id}",
+        category: "BoardView"
+    )
 
     private var isLoading: Bool {{
         switch store.state.loadState {{
@@ -4316,25 +4248,11 @@ struct BoardView: View {{
     }}
 
     private func resolvedGameInsight(for game: ScheduledGame) -> GameInsight? {{
-        let analysis = store.state.dailyAnalysis
-        if let insight = analysis?.gameInsights?[String(game.id)] {{
-            return insight
-        }}
-        guard let section = analysis?.slateNarrativeSections?.first(where: {{
-            $0.title.contains(game.visitorTeamAbbr) && $0.title.contains(game.homeTeamAbbr)
-        }}) else {{ return nil }}
-        return GameInsight(
-            gameId: String(game.id),
-            homeTeam: game.homeTeamAbbr,
-            awayTeam: game.visitorTeamAbbr,
-            generatedAt: analysis?.generatedAt ?? Date.now,
-            gameEnvironment: .neutral,
-            lineMovementSignal: .neutral,
-            matchupNarrative: section.body,
-            keyPlayers: [],
-            gameStackTargets: [],
-            injuryFlags: []
-        )
+        let key = String(game.id)
+        let availableKeys = store.state.dailyAnalysis?.gameInsights?.keys.sorted() ?? []
+        let result = store.state.dailyAnalysis?.gameInsights?[key]
+        logger.debug("resolvedGameInsight: game.id=\\(key, privacy: .public) hit=\\(result != nil, privacy: .public) availableKeys=[\\(availableKeys.joined(separator: ", "), privacy: .public)]")
+        return result
     }}
 
     private var titleText: String {{
@@ -4369,20 +4287,51 @@ struct BoardView: View {{
                         }}
                     )
                 }}
-                .navigationDestination(for: BoardEntry.self) {{ entry in
-                    BoardDetailView(
-                        entry: entry,
-                        sportConfig: sportConfig
+                .navigationDestination(for: DailyAnalysis.self) {{ analysis in
+                    SlateAnalysisView(
+                        analysis: analysis,
+                        games: store.state.todayGames,
+                        onSelectGame: {{ selectedGame = $0 }} // swiftlint:disable:this trailing_closure
+                    )
+                }}
+                .navigationDestination(for: BoardViewMode.self) {{ mode in
+                    BoardScrollContent(
+                        loadState: store.state.loadState,
+                        isSubscriptionRequired: isSubscriptionRequired,
+                        viewMode: mode,
+                        bestBetProps: store.state.bestBetProps,
+                        filteredTopProps: store.state.filteredTopProps,
+                        propFeedFilter: store.state.propFeedFilter,
+                        propSlateSynthesis: store.state.propSlateSynthesis,
+                        onRetry: {{ store.send(.refreshRequested) }},
+                        onShowPaywall: {{ showPaywall = true }},
+                        onFilterChanged: {{ store.send(.propFeedFilterChanged($0)) }}
                     )
                     .appBackground()
-                }}
-                .navigationDestination(for: DailyAnalysis.self) {{ analysis in
-                    SlateAnalysisView(analysis: analysis)
+                    .appNavigationBar(title: mode.navigationTitle)
                 }}
         }}
+        .task {{
+            // Fires unconditionally on mount — paints cached board before entitlement resolves.
+            logger.debug("BoardViewTask: sending .hydrateFromDisk")
+            store.send(.hydrateFromDisk)
+        }}
         .task(id: entitlementReady) {{
-            guard entitlementReady else {{ return }}
-            if case .loading = store.state.loadState {{ return }}
+            logger.debug("BoardViewTask: fired entitlementReady=\\(entitlementReady, privacy: .public) loadState=\\(String(describing: store.state.loadState), privacy: .public)")
+            guard entitlementReady else {{
+                logger.debug("BoardViewTask: exiting — entitlementReady is false")
+                return
+            }}
+            // Guard against a rapid true→false→true entitlementReady flip re-triggering
+            // .onAppear when a fetch is already in flight. Only skip if loadState is
+            // .loading AND lastUpdated is non-nil — that combination means a real fetch
+            // was started. lastUpdated == nil means this is the initial cold-start state
+            // (BoardState.initial sets loadState = .loading), so we must proceed.
+            if case .loading = store.state.loadState, store.state.lastUpdated != nil {{
+                logger.debug("BoardViewTask: exiting — fetch already in flight (lastUpdated non-nil)")
+                return
+            }}
+            logger.debug("BoardViewTask: sending .onAppear")
             Perf.event("BoardViewTask")
             store.send(.onAppear)
         }}
@@ -4404,8 +4353,8 @@ struct BoardView: View {{
             GameDetailSheet(
                 game: game,
                 odds: store.state.gameOdds[oddsKey],
-                spreadLabel: String(localized: "gameDetail.spreadLabel", defaultValue: "{spread_label}"),
-                spreadPickLabel: String(localized: "gameDetail.spreadPickLabel", defaultValue: "{spread_pick_label}"),
+                spreadLabel: String(localized: "gameDetail.runLine", defaultValue: "Run Line"),
+                spreadPickLabel: String(localized: "gameDetail.bkRunLinePick", defaultValue: "Run Line Pick"),
                 gameInsight: resolvedGameInsight(for: game)
             )
             .presentationDetents([.medium, .large])
@@ -4429,93 +4378,66 @@ struct BoardView: View {{
     // MARK: - Board list
 
     private var boardList: some View {{
-        VStack(spacing: 0) {{
-            BoardNavBar(
-                title: titleText,
-                subtitle: subtitleText,
-                isLoaded: {{
-                    if case .loaded = store.state.loadState {{ return true }}
-                    return false
-                }}(),
-                isRefreshing: isLoading || store.state.isBackgroundRefreshing,
-                unreadCount: notificationLogger.unreadCount,
-                onInbox: {{ showInbox = true }},
-                onProfile: {{ showProfile = true }},
-                onRefresh: {{
-                    onForceRefresh()
-                    store.send(.refreshRequested)
-                }}
-            )
-            .skeletonPulse(delay: 0, active: isLoading)
-
-            GamesStripSkeleton(games: store.state.todayGames, isLoading: isLoading) {{ game in
-                game.isDoubleheader ? "DH · Game \\(game.gameSequence)" : nil
-            }} onSelect: {{ selectedGame = $0 }}
-
-            SlateAnalysisCard(analysis: store.state.dailyAnalysis ?? store.state.analysisPreview.map {{
-                DailyAnalysis(
-                    date: store.state.serverDateString ?? "",
-                    cached: true,
-                    slateNarrative: $0,
-                    topProjections: [],
-                    keyTrends: [],
-                    generatedAt: Date()
+        ScrollView {{
+            VStack(spacing: 0) {{
+                BoardNavBar(
+                    title: titleText,
+                    subtitle: subtitleText,
+                    isLoaded: {{
+                        if case .loaded = store.state.loadState {{ return true }}
+                        return false
+                    }}(),
+                    isRefreshing: isLoading || store.state.isBackgroundRefreshing,
+                    unreadCount: notificationLogger.unreadCount,
+                    onInbox: {{ showInbox = true }},
+                    onProfile: {{ showProfile = true }},
+                    onRefresh: {{
+                        onForceRefresh()
+                        store.send(.refreshRequested)
+                    }}
                 )
-            }})
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .skeletonPulse(delay: 0.2, active: isLoading)
+                .skeletonPulse(delay: 0, active: isLoading)
 
-            Text(String(localized: "board.section.players", defaultValue: "Players"))
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                .tracking(0.8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .accessibilityAddTraits(.isHeader)
+                GamesStripSkeleton(games: store.state.todayGames, isLoading: isLoading) {{ game in
+                    game.isDoubleheader ? "DH · Game \\(game.gameSequence)" : nil
+                }} onSelect: {{ selectedGame = $0 }}
 
-            SearchFilterHeader(
-                searchText: searchBinding,
-                selectedPosition: store.state.selectedPosition,
-                filterAllLabel: String(localized: "board.position.all", defaultValue: "All positions"),
-                filterChips: store.state.viewMode == .flat ? SportPositionMap.{slug}.filterChips : [],
-                accessibilityPrefix: "board",
-                onPositionChanged: {{ store.send(.positionFilterChanged($0)) }},
-                tierOptions: store.state.viewMode == .flat
-                    ? TierLevel.allCases.map {{ (label: $0.tierDisplayName, id: $0.tierDisplayName) }}
-                    : nil,
-                tierAllLabel: String(localized: "board.tier.all", defaultValue: "All tiers"),
-                selectedTierID: store.state.selectedTier.map {{ $0.tierDisplayName }},
-                onTierChanged: {{ id in
-                    let tier = id.flatMap {{ label in TierLevel.allCases.first {{ $0.tierDisplayName == label }} }}
-                    store.send(.tierFilterChanged(tier))
-                }},
-                tipsContent: SearchTipsView.init
-            )
+                SlateAnalysisCard(analysis: store.state.dailyAnalysis)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .skeletonPulse(delay: 0.2, active: isLoading)
 
-            BoardViewModePicker(
-                allCount: store.state.totalOpportunities > 0
-                    ? store.state.totalOpportunities
-                    : store.state.filteredEntries.count,
-                topPicksCount: store.state.groupedEntries.reduce(0) {{ $0 + $1.picks.count }},
-                viewMode: viewModeBinding
-            )
+                Text(String(localized: "board.section.players", defaultValue: "Players"))
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white.opacity(AppOpacity.muted))
+                    .tracking(0.8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .padding(.bottom, 10)
+                    .accessibilityAddTraits(.isHeader)
+                    .skeletonPulse(delay: 0.3, active: isLoading)
 
-            BoardScrollContent(
-                loadState: store.state.loadState,
-                isSubscriptionRequired: isSubscriptionRequired,
-                filteredEntries: store.state.filteredEntries,
-                groupedEntries: store.state.groupedEntries,
-                viewMode: store.state.viewMode,
-                hasMorePages: store.state.hasMorePages,
-                isLoadingNextPage: store.state.isLoadingNextPage,
-                onRetry: {{ store.send(.refreshRequested) }},
-                onShowPaywall: {{ showPaywall = true }},
-                onLoadNextPage: {{ store.send(.loadNextPage) }},
-                onRefresh: {{ store.send(.refreshRequested) }}
-            )
+                PlayerModeLauncherView(
+                    loadState: store.state.loadState,
+                    topPropOpportunities: store.state.topPropOpportunities
+                )
+                .skeletonPulse(delay: 0.35, active: isLoading)
+            }}
         }}
+        .overlay(alignment: .top) {{
+            if store.state.isBackgroundRefreshing && store.state.lastUpdated != nil {{
+                Text(String(localized: "board.refreshing", defaultValue: "Refreshing…"))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.top, 80)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }}
+        }}
+        .animation(.easeInOut(duration: 0.3), value: store.state.isBackgroundRefreshing)
     }}
 
     // MARK: - Helpers
@@ -4534,9 +4456,10 @@ struct BoardView: View {{
         return fmt
     }}()
 
-    private static let monthFormatter: DateFormatter = {{
+    private static let longDateFormatter: DateFormatter = {{
         let fmt = DateFormatter()
-        fmt.dateFormat = "MMMM"
+        fmt.dateStyle = .long
+        fmt.timeStyle = .none
         fmt.locale = .current
         return fmt
     }}()
@@ -4557,23 +4480,7 @@ struct BoardView: View {{
         }} else {{
             date = Date.now
         }}
-        let month = Self.monthFormatter.string(from: date)
-        let day = Calendar.current.component(.day, from: date)
-        let year = Calendar.current.component(.year, from: date)
-        return "\\(month) \\(day)\\(daySuffix(day)), \\(year)"
-    }}
-
-    private func daySuffix(_ day: Int) -> String {{
-        switch day {{
-        case 11, 12, 13: return "th"
-        default:
-            switch day % 10 {{
-            case 1: return "st"
-            case 2: return "nd"
-            case 3: return "rd"
-            default: return "th"
-            }}
-        }}
+        return Self.longDateFormatter.string(from: date)
     }}
 }}
 """
@@ -4591,7 +4498,7 @@ import SwiftUI
 
 struct ProfileContainerView: View {{
     let credential: StoredCredential
-    @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    var profileStore: Store<ProfileState, ProfileIntent>
     let promoCodeService: PromoCodeServiceProtocol
     let seasonMode: SeasonMode
     let onEraseCachedData: () -> Void
@@ -4668,14 +4575,71 @@ import SwiftUI
 // Sport-specific notification preferences injected into BKSNotificationsView.
 
 struct NotificationsDetailView: View {{
-    @ObservedObject var profileStore: Store<ProfileState, ProfileIntent>
+    var profileStore: Store<ProfileState, ProfileIntent>
     let seasonMode: SeasonMode
 
     var body: some View {{
         BKSNotificationsView(
             profileStore: profileStore,
             appName: String(localized: "app.name", defaultValue: "{app_name}")
-        ) {{{notif_detail_body}
+        ) {{
+            Toggle(isOn: Binding(
+                get: {{ profileStore.state.preferences.notificationPreferences.isEnabled(.gameUpdates) }},
+                set: {{ profileStore.send(.notificationPreferenceToggled(.gameUpdates, $0)) }}
+            )) {{
+                Label(
+                    String(localized: "profile.row.notifications.gameUpdates",
+                           defaultValue: "Game Updates"),
+                    systemImage: "sportscourt.fill"
+                )
+                .foregroundStyle(.white)
+            }}
+            .tint(.accentColor)
+            .accessibilityIdentifier("profile.notification.game_updates")
+
+            Toggle(isOn: Binding(
+                get: {{ profileStore.state.preferences.notificationPreferences.isEnabled(.pregameAlerts) }},
+                set: {{ profileStore.send(.notificationPreferenceToggled(.pregameAlerts, $0)) }}
+            )) {{
+                Label(
+                    String(localized: "profile.row.notifications.pregameAlerts",
+                           defaultValue: "Pre-Game Alerts"),
+                    systemImage: "clock.fill"
+                )
+                .foregroundStyle(.white)
+            }}
+            .tint(.accentColor)
+            .accessibilityIdentifier("profile.notification.pregame_alerts")
+
+            Toggle(isOn: Binding(
+                get: {{ profileStore.state.preferences.notificationPreferences.isEnabled(.predictionsReady) }},
+                set: {{ profileStore.send(.notificationPreferenceToggled(.predictionsReady, $0)) }}
+            )) {{
+                Label(
+                    String(localized: "profile.row.notifications.predictionsReady",
+                           defaultValue: "Predictions Ready"),
+                    systemImage: "chart.bar.fill"
+                )
+                .foregroundStyle(.white)
+            }}
+            .tint(.accentColor)
+            .accessibilityIdentifier("profile.notification.predictions_ready")
+
+            if seasonMode == .playoffs {{
+                Toggle(isOn: Binding(
+                    get: {{ profileStore.state.preferences.notificationPreferences.isEnabled(.playoffAlerts) }},
+                    set: {{ profileStore.send(.notificationPreferenceToggled(.playoffAlerts, $0)) }}
+                )) {{
+                    Label(
+                        String(localized: "profile.row.notifications.playoff",
+                               defaultValue: "Playoff Alerts"),
+                        systemImage: "trophy.fill"
+                    )
+                    .foregroundStyle(.white)
+                }}
+                .tint(.accentColor)
+                .accessibilityIdentifier("profile.notification.playoff_alerts")
+            }}
         }}
     }}
 }}
@@ -4701,14 +4665,14 @@ struct BoardNavBar: View {{
     var body: some View {{
         AppCustomNavBar(
             title: title,
-            subtitle: nil,
-            slotWidth: 60,
+            subtitle: subtitle,
+            slotWidth: 80,
             leading: {{
                 RefreshIconButton(isRefreshing: isRefreshing, onRefresh: onRefresh)
                     .opacity(isLoaded || isRefreshing ? 1 : 0)
             }},
             trailing: {{
-                HStack(spacing: 16) {{
+                HStack(spacing: 4) {{
                     Button(action: onInbox) {{
                         ZStack(alignment: .topTrailing) {{
                             Image(systemName: "bell.fill")
@@ -4721,6 +4685,7 @@ struct BoardNavBar: View {{
                                     .offset(x: 4, y: -4)
                             }}
                         }}
+                        .frame(width: 28, height: 44)
                     }}
                     .accessibilityLabel(
                         unreadCount > 0
@@ -4732,19 +4697,12 @@ struct BoardNavBar: View {{
                         Image(systemName: "person")
                             .font(.system(size: 20))
                             .foregroundStyle(.white)
+                            .frame(width: 28, height: 44)
                     }}
                     .accessibilityLabel(String(localized: "a11y.label.profile", defaultValue: "Profile"))
                 }}
             }}
         )
-        .overlay(alignment: .bottom) {{
-            Text(subtitle)
-                .font(.system(size: 10))
-                .foregroundStyle(.white.opacity(0.6))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-                .padding(.bottom, 10)
-        }}
     }}
 }}
 
@@ -4760,15 +4718,19 @@ private struct RefreshIconButton: View {{
     @State private var pulsing = false
 
     var body: some View {{
-        Button(action: onRefresh) {{
-            Image("InAppIcon")
-                .resizable()
-                .scaledToFill()
-                .frame(width: 48, height: 48)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-                .opacity(pulsing ? 0.35 : 1.0)
+        GeometryReader {{ geo in
+            let side = geo.size.height
+            Button(action: onRefresh) {{
+                Image("InAppIcon")
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: side, height: side)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .opacity(pulsing ? 0.35 : 1.0)
+            }}
+            .buttonStyle(.plain)
         }}
-        .buttonStyle(.plain)
+        .padding(.vertical, -10)
         .accessibilityLabel(String(localized: "a11y.label.refresh", defaultValue: "Refresh"))
         .onAppear {{ if isRefreshing {{ startPulse() }} }}
         .onChange(of: isRefreshing) {{ _, refreshing in
@@ -4791,32 +4753,7 @@ private struct RefreshIconButton: View {{
 }}
 """
 
-# ── BoardViewModePicker.swift ────────────────────────────────────────────────────────────────
 
-board_view_mode_picker_swift = header() + f"""import BKSCore
-import SwiftUI
-
-// MARK: - BoardViewModePicker
-
-struct BoardViewModePicker: View {{
-    let allCount: Int
-    let topPicksCount: Int
-    let viewMode: Binding<BoardViewMode>
-
-    var body: some View {{
-        let allLabel = "\\(String(localized: "board.view.all", defaultValue: "All Players")) (\\(allCount))"
-        let topPicksBase = String(localized: "board.view.byPosition", defaultValue: "BlackKatt Instinct")
-        let topPicksLabel = "\\(topPicksBase) (\\(topPicksCount))"
-        Picker(String(localized: "board.picker.label", defaultValue: "View mode"), selection: viewMode) {{
-            Text(topPicksLabel).tag(BoardViewMode.byPosition)
-            Text(allLabel).tag(BoardViewMode.flat)
-        }}
-        .pickerStyle(.segmented)
-        .padding(.horizontal, 16)
-        .padding(.bottom, 8)
-    }}
-}}
-"""
 
 # ── BoardScrollContent.swift ─────────────────────────────────────────────────────────────────
 
@@ -4829,14 +4766,15 @@ import SwiftUI
 struct BoardScrollContent: View {{
     let loadState: ViewState<[BoardEntry]>
     let isSubscriptionRequired: Bool
-    let filteredEntries: [BoardEntry]
-    let groupedEntries: [(position: String, picks: [BoardEntry])]
     let viewMode: BoardViewMode
-    let topPropOpportunities: [TopPropOpportunity]?
+    // Props feed computed state (from BoardState.recomputeFilteredProps)
+    let bestBetProps: [TopPropOpportunity]
+    let filteredTopProps: [TopPropOpportunity]
+    let propFeedFilter: PropFeedFilter
+    let propSlateSynthesis: PropSlateSynthesis?
     let onRetry: () -> Void
     let onShowPaywall: () -> Void
-    let onRefresh: () -> Void
-
+    let onFilterChanged: (PropFeedFilter) -> Void
     var body: some View {{
         ScrollView {{
             switch loadState {{
@@ -4849,6 +4787,7 @@ struct BoardScrollContent: View {{
                     Image(systemName: "lock.fill")
                         .font(.system(size: 36))
                         .foregroundStyle(.white.opacity(AppOpacity.muted))
+                        .accessibilityHidden(true)
                     Text(String(
                         localized: "board.subscriptionRequired.title",
                         defaultValue: "Subscription Required"
@@ -4876,6 +4815,7 @@ struct BoardScrollContent: View {{
                     Image(systemName: "exclamationmark.triangle")
                         .font(.system(size: 36))
                         .foregroundStyle(.white.opacity(AppOpacity.muted))
+                        .accessibilityHidden(true)
                     Text(String(localized: "board.error", defaultValue: "Unable to load board"))
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(AppOpacity.muted))
@@ -4891,115 +4831,71 @@ struct BoardScrollContent: View {{
             case .loaded:
                 switch viewMode {{
                 case .props:
-                    if let props = topPropOpportunities, !props.isEmpty {{
-                        LazyVStack(spacing: 0) {{
-                            ForEach(groupedProps(props), id: \\.key) {{ group in
-                                PropSectionHeader(title: group.key)
-                                ForEach(group.value) {{ prop in
-                                    PropOpportunityRow(prop: prop)
-                                    Divider().overlay(.white.opacity(0.1))
-                                }}
-                            }}
-                        }}
-                        .padding(.bottom, 16)
-                    }} else if filteredEntries.isEmpty {{
-                        VStack(spacing: 12) {{
-                            Image(systemName: "sportscourt")
-                                .font(.system(size: 36))
-                                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                            Text(String(localized: "board.empty", defaultValue: "No picks today"))
-                                .font(.subheadline)
-                                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                                .multilineTextAlignment(.center)
-                        }}
-                        .padding(.horizontal, 24)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .containerRelativeFrame(.vertical)
-                    }} else {{
-                        LazyVStack(spacing: 0) {{
-                            ForEach(filteredEntries, id: \\.id) {{ entry in
-                                NavigationLink(value: entry) {{
-                                    // TODO: replace with sport-specific card view
-                                    VStack(alignment: .leading, spacing: 2) {{
-                                        Text(entry.displayName)
-                                            .font(.headline)
-                                            .foregroundStyle(.white)
-                                        if let score = entry.projectedScore {{
-                                            Text(String(format: "%.1f pts", score))
-                                                .font(.caption)
-                                                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                                        }}
-                                    }}
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 12)
-                                }}
-                                .buttonStyle(.plain)
-                                Divider().overlay(.white.opacity(0.1))
-                            }}
-                        }}
-                        .padding(.bottom, 16)
-                    }}
+                    PropsFeedView(
+                        bestBetProps: bestBetProps,
+                        filteredTopProps: filteredTopProps,
+                        propFeedFilter: propFeedFilter,
+                        propSlateSynthesis: propSlateSynthesis,
+                        activeFilterCount: propFeedFilter.activeFilterCount,
+                        onFilterChanged: onFilterChanged
+                    )
 
                 case .draftKings, .fanDuel:
-                    if groupedEntries.isEmpty {{
-                        VStack(spacing: 12) {{
-                            Image(systemName: "sportscourt")
-                                .font(.system(size: 36))
-                                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                            Text(String(localized: "board.empty", defaultValue: "No picks today"))
-                                .font(.subheadline)
-                                .foregroundStyle(.white.opacity(AppOpacity.muted))
-                                .multilineTextAlignment(.center)
-                        }}
-                        .padding(.top, 40)
-                        .padding(.horizontal, 24)
-                    }} else {{
-                        VStack(spacing: 0) {{
-                            ForEach(groupedEntries, id: \\.position) {{ group in
-                                HStack {{
-                                    Text(group.position)
-                                        .font(AppFonts.sectionHeader)
-                                        .foregroundStyle(.white.opacity(AppOpacity.primary))
-                                        .tracking(1.2)
-                                        .accessibilityAddTraits(.isHeader)
-                                    Spacer()
-                                }}
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .background(.white.opacity(0.07))
-                                ForEach(group.picks, id: \\.id) {{ entry in
-                                    NavigationLink(value: entry) {{
-                                        // TODO: replace with sport-specific card view
-                                        Text(entry.displayName)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .padding(.horizontal, 16)
-                                            .padding(.vertical, 12)
-                                    }}
-                                    .buttonStyle(.plain)
-                                    Divider().overlay(.white.opacity(0.1))
-                                }}
-                            }}
-                        }}
-                        .padding(.bottom, 16)
-                    }}
+                    comingSoonPlaceholder
                 }}
             }}
         }}
-        .refreshable {{ onRefresh() }}
         .contentMargins(.bottom, AppPadding.tabBarClearance, for: .scrollContent)
     }}
 
-    private func groupedProps(_ props: [TopPropOpportunity]) -> [(key: String, value: [TopPropOpportunity])] {{
-        var seen = Set<String>()
-        var order: [String] = []
-        var buckets: [String: [TopPropOpportunity]] = [:]
-        for prop in props {{
-            let key = prop.marketType
-            if seen.insert(key).inserted {{ order.append(key) }}
-            buckets[key, default: []].append(prop)
+    private var comingSoonPlaceholder: some View {{
+        VStack(spacing: 12) {{
+            Image(systemName: "clock")
+                .font(.system(size: 36))
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                .accessibilityHidden(true)
+            Text(String(localized: "board.comingSoon.title", defaultValue: "Coming Soon"))
+                .font(.headline)
+                .foregroundStyle(.white)
+            Text(String(localized: "board.comingSoon.body", defaultValue: "Fantasy lineup support is on the way."))
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(AppOpacity.muted))
+                .multilineTextAlignment(.center)
         }}
-        return order.map {{ (key: $0, value: buckets[$0]!) }}
+        .padding(.top, 60)
+        .padding(.horizontal, 24)
+    }}
+}}
+
+// MARK: - GamesStripSkeleton
+
+/// Shows placeholder chips while loading, then the real GamesStrip once data is available.
+struct GamesStripSkeleton: View {{
+    let games: [ScheduledGame]
+    let isLoading: Bool
+    let chipLabel: (ScheduledGame) -> String?
+    let onSelect: (ScheduledGame) -> Void
+
+    var body: some View {{
+        Group {{
+            if games.isEmpty && isLoading {{
+                HStack(spacing: 8) {{
+                    ForEach(0..<4, id: \\.self) {{ index in
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.white.opacity(0.08))
+                            .frame(width: 88, height: 44)
+                            .skeletonPulse(delay: Double(index) * 0.08, active: true)
+                    }}
+                }}
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+            }} else if !games.isEmpty {{
+                GamesStrip(games: games, chipLabel: chipLabel, onSelect: onSelect)
+                    .padding(.top, 8)
+                    .skeletonPulse(delay: 0.1, active: isLoading)
+            }}
+        }}
     }}
 }}
 """
@@ -6142,81 +6038,78 @@ struct SubduedDisclosureRow: View {
 }
 """
 
-edge_prop_card_swift = header() + """\
-import BKSUICore
+edge_prop_card_swift = header() + f"""import BKSUICore
 import SwiftUI
 
 // MARK: - EdgePropCard
 
-// MARK: - MANUAL IMPLEMENTATION REQUIRED
-// This stub was generated by scaffold.sh. The stat/odds row is sport-specific —
-// replace the statOddsRow body with the correct stat display for this sport.
-
 /// Card shown in the TODAY'S BEST BETS section.
 /// All ranks show identical formatting: player identity row + stat/odds row.
-struct EdgePropCard: View {
+struct EdgePropCard: View {{
     let prop: TopPropOpportunity
     let rank: Int
 
     @State private var isExpanded = false
 
-    private var tierColor: Color { prop.tier.stripColor }
+    private var tierColor: Color {{ prop.tier.stripColor }}
 
-    private func sortedBooks() -> [(name: String, odds: Int, line: Double)] {
-        guard let books = prop.bookmakers else { return [] }
+    private func sortedBooks() -> [(name: String, odds: Int, line: Double)] {{
+        guard let books = prop.bookmakers else {{ return [] }}
         return books
-            .map { key, val in
+            .map {{ key, val in
                 let odds = prop.direction == .over ? val.overOdds : val.underOdds
                 return (name: key.capitalized, odds: odds, line: val.line)
-            }
-            .sorted { $0.odds > $1.odds }
-    }
+            }}
+            .sorted {{ $0.odds > $1.odds }}
+    }}
 
-    var body: some View {
+    var body: some View {{
         cardContent
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background {
+            .background {{
                 RoundedRectangle(cornerRadius: 13)
                     .fill(Color.white.opacity(0.05))
-            }
+            }}
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(accessibilityLabel)
-    }
+    }}
 
     @ViewBuilder
-    private var cardContent: some View {
-        HStack(spacing: 10) {
+    private var cardContent: some View {{
+        HStack(spacing: 10) {{
             RoundedRectangle(cornerRadius: 2)
                 .fill(tierColor)
                 .frame(width: 5)
                 .frame(maxHeight: .infinity)
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 2) {{
                 PropPlayerRow(
                     prop: prop,
                     nameFontSize: 16,
                     nameWeight: .bold,
-                    leading: {
+                    leading: {{
                         Text("#\\(rank)")
                             .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(.white.opacity(0.5))
-                    },
-                    trailing: { EmptyView() }
+                    }},
+                    trailing: {{ EmptyView() }}
                 )
                 statOddsRow.padding(.top, -6)
+                aiPickChip
                 conflictWarning
-            }
+            }}
             .padding(.vertical, 12)
             .padding(.trailing, 12)
-        }
-    }
+        }}
+    }}
 
-    // MARK: - Sport-specific: replace stat label/line display for this sport
+    private var statCategoryLabel: some View {{
+        Text((prop.statCategory?.shortLabel ?? prop.statDisplayName).uppercased())
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.55))
+    }}
 
-    @ViewBuilder
-    private var statOddsRow: some View {
-        let books = sortedBooks()
-        let statLabel = (prop.statCategory?.shortLabel ?? prop.statDisplayName).uppercased()
+    private var statLine: some View {{
         let dirLabel = prop.direction == .over
             ? String(localized: "gameDetail.call.over", defaultValue: "OVER")
             : String(localized: "gameDetail.call.under", defaultValue: "UNDER")
@@ -6224,38 +6117,44 @@ struct EdgePropCard: View {
             ? String(format: "%.0f", prop.line)
             : String(format: "%.1f", prop.line)
 
-        if books.count > 1 {
-            VStack(alignment: .leading, spacing: 4) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
-                } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 0) {
-                        Text(statLabel)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.55))
+        return Text("\\(dirLabel) \\(lineStr)")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.7))
+    }}
+
+    // MARK: - Stat / odds row
+
+    @ViewBuilder
+    private var statOddsRow: some View {{
+        let books = sortedBooks()
+        if books.count > 1 {{
+            VStack(alignment: .leading, spacing: 4) {{
+                Button {{
+                    withAnimation(.easeInOut(duration: 0.2)) {{ isExpanded.toggle() }}
+                }} label: {{
+                    HStack(alignment: .firstTextBaseline, spacing: 0) {{
+                        statCategoryLabel
                         Text(" ")
-                        Text("\\(dirLabel) \\(lineStr)")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.7))
+                        statLine
                         Spacer(minLength: 8)
-                        if let best = books.first {
+                        if let best = books.first {{
                             let oddsStr = best.odds > 0 ? "+\\(best.odds)" : "\\(best.odds)"
                             Text("\\(oddsStr)  \\(best.name)")
                                 .font(.system(size: 13, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.85))
-                        }
+                        }}
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.4))
                             .padding(.leading, 6)
-                    }
-                }
+                    }}
+                }}
                 .buttonStyle(.plain)
 
-                if isExpanded {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(books, id: \\.name) { book in
-                            HStack(spacing: 0) {
+                if isExpanded {{
+                    VStack(alignment: .leading, spacing: 3) {{
+                        ForEach(books, id: \\.name) {{ book in
+                            HStack(spacing: 0) {{
                                 let oddsStr = book.odds > 0 ? "+\\(book.odds)" : "\\(book.odds)"
                                 Text(oddsStr)
                                     .font(.system(size: 12, weight: .semibold))
@@ -6264,56 +6163,79 @@ struct EdgePropCard: View {
                                 Text(book.name)
                                     .font(.system(size: 12))
                                     .foregroundStyle(.white.opacity(0.6))
-                                if book.line != prop.line {
-                                    let ls = book.line.truncatingRemainder(dividingBy: 1) == 0
+                                if book.line != prop.line {{
+                                    let lineStr = book.line.truncatingRemainder(dividingBy: 1) == 0
                                         ? String(format: " (%.0f)", book.line)
                                         : String(format: " (%.1f)", book.line)
-                                    Text(ls)
+                                    Text(lineStr)
                                         .font(.system(size: 11))
                                         .foregroundStyle(.white.opacity(0.4))
-                                }
-                            }
-                        }
-                    }
+                                }}
+                            }}
+                        }}
+                    }}
                     .padding(.leading, 4)
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-            }
-        } else {
-            HStack(alignment: .firstTextBaseline, spacing: 0) {
-                Text(statLabel)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.55))
+                }}
+            }}
+        }} else {{
+            HStack(alignment: .firstTextBaseline, spacing: 0) {{
+                statCategoryLabel
                 Text(" ")
-                Text("\\(dirLabel) \\(lineStr)")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.7))
+                statLine
                 Spacer(minLength: 8)
-                if let best = books.first {
+                if let best = books.first {{
                     let oddsStr = best.odds > 0 ? "+\\(best.odds)" : "\\(best.odds)"
                     Text("\\(oddsStr)  \\(best.name)")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.85))
-                }
-            }
-        }
-    }
+                }}
+            }}
+        }}
+    }}
+
+    // MARK: - AI Pick chip
 
     @ViewBuilder
-    private var conflictWarning: some View {
-        if prop.instinctAgrees == false {
-            HStack(spacing: 4) {
+    private var aiPickChip: some View {{
+        if prop.llmNominated {{
+            HStack(spacing: 4) {{
+                Image(systemName: "sparkles")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.purple.opacity(0.9))
+                Text(String(localized: "props.card.aiPick", defaultValue: "AI Pick"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.purple.opacity(0.9))
+            }}
+        }}
+    }}
+
+    // MARK: - Conflict warning (all ranks)
+
+    @ViewBuilder
+    private var conflictWarning: some View {{
+        if prop.llmFade {{
+            HStack(spacing: 4) {{
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(.orange)
                 Text(String(localized: "props.card.conflict", defaultValue: "Model conflicts with recent form"))
                     .font(.system(size: 12))
                     .foregroundStyle(.orange.opacity(0.9))
-            }
-        }
-    }
+            }}
+            if let insight = prop.instinctInsight, insight.count > 10 {{
+                Text(insight)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }}
+        }}
+    }}
 
-    private var accessibilityLabel: String {
+    // MARK: - Accessibility
+
+    private var accessibilityLabel: String {{
         let dir = prop.direction == .over
             ? String(localized: "props.card.a11y.over", defaultValue: "over")
             : String(localized: "props.card.a11y.under", defaultValue: "under")
@@ -6334,105 +6256,106 @@ struct EdgePropCard: View {
             format: String(localized: "props.card.a11y.edge", defaultValue: "+%.1f percentage point edge"),
             prop.edgePP
         )
+
         var parts: [String] = [
             rankLabel,
             "\\(prop.playerName), \\(stat), \\(dir) \\(lineStr)",
             pctLabel,
             edgeLabel,
         ]
-        if let odds = prop.bestOdds {
+        if let odds = prop.bestOdds {{
             let oddsStr = odds > 0 ? "+\\(odds)" : "\\(odds)"
             let oddsLabel = String(
                 format: String(localized: "props.card.a11y.bestOdds", defaultValue: "best odds %@"),
                 oddsStr
             )
             parts.append(oddsLabel)
-        }
-        if prop.instinctAgrees == false {
+        }}
+        if prop.llmNominated {{
+            parts.append(String(localized: "props.card.a11y.aiPick", defaultValue: "AI nominated pick"))
+        }}
+        if prop.llmFade {{
             parts.append(String(localized: "props.card.a11y.disagrees", defaultValue: "model disagrees"))
-        }
+            if let insight = prop.instinctInsight, insight.count > 10 {{
+                parts.append(insight)
+            }}
+        }}
         return parts.joined(separator: ". ")
-    }
-}
+    }}
+}}
 """
 
-all_prop_row_swift = header() + """\
-import SwiftUI
+all_prop_row_swift = header() + f"""import SwiftUI
 
 // MARK: - AllPropRow
 
-// MARK: - MANUAL IMPLEMENTATION REQUIRED
-// This stub was generated by scaffold.sh. The statRow body is sport-specific —
-// replace the stat label/line display for this sport.
-
 /// Compact prop row used in the ALL PROPS section beneath the hero cards.
-struct AllPropRow: View {
+/// Matches the visual style of Best Bets ranks 2 and 3.
+struct AllPropRow: View {{
     let prop: TopPropOpportunity
 
     @State private var isExpanded = false
 
-    private var tierColor: Color { prop.tier.stripColor }
+    private var tierColor: Color {{ prop.tier.stripColor }}
 
-    private func sortedBooks() -> [(name: String, odds: Int, line: Double)] {
-        guard let books = prop.bookmakers else { return [] }
+    private func sortedBooks() -> [(name: String, odds: Int, line: Double)] {{
+        guard let books = prop.bookmakers else {{ return [] }}
         return books
-            .map { key, val in
+            .map {{ key, val in
                 let odds = prop.direction == .over ? val.overOdds : val.underOdds
                 return (name: key.capitalized, odds: odds, line: val.line)
-            }
-            .sorted { $0.odds > $1.odds }
-    }
+            }}
+            .sorted {{ $0.odds > $1.odds }}
+    }}
 
-    var body: some View {
-        HStack(spacing: 10) {
+    var body: some View {{
+        HStack(spacing: 10) {{
             RoundedRectangle(cornerRadius: 2)
                 .fill(tierColor)
                 .frame(width: 5)
                 .frame(maxHeight: .infinity)
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 2) {{
                 PropPlayerRow(
                     prop: prop,
                     nameFontSize: 16,
                     nameWeight: .bold,
-                    leading: { EmptyView() },
-                    trailing: { EmptyView() }
+                    leading: {{ EmptyView() }},
+                    trailing: {{ EmptyView() }}
                 )
-                statRow.padding(.top, -8)
-                if prop.instinctAgrees == false { conflictWarning }
-            }
+                statRow.padding(.top, -6)
+                aiPickChip
+                conflictWarning
+            }}
             .padding(.vertical, 12)
             .padding(.trailing, 12)
-        }
+        }}
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background {
+        .background {{
             RoundedRectangle(cornerRadius: 13)
                 .fill(Color.white.opacity(0.05))
-        }
+        }}
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
-    }
-
-    // MARK: - Sport-specific: replace stat label/line display for this sport
+    }}
 
     @ViewBuilder
-    private var statRow: some View {
+    private var statRow: some View {{
         let dirLabel = prop.direction == .over
             ? String(localized: "gameDetail.call.over", defaultValue: "OVER")
             : String(localized: "gameDetail.call.under", defaultValue: "UNDER")
         let lineStr = prop.line.truncatingRemainder(dividingBy: 1) == 0
             ? String(format: "%.0f", prop.line)
             : String(format: "%.1f", prop.line)
-        let statLabel = (prop.statCategory?.shortLabel ?? prop.statDisplayName).uppercased()
         let books = sortedBooks()
 
-        if books.count > 1 {
-            VStack(alignment: .leading, spacing: 4) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
-                } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 0) {
-                        Text(statLabel)
+        if books.count > 1 {{
+            VStack(alignment: .leading, spacing: 4) {{
+                Button {{
+                    withAnimation(.easeInOut(duration: 0.2)) {{ isExpanded.toggle() }}
+                }} label: {{
+                    HStack(alignment: .firstTextBaseline, spacing: 0) {{
+                        Text((prop.statCategory?.shortLabel ?? prop.statDisplayName).uppercased())
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.55))
                         Text(" ")
@@ -6440,24 +6363,24 @@ struct AllPropRow: View {
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.7))
                         Spacer(minLength: 8)
-                        if let best = books.first {
+                        if let best = books.first {{
                             let oddsStr = best.odds > 0 ? "+\\(best.odds)" : "\\(best.odds)"
                             Text("\\(oddsStr)  \\(best.name)")
                                 .font(.system(size: 13, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.85))
-                        }
+                        }}
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.4))
                             .padding(.leading, 6)
-                    }
-                }
+                    }}
+                }}
                 .buttonStyle(.plain)
 
-                if isExpanded {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(books, id: \\.name) { book in
-                            HStack(spacing: 0) {
+                if isExpanded {{
+                    VStack(alignment: .leading, spacing: 3) {{
+                        ForEach(books, id: \\.name) {{ book in
+                            HStack(spacing: 0) {{
                                 let oddsStr = book.odds > 0 ? "+\\(book.odds)" : "\\(book.odds)"
                                 Text(oddsStr)
                                     .font(.system(size: 12, weight: .semibold))
@@ -6466,24 +6389,24 @@ struct AllPropRow: View {
                                 Text(book.name)
                                     .font(.system(size: 12))
                                     .foregroundStyle(.white.opacity(0.6))
-                                if book.line != prop.line {
-                                    let ls = book.line.truncatingRemainder(dividingBy: 1) == 0
+                                if book.line != prop.line {{
+                                    let lineStr = book.line.truncatingRemainder(dividingBy: 1) == 0
                                         ? String(format: " (%.0f)", book.line)
                                         : String(format: " (%.1f)", book.line)
-                                    Text(ls)
+                                    Text(lineStr)
                                         .font(.system(size: 11))
                                         .foregroundStyle(.white.opacity(0.4))
-                                }
-                            }
-                        }
-                    }
+                                }}
+                            }}
+                        }}
+                    }}
                     .padding(.leading, 4)
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-            }
-        } else {
-            HStack(alignment: .firstTextBaseline, spacing: 0) {
-                Text(statLabel)
+                }}
+            }}
+        }} else {{
+            HStack(alignment: .firstTextBaseline, spacing: 0) {{
+                Text((prop.statCategory?.shortLabel ?? prop.statDisplayName).uppercased())
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.55))
                 Text(" ")
@@ -6491,29 +6414,56 @@ struct AllPropRow: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.7))
                 Spacer(minLength: 8)
-                if let best = books.first {
+                if let best = books.first {{
                     let oddsStr = best.odds > 0 ? "+\\(best.odds)" : "\\(best.odds)"
                     Text("\\(oddsStr)  \\(best.name)")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.85))
-                }
-            }
-        }
-    }
+                }}
+            }}
+        }}
+    }}
+
+    // MARK: - AI Pick chip
 
     @ViewBuilder
-    private var conflictWarning: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 10))
-                .foregroundStyle(.orange)
-            Text(String(localized: "props.card.conflict", defaultValue: "Model conflicts with recent form"))
-                .font(.system(size: 12))
-                .foregroundStyle(.orange.opacity(0.9))
-        }
-    }
+    private var aiPickChip: some View {{
+        if prop.llmNominated {{
+            HStack(spacing: 4) {{
+                Image(systemName: "sparkles")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.purple.opacity(0.9))
+                Text(String(localized: "props.card.aiPick", defaultValue: "AI Pick"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.purple.opacity(0.9))
+            }}
+        }}
+    }}
 
-    private var accessibilityLabel: String {
+    // MARK: - Conflict warning
+
+    @ViewBuilder
+    private var conflictWarning: some View {{
+        if prop.llmFade {{
+            HStack(spacing: 4) {{
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                Text(String(localized: "props.card.conflict", defaultValue: "Model conflicts with recent form"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange.opacity(0.9))
+            }}
+            if let insight = prop.instinctInsight, insight.count > 10 {{
+                Text(insight)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }}
+        }}
+    }}
+
+    private var accessibilityLabel: String {{
         let dir = prop.direction == .over
             ? String(localized: "props.card.a11y.over", defaultValue: "over")
             : String(localized: "props.card.a11y.under", defaultValue: "under")
@@ -6522,33 +6472,37 @@ struct AllPropRow: View {
             : String(format: "%.1f", prop.line)
         let stat = prop.statCategory?.shortLabel ?? prop.statDisplayName
         var parts = [prop.tier.label, "\\(prop.playerName), \\(stat), \\(dir) \\(lineStr)"]
-        if prop.instinctAgrees == false {
+        if prop.llmNominated {{
+            parts.append(String(localized: "props.card.a11y.aiPick", defaultValue: "AI nominated pick"))
+        }}
+        if prop.llmFade {{
             parts.append(String(localized: "props.card.a11y.disagrees", defaultValue: "model disagrees"))
-        }
+            if let insight = prop.instinctInsight, insight.count > 10 {{
+                parts.append(insight)
+            }}
+        }}
         return parts.joined(separator: ". ")
-    }
-}
+    }}
+}}
 """
 
-props_feed_view_swift = header() + """\
-import BKSUICore
+props_feed_view_swift = header() + f"""import BKSUICore
 import SwiftUI
 
 // MARK: - PropsFeedView
-
-// MARK: - MANUAL IMPLEMENTATION REQUIRED
-// This stub was generated by scaffold.sh. Wire bestBetProps / filteredTopProps
-// from BoardState.topPropOpportunities in BoardView, and implement
-// PropsFeedFilterSheet for sport-specific filter options.
 
 /// Root compositor for the Props feed screen.
 /// Presents an edge-ranked feed in two sections:
 ///   • TODAY'S BEST BETS — top 3 as rich cards
 ///   • ALL PROPS — remainder grouped by tier with TierDividerRows; subdued collapsed
-struct PropsFeedView: View {
+///
+/// No FAB. Filter is a nav-bar trailing toolbar button per design spec.
+/// No SlateBestChip — the #1 card is the best bet at position zero.
+struct PropsFeedView: View {{
     let bestBetProps: [TopPropOpportunity]
     let filteredTopProps: [TopPropOpportunity]
     let propFeedFilter: PropFeedFilter
+    let propSlateSynthesis: PropSlateSynthesis?
     let activeFilterCount: Int
     let onFilterChanged: (PropFeedFilter) -> Void
 
@@ -6560,44 +6514,56 @@ struct PropsFeedView: View {
         bestBetProps: [TopPropOpportunity],
         filteredTopProps: [TopPropOpportunity],
         propFeedFilter: PropFeedFilter,
+        propSlateSynthesis: PropSlateSynthesis?,
         activeFilterCount: Int,
         onFilterChanged: @escaping (PropFeedFilter) -> Void
-    ) {
+    ) {{
         self.bestBetProps = bestBetProps
         self.filteredTopProps = filteredTopProps
         self.propFeedFilter = propFeedFilter
+        self.propSlateSynthesis = propSlateSynthesis
         self.activeFilterCount = activeFilterCount
         self.onFilterChanged = onFilterChanged
         self._filterSnapshot = State(initialValue: propFeedFilter)
-    }
+    }}
 
-    private var allPropsRemainder: [TopPropOpportunity] {
-        guard filteredTopProps.count > 3 else { return [] }
+    // MARK: - Derived lists
+
+    private var allPropsRemainder: [TopPropOpportunity] {{
+        guard filteredTopProps.count > 3 else {{ return [] }}
         return Array(filteredTopProps.dropFirst(3))
-    }
+    }}
 
-    private var groupedRemainder: GroupedRemainder {
+    /// All derived groupings computed in one pass over allPropsRemainder.
+    private var groupedRemainder: GroupedRemainder {{
         GroupedRemainder(from: allPropsRemainder)
-    }
+    }}
 
-    private var availableStats: [PropStatCategory] {
+    private var availableStats: [PropStatCategory] {{
         var seen = Set<PropStatCategory>()
         var result: [PropStatCategory] = []
-        for prop in filteredTopProps {
-            if let cat = prop.statCategory, seen.insert(cat).inserted { result.append(cat) }
-        }
+        for prop in filteredTopProps {{
+            if let cat = prop.statCategory, seen.insert(cat).inserted {{ result.append(cat) }}
+        }}
         return result
-    }
+    }}
 
-    var body: some View {
-        LazyVStack(alignment: .leading, spacing: 0, pinnedViews: []) {
+    // MARK: - Body
+
+    var body: some View {{
+        LazyVStack(alignment: .leading, spacing: 0, pinnedViews: []) {{
+            if let synthesis = propSlateSynthesis {{
+                PropSlateSynthesisCard(synthesis: synthesis)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
+            }}
             bestBetsSection
-            if !allPropsRemainder.isEmpty { allPropsSection }
-        }
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                HStack(spacing: 7) {
-                    if activeFilterCount > 0 {
+            if !allPropsRemainder.isEmpty {{ allPropsSection }}
+        }}
+        .toolbar {{
+            ToolbarItem(placement: .navigationBarTrailing) {{
+                HStack(spacing: 7) {{
+                    if activeFilterCount > 0 {{
                         Text("\\(activeFilterCount)")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.white)
@@ -6605,14 +6571,14 @@ struct PropsFeedView: View {
                             .padding(.vertical, 3)
                             .background(Capsule().fill(Color(red: 0.094, green: 0.373, blue: 0.647)))
                             .accessibilityHidden(true)
-                    }
-                    Button {
+                    }}
+                    Button {{
                         filterSnapshot = propFeedFilter
                         committed = false
                         showFilterSheet = true
-                    } label: {
+                    }} label: {{
                         Image(systemName: "slider.horizontal.3")
-                    }
+                    }}
                     .accessibilityLabel(
                         activeFilterCount > 0
                             ? String(localized: "props.filter.fab.a11y.active",
@@ -6624,76 +6590,79 @@ struct PropsFeedView: View {
                         localized: "props.filter.fab.a11y.hint",
                         defaultValue: "Opens filter options"
                     ))
-                }
-            }
-        }
-        .sheet(isPresented: $showFilterSheet) {
+                }}
+            }}
+        }}
+        .sheet(isPresented: $showFilterSheet) {{
             PropsFeedFilterSheet(
                 isPresented: $showFilterSheet,
                 currentFilter: filterSnapshot,
                 availableStats: availableStats,
                 filteredCount: filteredTopProps.count,
-                onFilterChanged: { onFilterChanged($0) },
-                onCommit: { filter in
+                onFilterChanged: {{ onFilterChanged($0) }},
+                onCommit: {{ filter in
                     committed = true
                     onFilterChanged(filter)
-                },
-                onRollback: { original in
-                    if !committed { onFilterChanged(original) }
-                }
+                }},
+                onRollback: {{ original in
+                    if !committed {{ onFilterChanged(original) }}
+                }}
             )
-        }
-    }
+        }}
+    }}
 
     // MARK: - Best Bets Section
 
-    private var bestBetsSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private var bestBetsSection: some View {{
+        VStack(alignment: .leading, spacing: 0) {{
             bestBetsHeader
-            if bestBetProps.isEmpty {
+
+            if bestBetProps.isEmpty {{
                 emptyBestBets
-            } else {
-                VStack(spacing: 8) {
-                    ForEach(Array(bestBetProps.enumerated()), id: \\.element.id) { index, prop in
+            }} else {{
+                VStack(spacing: 8) {{
+                    ForEach(Array(bestBetProps.enumerated()), id: \\.element.id) {{ index, prop in
                         EdgePropCard(prop: prop, rank: index + 1)
-                    }
-                }
+                    }}
+                }}
                 .padding(.horizontal, 16)
                 .padding(.bottom, 8)
-            }
-        }
-    }
+            }}
+        }}
+    }}
 
-    private var bestBetsHeader: some View {
-        HStack(spacing: 6) {
+    private var bestBetsHeader: some View {{
+        HStack(spacing: 6) {{
             Image(systemName: "star.fill")
                 .font(.system(size: 11))
                 .foregroundStyle(.yellow.opacity(0.8))
                 .accessibilityHidden(true)
+
             Text(String(localized: "props.feed.bestBets.title", defaultValue: "TODAY'S BEST BETS"))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.7))
                 .kerning(0.8)
+
             Spacer()
+
             let count = bestBetProps.count
             Text(count == 1
                  ? String(localized: "props.feed.propCount.singular", defaultValue: "1 prop")
                  : String(localized: "props.feed.propCount.plural", defaultValue: "\\(count) props"))
                 .font(.system(size: 12))
                 .foregroundStyle(.white.opacity(0.4))
-        }
+        }}
         .padding(.horizontal, 16)
         .padding(.top, 16)
         .padding(.bottom, 10)
         .accessibilityAddTraits(.isHeader)
         .accessibilityLabel(String(localized: "props.bestBets.header.a11y",
                                    defaultValue: "Today's Best Bets, \\(bestBetProps.count) props"))
-    }
+    }}
 
-    private var emptyBestBets: some View {
-        VStack(spacing: 10) {
-            // MANUAL: replace systemName with a sport-appropriate SF Symbol
-            Image(systemName: "sportscourt")
+    private var emptyBestBets: some View {{
+        VStack(spacing: 10) {{
+            Image(systemName: "{slug}")
                 .font(.system(size: 32))
                 .foregroundStyle(.white.opacity(0.3))
                 .accessibilityHidden(true)
@@ -6701,95 +6670,101 @@ struct PropsFeedView: View {
                 .font(.subheadline)
                 .foregroundStyle(.white.opacity(0.45))
                 .multilineTextAlignment(.center)
-        }
+        }}
         .frame(maxWidth: .infinity)
         .padding(.vertical, 40)
         .padding(.horizontal, 24)
-    }
+    }}
 
     // MARK: - All Props Section
 
-    private var allPropsSection: some View {
+    private var allPropsSection: some View {{
         let grouped = groupedRemainder
-        return VStack(alignment: .leading, spacing: 0) {
+        return VStack(alignment: .leading, spacing: 0) {{
             allPropsHeader
-            ForEach(grouped.tiers, id: \\.rawValue) { tier in
+
+            ForEach(grouped.tiers, id: \\.rawValue) {{ tier in
                 let propsForTier = grouped.byTier[tier] ?? []
-                if tier != .elite {
+                if tier != .elite {{
                     TierDividerRow(tier: tier)
                         .padding(.horizontal, 16)
-                }
-                VStack(spacing: 8) {
-                    ForEach(propsForTier) { prop in
+                }}
+                VStack(spacing: 8) {{
+                    ForEach(propsForTier) {{ prop in
                         AllPropRow(prop: prop)
                             .padding(.horizontal, 16)
-                    }
-                }
-            }
-            if !grouped.subdued.isEmpty {
+                    }}
+                }}
+            }}
+
+            if !grouped.subdued.isEmpty {{
                 SubduedDisclosureRow(count: grouped.subdued.count, props: grouped.subdued)
                     .padding(.bottom, 8)
-            }
-        }
-    }
+            }}
+        }}
+    }}
 
-    private var allPropsHeader: some View {
-        HStack(spacing: 6) {
+    private var allPropsHeader: some View {{
+        HStack(spacing: 6) {{
             Image(systemName: "list.bullet")
                 .font(.system(size: 11))
                 .foregroundStyle(.white.opacity(0.7))
                 .accessibilityHidden(true)
+
             Text(String(localized: "props.feed.allProps.title", defaultValue: "ALL PROPS"))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.7))
                 .kerning(0.8)
+
             Spacer()
+
             let count = allPropsRemainder.count
             Text(count == 1
                  ? String(localized: "props.feed.allProps.count.singular", defaultValue: "1 prop")
                  : String(localized: "props.feed.allProps.count.plural", defaultValue: "\\(count) props"))
                 .font(.system(size: 12))
                 .foregroundStyle(.white.opacity(0.4))
-        }
+        }}
         .padding(.horizontal, 16)
         .padding(.top, 16)
         .padding(.bottom, 10)
         .accessibilityAddTraits(.isHeader)
         .accessibilityLabel(String(localized: "props.allProps.header.a11y",
                                    defaultValue: "All Props, \\(allPropsRemainder.count) props"))
-    }
-}
+    }}
+}}
 
 // MARK: - GroupedRemainder
 
-/// Partitions the allPropsRemainder list in a single O(N) pass.
-private struct GroupedRemainder {
+/// Partitions the allPropsRemainder list in a single O(N) pass, avoiding
+/// repeated filter calls in the ForEach body.
+private struct GroupedRemainder {{
     let tiers: [PropEdgeTier]
     let byTier: [PropEdgeTier: [TopPropOpportunity]]
     let subdued: [TopPropOpportunity]
 
-    init(from props: [TopPropOpportunity]) {
+    init(from props: [TopPropOpportunity]) {{
         var tierOrder: [PropEdgeTier] = []
         var seenTiers = Set<PropEdgeTier>()
         var byTier: [PropEdgeTier: [TopPropOpportunity]] = [:]
         var subdued: [TopPropOpportunity] = []
 
-        for prop in props {
-            if prop.tier == .subdued {
+        for prop in props {{
+            if prop.tier == .subdued {{
                 subdued.append(prop)
-            } else {
-                if seenTiers.insert(prop.tier).inserted {
+            }} else {{
+                if seenTiers.insert(prop.tier).inserted {{
                     tierOrder.append(prop.tier)
-                }
+                }}
                 byTier[prop.tier, default: []].append(prop)
-            }
-        }
+            }}
+        }}
 
         self.tiers = tierOrder
         self.byTier = byTier
         self.subdued = subdued
-    }
-}
+    }}
+}}
 """
 
 # ── Write all files ─────────────────────────────────────────────────────────────────────────
@@ -6800,7 +6775,6 @@ write(os.path.join(board_store_dir,   "BoardIntent.swift"),              board_i
 write(os.path.join(board_store_dir,   "BoardState.swift"),               board_state_swift)
 write_if_absent(os.path.join(board_views_dir,   "BoardView.swift"),                board_view_swift)
 write_if_absent(os.path.join(board_views_dir,   "BoardNavBar.swift"),              board_nav_bar_swift)
-write_if_absent(os.path.join(board_views_dir,   "BoardViewModePicker.swift"),      board_view_mode_picker_swift)
 write_if_absent(os.path.join(board_views_dir,   "BoardScrollContent.swift"),       board_scroll_content_swift)
 # BoardDetailView, BoardDetailSubviews, BoardDetailHeaderCard are intentionally not scaffolded.
 # The player detail UI has been consolidated into BKSUICore shared components.
@@ -6810,6 +6784,536 @@ write_if_absent(os.path.join(props_views_dir,   "TierDividerRow.swift"),        
 write_if_absent(os.path.join(props_views_dir,   "EdgePropCard.swift"),             edge_prop_card_swift)
 write_if_absent(os.path.join(props_views_dir,   "AllPropRow.swift"),               all_prop_row_swift)
 write_if_absent(os.path.join(props_views_dir,   "PropsFeedView.swift"),            props_feed_view_swift)
+
+# ── Props feed: synthesis card, filter sheet, player-mode launcher ────────────
+
+prop_slate_synthesis_card_swift = f"""// Copyright 2026 Black Katt Technologies Inc.
+// iOS {deploy_tgt}+
+
+import SwiftUI
+
+// MARK: - PropSlateSynthesisCard
+
+/// Slate-level cross-prop strategy summary produced by the server's Sonnet pass.
+/// Rendered above TODAY'S BEST BETS when prop_slate_synthesis is present in the board response.
+struct PropSlateSynthesisCard: View {{
+    let synthesis: PropSlateSynthesis
+
+    var body: some View {{
+        VStack(alignment: .leading, spacing: 8) {{
+            header
+            narrativeText
+            if !synthesis.contradictions.isEmpty {{
+                contradictionChips
+            }}
+        }}
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {{
+            RoundedRectangle(cornerRadius: 13)
+                .fill(Color.white.opacity(0.05))
+                .overlay {{
+                    RoundedRectangle(cornerRadius: 13)
+                        .strokeBorder(Color.cyan.opacity(0.18), lineWidth: 1)
+                }}
+        }}
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }}
+
+    // MARK: - Subviews
+
+    private var header: some View {{
+        HStack(spacing: 6) {{
+            Image(systemName: "brain")
+                .font(.system(size: 11))
+                .foregroundStyle(.cyan.opacity(0.8))
+                .accessibilityHidden(true)
+            Text(String(localized: "props.slate.narrative.header", defaultValue: "SLATE ANALYSIS"))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.7))
+                .kerning(0.8)
+        }}
+    }}
+
+    private var narrativeText: some View {{
+        Text(synthesis.dailyPropNarrative)
+            .font(.system(size: 14))
+            .foregroundStyle(.white.opacity(0.85))
+            .fixedSize(horizontal: false, vertical: true)
+    }}
+
+    private var contradictionChips: some View {{
+        VStack(alignment: .leading, spacing: 4) {{
+            ForEach(Array(synthesis.contradictions.enumerated()), id: \\.offset) {{ _, contradiction in
+                HStack(alignment: .top, spacing: 4) {{
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.yellow.opacity(0.8))
+                        .padding(.top, 2)
+                        .accessibilityHidden(true)
+                    Text(contradiction)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.yellow.opacity(0.75))
+                        .fixedSize(horizontal: false, vertical: true)
+                }}
+            }}
+        }}
+    }}
+
+    // MARK: - Accessibility
+
+    private var accessibilityLabel: String {{
+        var parts: [String] = [
+            String(localized: "props.slate.narrative.header.a11y", defaultValue: "Slate Analysis"),
+            synthesis.dailyPropNarrative,
+        ]
+        for contradiction in synthesis.contradictions {{
+            parts.append(
+                String(
+                    format: String(
+                        localized: "props.slate.contradiction.a11y",
+                        defaultValue: "Tension: %@"
+                    ),
+                    contradiction
+                )
+            )
+        }}
+        return parts.joined(separator: ". ")
+    }}
+}}
+"""
+
+props_feed_filter_sheet_swift = header() + f"""import SwiftUI
+
+// MARK: - PropsFeedFilterSheet
+
+/// Half-sheet filter for the props feed. Detents: .fraction(0.52) / .large.
+/// Changes preview live via onFilterChanged. On dismiss-without-commit, rolls back
+/// to the snapshot taken at sheet open via onRollback.
+struct PropsFeedFilterSheet: View {{
+    @Binding var isPresented: Bool
+    let currentFilter: PropFeedFilter
+    let availableStats: [PropStatCategory]
+    let filteredCount: Int
+    let onFilterChanged: (PropFeedFilter) -> Void
+    let onCommit: (PropFeedFilter) -> Void
+    let onRollback: (PropFeedFilter) -> Void
+
+    @State private var localFilter: PropFeedFilter
+    @State private var committed = false
+
+    init(
+        isPresented: Binding<Bool>,
+        currentFilter: PropFeedFilter,
+        availableStats: [PropStatCategory],
+        filteredCount: Int,
+        onFilterChanged: @escaping (PropFeedFilter) -> Void,
+        onCommit: @escaping (PropFeedFilter) -> Void,
+        onRollback: @escaping (PropFeedFilter) -> Void
+    ) {{
+        self._isPresented = isPresented
+        self.currentFilter = currentFilter
+        self.availableStats = availableStats
+        self.filteredCount = filteredCount
+        self.onFilterChanged = onFilterChanged
+        self.onCommit = onCommit
+        self.onRollback = onRollback
+        self._localFilter = State(initialValue: currentFilter)
+    }}
+
+    var body: some View {{
+        NavigationStack {{
+            ScrollView {{
+                VStack(alignment: .leading, spacing: 24) {{
+                    statCategorySection
+                    minimumTierSection
+                    instinctSection
+                }}
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 24)
+            }}
+            .navigationTitle(String(localized: "props.filter.title", defaultValue: "Filter Props"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {{
+                ToolbarItem(placement: .navigationBarLeading) {{
+                    Button(String(localized: "props.filter.reset", defaultValue: "Reset")) {{
+                        localFilter = .init()
+                        onFilterChanged(localFilter)
+                    }}
+                    .font(.system(size: 15))
+                    .disabled(localFilter == .init())
+                }}
+            }}
+            .safeAreaInset(edge: .bottom) {{
+                commitButton
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .background(.ultraThinMaterial)
+            }}
+        }}
+        .presentationDetents([.fraction(0.52), .large])
+        .presentationDragIndicator(.visible)
+        .onDisappear {{
+            if !committed {{ onRollback(currentFilter) }}
+        }}
+    }}
+
+    // MARK: - Stat category chips
+
+    private var statCategorySection: some View {{
+        VStack(alignment: .leading, spacing: 10) {{
+            filterSectionLabel(String(localized: "props.filter.stat.label", defaultValue: "Stat Category"))
+
+            let batStats = availableStats.filter {{ $0.isBatterStat }}
+            let pitchStats = availableStats.filter {{ !$0.isBatterStat }}
+
+            if !batStats.isEmpty {{
+                Text(String(localized: "props.filter.stat.batters", defaultValue: "Batters"))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.4))
+                    .accessibilityAddTraits(.isHeader)
+                FlowChips(items: batStats, selection: $localFilter.selectedStatCategories) {{ $0.shortLabel }}
+            }}
+            if !pitchStats.isEmpty {{
+                Text(String(localized: "props.filter.stat.pitchers", defaultValue: "Pitchers"))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.4))
+                    .padding(.top, 4)
+                    .accessibilityAddTraits(.isHeader)
+                FlowChips(items: pitchStats, selection: $localFilter.selectedStatCategories) {{ $0.shortLabel }}
+            }}
+        }}
+        .onChange(of: localFilter.selectedStatCategories) {{ _, _ in onFilterChanged(localFilter) }}
+    }}
+
+    // MARK: - Minimum tier picker
+
+    private var minimumTierSection: some View {{
+        VStack(alignment: .leading, spacing: 10) {{
+            filterSectionLabel(String(localized: "props.filter.minTier.label", defaultValue: "Minimum Edge"))
+            Picker("", selection: $localFilter.minimumTier) {{
+                Text(String(localized: "props.filter.tier.any", defaultValue: "Any")).tag(PropEdgeTier.subdued)
+                Text(String(localized: "props.filter.tier.lean", defaultValue: "Lean+")).tag(PropEdgeTier.lean)
+                Text(String(localized: "props.filter.tier.solid", defaultValue: "Solid+")).tag(PropEdgeTier.solid)
+                Text(String(localized: "props.filter.tier.strong", defaultValue: "Strong+")).tag(PropEdgeTier.strong)
+            }}
+            .pickerStyle(.segmented)
+            .onChange(of: localFilter.minimumTier) {{ _, _ in onFilterChanged(localFilter) }}
+        }}
+    }}
+
+    // MARK: - Instinct toggle
+
+    private var instinctSection: some View {{
+        VStack(alignment: .leading, spacing: 10) {{
+            filterSectionLabel(String(localized: "props.filter.instinct.label", defaultValue: "BlackKatt Instinct"))
+            Toggle(
+                String(localized: "props.filter.instinct.toggle",
+                       defaultValue: "Instinct agrees only"),
+                isOn: $localFilter.instinctAgreesOnly
+            )
+            .tint(.green)
+            .onChange(of: localFilter.instinctAgreesOnly) {{ _, _ in onFilterChanged(localFilter) }}
+        }}
+    }}
+
+    // MARK: - Commit button
+
+    private var commitButton: some View {{
+        let title = filteredCount == 0
+            ? String(localized: "props.filter.show.empty", defaultValue: "No Props Match")
+            : String(localized: "props.filter.show.count", defaultValue: "Show \\(filteredCount) Props")
+
+        return Button {{
+            committed = true
+            onCommit(localFilter)
+            isPresented = false
+        }} label: {{
+            Text(title)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(filteredCount == 0 ? Color.gray.opacity(0.3) : Color.accentColor)
+                )
+        }}
+        .disabled(filteredCount == 0)
+        .accessibilityLabel(title)
+        .accessibilityHint(String(localized: "props.filter.show.hint",
+                                  defaultValue: "Applies filters and closes sheet"))
+    }}
+
+    private func filterSectionLabel(_ text: String) -> some View {{
+        Text(text)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.6))
+            .textCase(.uppercase)
+            .kerning(0.5)
+            .accessibilityAddTraits(.isHeader)
+    }}
+}}
+
+// MARK: - FlowChips
+
+/// Multi-select chip grid that wraps to multiple lines.
+private struct FlowChips: View {{
+    let items: [PropStatCategory]
+    @Binding var selection: Set<PropStatCategory>
+    let label: (PropStatCategory) -> String
+
+    var body: some View {{
+        // Simple wrapping layout using ViewThatFits fallback approach
+        // LazyVGrid provides consistent column sizing without a custom Layout.
+        LazyVGrid(columns: [
+            GridItem(.adaptive(minimum: 80, maximum: 140), spacing: 8)
+        ], spacing: 8) {{
+            ForEach(items) {{ item in
+                let isSelected = selection.contains(item)
+                Button {{
+                    if isSelected {{ selection.remove(item) }} else {{ selection.insert(item) }}
+                }} label: {{
+                    Text(label(item))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(isSelected ? .white : .white.opacity(0.6))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(isSelected ? Color.accentColor.opacity(0.3) : .white.opacity(0.07))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .strokeBorder(
+                                            isSelected ? Color.accentColor : .white.opacity(0.15),
+                                            lineWidth: 1
+                                        )
+                                )
+                        )
+                }}
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
+            }}
+        }}
+    }}
+}}
+"""
+
+player_mode_launcher_view_swift = header() + f"""import BKSCore
+import BKSUICore
+import SwiftUI
+
+// MARK: - PlayerModeLauncherView
+
+struct PlayerModeLauncherView: View {{
+    let loadState: ViewState<[BoardEntry]>
+    let topPropOpportunities: [TopPropOpportunity]?
+
+    var body: some View {{
+        VStack(spacing: 12) {{
+            PlayerModeCard(
+                mode: .props,
+                iconColor: .black,
+                stats: propsStats
+            )
+            PlayerModeCard(
+                mode: .draftKings,
+                iconColor: Color(red: 0.33, green: 0.76, blue: 0.22),
+                stats: draftKingsStats
+            )
+            PlayerModeCard(
+                mode: .fanDuel,
+                iconColor: Color(red: 0.28, green: 0.56, blue: 0.96),
+                stats: fanDuelStats
+            )
+        }}
+        .padding(.top, 4)
+        .padding(.bottom, 16)
+    }}
+
+    private var propsStats: [PlayerModeStat] {{
+        guard case .loaded = loadState, let props = topPropOpportunities, !props.isEmpty else {{
+            return []
+        }}
+        let topEdges = props.filter {{ $0.edgePP >= 10 }}.count
+        let bestHitRate = props.map {{ $0.ourProbability }}.max().map {{ Int($0 * 100) }}
+        return [
+            PlayerModeStat(
+                value: "\\(props.count)",
+                label: String(localized: "launcher.props.count", defaultValue: "props")
+            ),
+            PlayerModeStat(
+                value: "\\(topEdges)",
+                label: String(localized: "launcher.props.topEdges", defaultValue: "top edges"),
+                isHighlighted: true
+            ),
+            bestHitRate.map {{
+                PlayerModeStat(
+                    value: "\\($0)%",
+                    label: String(localized: "launcher.props.hitRate", defaultValue: "best hit rate")
+                )
+            }},
+        ].compactMap {{ $0 }}
+    }}
+
+    private var draftKingsStats: [PlayerModeStat] {{
+        [
+            PlayerModeStat(
+                value: "$50K",
+                label: String(localized: "launcher.dk.cap", defaultValue: "cap")
+            ),
+        ]
+    }}
+
+    private var fanDuelStats: [PlayerModeStat] {{
+        [
+            PlayerModeStat(
+                value: "$35K",
+                label: String(localized: "launcher.fd.cap", defaultValue: "cap")
+            ),
+        ]
+    }}
+}}
+
+// MARK: - PlayerModeCard
+
+private struct PlayerModeCard: View {{
+    let mode: BoardViewMode
+    let iconColor: Color
+    let stats: [PlayerModeStat]
+
+    var body: some View {{
+        NavigationLink(value: mode) {{
+            HStack(alignment: .center, spacing: 14) {{
+                ZStack {{
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(iconColor)
+                        .frame(width: 60, height: 60)
+                        .accessibilityHidden(true)
+
+                    if let tag = mode.modeTag {{
+                        Text(tag)
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                    }}
+                }}
+
+                VStack(alignment: .leading, spacing: 2) {{
+                    HStack {{
+                        Text(mode.displayName)
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(.white)
+                        Spacer()
+                    }}
+
+                    if !stats.isEmpty {{
+                        HStack(alignment: .top, spacing: 20) {{
+                            ForEach(stats) {{ stat in
+                                PlayerModeStatView(stat: stat)
+                            }}
+                            Spacer()
+                        }}
+                        .padding(.top, 4)
+                    }}
+                }}
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.white.opacity(AppOpacity.muted))
+            }}
+            .padding(.horizontal, 17)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .appCard()
+        }}
+        .containerRelativeFrame(.horizontal) {{ width, _ in width - 32 }}
+        .buttonStyle(.plain)
+        .accessibilityLabel(statsAccessibilityLabel)
+        .accessibilityHint(String(localized: "a11y.launcher.card.hint", defaultValue: "Open"))
+    }}
+
+    private var statsAccessibilityLabel: String {{
+        var parts = [mode.displayName]
+        for stat in stats {{
+            parts.append("\\(stat.value) \\(stat.label)")
+        }}
+        return parts.joined(separator: ", ")
+    }}
+}}
+
+// MARK: - PlayerModeStatView
+
+private struct PlayerModeStatView: View {{
+    let stat: PlayerModeStat
+
+    var body: some View {{
+        VStack(alignment: .center, spacing: 1) {{
+            Text(stat.value)
+                .font(.system(size: 16, weight: .semibold).monospacedDigit())
+                .foregroundStyle(
+                    stat.isHighlighted
+                        ? Color(red: 0.33, green: 0.76, blue: 0.22)
+                        : .white
+                )
+            Text(stat.label)
+                .font(.system(size: 12))
+                .foregroundStyle(.white.opacity(AppOpacity.secondary))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }}
+    }}
+}}
+
+// MARK: - PlayerModeStat
+
+private struct PlayerModeStat: Identifiable {{
+    var id: String {{ label }}
+    let value: String
+    let label: String
+    var isHighlighted: Bool = false
+}}
+
+// MARK: - BoardViewMode helpers
+
+extension BoardViewMode {{
+    var displayName: String {{
+        switch self {{
+        case .props:
+            return String(localized: "board.view.props", defaultValue: "Sports Markets")
+        case .draftKings:
+            return String(localized: "board.view.draftKings.short", defaultValue: "DraftKings")
+        case .fanDuel:
+            return String(localized: "board.view.fanDuel.short", defaultValue: "FanDuel")
+        }}
+    }}
+
+    var modeTag: String? {{
+        switch self {{
+        case .props: return String(localized: "board.view.props.tag", defaultValue: "Props")
+        case .draftKings: return String(localized: "board.view.dfs.tag", defaultValue: "DFS")
+        case .fanDuel: return String(localized: "board.view.dfs.tag", defaultValue: "DFS")
+        }}
+    }}
+
+    var navigationTitle: String {{
+        switch self {{
+        case .props:
+            return String(localized: "board.view.props", defaultValue: "Sports Markets")
+        case .draftKings:
+            return String(localized: "board.view.draftKings", defaultValue: "DraftKings")
+        case .fanDuel:
+            return String(localized: "board.view.fanDuel", defaultValue: "FanDuel")
+        }}
+    }}
+}}
+"""
+
+write_if_absent(os.path.join(props_views_dir,   "PropSlateSynthesisCard.swift"),   prop_slate_synthesis_card_swift)
+write_if_absent(os.path.join(props_views_dir,   "PropsFeedFilterSheet.swift"),     props_feed_filter_sheet_swift)
+write_if_absent(os.path.join(board_views_dir,   "PlayerModeLauncherView.swift"),   player_mode_launcher_view_swift)
 write(os.path.join(profile_views_dir, "ProfileContainerView.swift"),     profile_container_swift)
 write(os.path.join(profile_views_dir, "NotificationsDetailView.swift"),  notifications_detail_swift)
 
@@ -7132,6 +7636,234 @@ write(os.path.join(out_dir, "App/Config/Release.xcconfig"), release_template)
 
 # Tests directory placeholder so XcodeGen finds the path
 write(os.path.join(out_dir, "App/Tests/.gitkeep"), "")
+
+# ── Board performance baselines (XCTest measure blocks) ────────────────────
+
+board_performance_tests_swift = header() + f"""import XCTest
+@testable import {type_prefix}
+@testable import BKSCore
+
+/// Performance baselines for the Board cold-launch flow.
+///
+/// Run via: `xcodebuild test -project App/{type_prefix}.xcodeproj -scheme {type_prefix}
+/// -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17'
+/// -only-testing:{type_prefix}Tests/BoardPerformanceTests`.
+///
+/// XCTest records and pins baselines per host machine. The first run establishes
+/// the baseline; subsequent runs fail if they regress by more than the configured
+/// percentage (default 10%).
+final class BoardPerformanceTests: XCTestCase {{
+
+    /// Measures the synchronous `BoardEntryBuilder.build` join for a realistic
+    /// slate. This is the largest single block of CPU work on the Board cold path.
+    func testBoardEntryBuildPerformance() {{
+        let projections = SeedData.makeProjections(count: 400)
+        let opportunities = SeedData.makeOpportunities(count: 400)
+        let today = "2026-05-16"
+
+        measure(metrics: [XCTClockMetric(), XCTCPUMetric(), XCTMemoryMetric()]) {{
+            _ = BoardEntryBuilder.build(
+                players: [],
+                projections: projections,
+                opportunities: opportunities,
+                todayDateString: today
+            )
+        }}
+    }}
+
+    /// Measures `applyFilters`-equivalent work under a realistic search-as-you-type scenario.
+    func testBoardApplyFiltersPerformance() {{
+        let projections = SeedData.makeProjections(count: 400)
+        let opportunities = SeedData.makeOpportunities(count: 400)
+        let entries = BoardEntryBuilder.build(
+            players: [],
+            projections: projections,
+            opportunities: opportunities,
+            todayDateString: "2026-05-16"
+        )
+        let search = "smi"
+
+        measure(metrics: [XCTClockMetric(), XCTCPUMetric()]) {{
+            _ = entries.filter {{ entry in
+                entry.displayName.lowercased().contains(search)
+                    || entry.team.lowercased().contains(search)
+                    || (entry.position?.lowercased().contains(search) ?? false)
+            }}
+        }}
+    }}
+}}
+
+// MARK: - Seed data
+
+/// Test data factories producing realistic slates for performance benchmarks.
+///
+/// Names and teams vary so the filter benchmark exercises real string scanning
+/// rather than short-circuiting on identical values.
+enum SeedData {{
+
+    private static let firstNames = [
+        "Aaron", "Blake", "Carlos", "David", "Evan",
+        "Fernando", "George", "Henry", "Ivan", "Jake",
+        "Kevin", "Luis", "Marcus", "Nathan", "Oscar",
+        "Pablo", "Quinn", "Rafael", "Samuel", "Tyler",
+        "Uriel", "Victor", "Walter", "Xavier", "Yoan",
+        "Zack", "Smith", "Jones", "Brown", "Davis",
+    ]
+
+    private static let lastNames = [
+        "Smith", "Johnson", "Williams", "Brown", "Jones",
+        "Garcia", "Miller", "Davis", "Martinez", "Hernandez",
+        "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas",
+        "Taylor", "Moore", "Jackson", "Martin", "Lee",
+        "Perez", "Thompson", "White", "Harris", "Sanchez",
+        "Clark", "Ramirez", "Lewis", "Robinson", "Walker",
+    ]
+
+    private static let teams = [
+        "NYY", "BOS", "LAD", "CHC", "SFG",
+        "HOU", "ATL", "NYM", "PHI", "TBR",
+        "SEA", "MIN", "CLE", "DET", "BAL",
+        "TOR", "OAK", "TEX", "KCR", "CWS",
+        "STL", "MIL", "CIN", "PIT", "COL",
+        "ARI", "SDP", "MIA", "WSN", "LAA",
+    ]
+
+    private static let positions = ["SP", "RP", "C", "1B", "2B", "3B", "SS", "OF", "DH"]
+
+    private static let opponents = [
+        "NYY", "BOS", "LAD", "CHC", "SFG",
+        "HOU", "ATL", "NYM", "PHI", "TBR",
+    ]
+
+    private static func name(at index: Int) -> String {{
+        let first = firstNames[index % firstNames.count]
+        let last = lastNames[(index * 7 + 3) % lastNames.count]
+        return "\\(first) \\(last)"
+    }}
+
+    private static func team(at index: Int) -> String {{
+        teams[index % teams.count]
+    }}
+
+    private static func position(at index: Int) -> String {{
+        positions[index % positions.count]
+    }}
+
+    private static func tier(at index: Int) -> TierLevel {{
+        switch index % 4 {{
+        case 0: return .elite
+        case 1: return .good
+        case 2: return .solid
+        default: return .bottom
+        }}
+    }}
+
+    private static func gameDate() -> Date {{
+        // Fixed date matching today's slate string
+        var components = DateComponents()
+        components.year = 2026
+        components.month = 5
+        components.day = 16
+        components.hour = 19
+        components.minute = 10
+        return Calendar.current.date(from: components) ?? Date()
+    }}
+
+    private static func makeTodayGame(index: Int, today: Date) -> ProjectedGame {{
+        ProjectedGame(
+            id: "game-proj-\\(index)",
+            gameDate: today,
+            gameDateTime: today,
+            opponentAbbr: opponents[index % opponents.count],
+            isHome: index.isMultiple(of: 2)
+        )
+    }}
+
+    static func makeProjections(count: Int) -> [Projection] {{
+        let today = gameDate()
+        return (0..<count).map {{ index in
+            let hotStreak: Int? = index.isMultiple(of: 4) ? (index % 5) + 1 : nil
+            let coldStreak: Int? = index.isMultiple(of: 7) ? (index % 3) + 1 : nil
+            let trendDir: TrendDirection = index.isMultiple(of: 3) ? .up : (index.isMultiple(of: 5) ? .down : .flat)
+            let confidence = 0.5 + Double(index % 50) / 100.0
+            let rankScore = 20.0 + Double(index % 30)
+            let seasonAvg = 0.220 + Double(index % 80) / 1000.0
+            let seasonOBP = 0.300 + Double(index % 60) / 1000.0
+            let seasonSLG = 0.380 + Double(index % 100) / 1000.0
+            let seasonOPS = 0.680 + Double(index % 150) / 1000.0
+            let seasonWAR = Double(index % 50) / 10.0
+            return Projection(
+                id: "proj-\\(index)",
+                displayName: name(at: index),
+                team: team(at: index),
+                position: position(at: index),
+                headshotURL: nil,
+                externalPersonID: 500_000 + index,
+                rankingScore: rankScore,
+                injuryStatus: nil,
+                isSurging: index.isMultiple(of: 5),
+                upcomingGames: [makeTodayGame(index: index, today: today)],
+                hotStreak: hotStreak,
+                coldStreak: coldStreak,
+                trendDirection: trendDir,
+                confidenceScore: confidence,
+                seasonAvg: seasonAvg,
+                seasonOBP: seasonOBP,
+                seasonSLG: seasonSLG,
+                seasonOPS: seasonOPS,
+                seasonWAR: seasonWAR
+            )
+        }}
+    }}
+
+    // swiftlint:disable:next function_body_length
+    static func makeOpportunities(count: Int) -> [Opportunity] {{
+        let today = gameDate()
+        return (0..<count).map {{ index in
+            let personID = 500_000 + index
+            let oppScore = 50.0 + Double(index % 50)
+            let isTopPick = index.isMultiple(of: 10)
+            let topPickRank: Int? = isTopPick ? index / 10 + 1 : nil
+            let topPickReasons: [String] = isTopPick ? ["Hot streak", "Favorable matchup"] : []
+            let battingOrder: Int? = index.isMultiple(of: 9) ? nil : (index % 9) + 1
+            let parkFactor = 0.9 + Double(index % 20) / 100.0
+            let trendHits = Double(index % 30) / 10.0
+            let seasonAvg = 0.220 + Double(index % 80) / 1000.0
+            let wobaProxy = 0.300 + Double(index % 70) / 1000.0
+            let obpProxy = 0.310 + Double(index % 60) / 1000.0
+            let avgPaPerGame = 3.5 + Double(index % 15) / 10.0
+            return Opportunity(
+                id: "opp-\\(index)",
+                displayName: name(at: index),
+                team: team(at: index),
+                position: position(at: index),
+                opponentAbbr: opponents[index % opponents.count],
+                headshotURL: nil,
+                externalPersonID: personID,
+                opportunityScore: oppScore,
+                opportunityTier: tier(at: index),
+                injuryStatus: nil,
+                isSurging: index.isMultiple(of: 5),
+                isHome: index.isMultiple(of: 2),
+                gameDateTime: today,
+                isTopPick: isTopPick,
+                topPickRank: topPickRank,
+                topPickReasons: topPickReasons,
+                battingOrder: battingOrder,
+                probablePitcher: "Starter \\(index % 15)",
+                parkFactor: parkFactor,
+                trendHits: trendHits,
+                seasonAvg: seasonAvg,
+                wobaProxy: wobaProxy,
+                obpProxy: obpProxy,
+                avgPaPerGame: avgPaPerGame
+            )
+        }}
+    }}
+}}
+"""
+
+write_if_absent(os.path.join(out_dir, "App/Tests/BoardPerformanceTests.swift"), board_performance_tests_swift)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. Info.plist
@@ -7514,6 +8246,7 @@ excluded:
   - .swiftpm
   - App/.build
   - "**/SourcePackages"
+  - .claude
 
 # Opt-in rules beyond defaults
 opt_in_rules:
@@ -7786,22 +8519,23 @@ position_labels = ", ".join(p["label"] for p in positions)
 claude_md = f"""# CLAUDE.md
 
 ## Project Overview
-iOS app built with Swift and SwiftUI, targeting iOS {deploy_tgt}+. Uses Swift Package Manager for dependencies.
+iOS app — Swift {swift_ver} / Xcode {xcode_ver}, targeting iOS {deploy_tgt}+. SwiftUI + SPM.
 
 ## Build & Test Commands
-- **Build**: `xcodebuild -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`
-- **Test**: `xcodebuild test -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`
+- **Build**: `xcodebuild -project App/{app_target}.xcodeproj -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`
+- **Test**: `xcodebuild test -project App/{app_target}.xcodeproj -scheme {app_target} -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`
+- **Build until clean**: Run build, fix all errors and warnings, repeat until `grep -E "error:|warning:"` returns only the `appintentsmetadataprocessor` tooling line (not a real warning). Always fix all issues before considering a task done.
 - **Lint**: `swiftlint`
 - **Regenerate project**: `./generate.sh` (from repo root — runs xcodegen then syncs both Package.resolved files)
   - **Never** run `xcodegen generate` directly; always use `./generate.sh` to keep the inner and outer Package.resolved in sync
 - **After every build cycle** (mandatory, no exceptions): Always nuke DerivedData, re-resolve, and sync both Package.resolved files:
   ```
   rm -rf ~/Library/Developer/Xcode/DerivedData/{app_target}-*
-  xcodebuild -resolvePackageDependencies -scheme {app_target}
-  cp App/{app_target}.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved *.xcworkspace/xcshareddata/swiftpm/Package.resolved
+  xcodebuild -resolvePackageDependencies -project App/{app_target}.xcodeproj -scheme {app_target}
+  cp App/{app_target}.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved {app_target}.xcworkspace/xcshareddata/swiftpm/Package.resolved
   ```
   This is required after every build, tag, package bump, or significant change — not just SPM version bumps. Skipping causes stale SPM source, phantom build errors, and layout bugs that are invisible until device.
-- **Before completing any task**: Run `swiftlint` and verify it produces no warnings or errors in app source. Confirm both `Package.resolved` files are in sync. Run a full build and confirm `BUILD SUCCEEDED` with no `error:` or `warning:` lines beyond the `appintentsmetadataprocessor` tooling noise.
+- **Before completing any task**: Run `swiftlint` and verify it produces no warnings or errors in app source. Confirm both `Package.resolved` files are in sync (inner `App/{app_target}.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved` and outer `{app_target}.xcworkspace/xcshareddata/swiftpm/Package.resolved` must match). Run a full build and confirm `BUILD SUCCEEDED` with no `error:` or `warning:` lines beyond the `appintentsmetadataprocessor` tooling noise.
 
 ## Code Standards
 - Use async/await for all new concurrency code (no Combine for new work)
@@ -7821,19 +8555,11 @@ iOS app built with Swift and SwiftUI, targeting iOS {deploy_tgt}+. Uses Swift Pa
 - **Never** use bare `String(localized: "some.key")` without `defaultValue:` — it renders the raw key if the catalog entry is missing
 
 ## Template Origin
+Scaffolded by **BKS-Sports-iOS**: https://github.com/bkatnich/BKS-Sports-iOS
 
-This project was scaffolded by the **BKS-Sports-iOS** code generator:
+The generator takes `sports/{slug}.yaml` and produces sport-specific Swift files. If templates change, re-run `./scaffold.sh {slug}` from the template repo.
 
-https://github.com/bkatnich/BKS-Sports-iOS
-
-The generator takes `sports/{slug}.yaml` and produces the sport-specific Swift files. If the generator's templates change, re-run `./scaffold.sh {slug}` from the template repo to regenerate those files.
-
-`project.yml` is **write-if-absent** by default — re-running the scaffold never overwrites it. To regenerate it from the YAML spec, pass `--regen-project`:
-```
-./scaffold.sh --regen-project {slug}
-```
-
-**Do NOT** automatically propagate changes from this project back to the template repo. Always ask for explicit permission before modifying files in the BKS-Sports-iOS generator.
+**Do NOT** propagate changes from this project back to the template repo without explicit permission.
 
 ## Architecture
 - **Pattern**: MVI (Store/Reduce unidirectional data flow) via BKSCore
@@ -7845,31 +8571,24 @@ The generator takes `sports/{slug}.yaml` and produces the sport-specific Swift f
 Sources/
 ├── App/           — Composition root ({type_prefix}App, AppShell, DependencyContainer)
 ├── Core/
-│   ├── Services/  — Sport-specific implementations (BoardService, OpportunitiesService, GamesService)
-│   │              — BoardService owns get-board (schedule + players + odds); GamesService owns game logs + playoff bracket
-│   ├── Models/    — Domain models (Player, Opportunity, Projection, PlayoffSeries, LeagueState)
-│   ├── Sport/     — Sport extensions (SportConfiguration+<Sport>, SportPositionMap+<Sport>, <Calc>)
+│   ├── Services/  — Sport-specific implementations (BoardService, GamesService)
+│   │              — BoardService owns get-board (schedule + players + odds + props); GamesService owns game logs + playoff bracket
+│   ├── Models/    — Domain models (Opportunity, Projection, TopPropOpportunity, PropSlateSynthesis, PropEdgeTier, PropStatCategory, LeagueState)
+│   ├── Sport/     — Sport extensions (SportConfiguration+<Sport>, SportPositionMap+<Sport>)
 │   │              — Base types (SportConfiguration, SportPositionMap, ScoringCalculator) live in BKSCore
-│   ├── Utilities/ — Shared helpers (ConfigurationKeys, VisiblePushEvent, NotificationPreferenceKey)
+│   ├── Utilities/ — Shared helpers (ConfigurationKeys, VisiblePushEvent, NotificationPreferenceKey, PropFeedFilter, GamedayTopicManager)
 │   │              — (Filterable, PlayerLookup, PushNotificationNames) live in BKSCore
 │   └── UI/        — Shared views (TierTypes+UI, TierThresholds)
 └── Features/
-    ├── Board/          — Primary sport feature (stub — customise post-generation)
+    ├── Board/          — Primary sport feature
     │   ├── Models/ — BoardEntry, BoardEntryBuilder
     │   ├── Store/  — BoardState, BoardIntent
-    │   └── Views/  — BoardView, GameLogViews
+    │   └── Views/  — BoardView, PlayerModeLauncherView, Props/ feed views
     ├── Profile/
     │   └── Views/  — ProfileContainerView, NotificationsDetailView
     ├── PromoCode/      — BKSUICore owns logic; directories only
     └── Subscription/   — BKSUICore owns logic; directories only
 ```
-
-### Agent ownership boundaries
-- **Core/Services/ + Core/Models/**: Data Agent
-- **Core/Sport/ + Core/Utilities/ + Core/Utilities/**: whichever agent's task requires it; coordinate if both need changes
-- **Features/*/Views/**: UI Agent
-- **Features/*/Store/**: UI Agent (state) or Data Agent (service wiring)
-- **Tests/**: Test Agent
 
 ## Branch Policy
 - **Always commit and push to `develop`** — this is the default integration branch for all work.
@@ -7893,7 +8612,7 @@ Each agent owns a distinct set of files. Two agents must never edit the same fil
 - **UI Agent**: `Sources/Features/*/Views/`
 - **Data Agent**: `Sources/Core/Services/`, `Sources/Core/Models/`
 - **Test Agent**: `Tests/`
-- Shared code (`Sources/Core/Sport/`, `Sources/Core/Utilities/`, `Sources/Core/Utilities/`) is owned by whichever agent's task requires the change; coordinate via the lead if both need changes
+- Shared code (`Sources/Core/Sport/`, `Sources/Core/Utilities/`) is owned by whichever agent's task requires the change; coordinate via the lead if both need changes
 
 ### Workflow stages
 1. **Research** — Read-only agents investigate in parallel. No file writes.
@@ -7914,13 +8633,29 @@ write(os.path.join(out_dir, "CLAUDE.md"), claude_md)
 # .claude/skills/ios-advisor.md  (iOS Architect advisor skill for Claude Code)
 # ─────────────────────────────────────────────────────────────────────────────
 
-ios_advisor_skill_path = os.path.join(SCRIPT_DIR, ".claude", "skills", "ios-advisor.md")
+ios_advisor_skill_path = os.path.join(SCRIPT_DIR, ".claude", "skills", "ios-advisor", "SKILL.md")
 if os.path.exists(ios_advisor_skill_path):
     with open(ios_advisor_skill_path) as f:
         ios_advisor_skill = f.read()
-    write(os.path.join(out_dir, ".claude", "skills", "ios-advisor.md"), ios_advisor_skill)
+    write(os.path.join(out_dir, ".claude", "skills", "ios-advisor", "SKILL.md"), ios_advisor_skill)
 else:
     print(f"  warning: {ios_advisor_skill_path} not found — skipping ios-advisor skill")
+
+# run-<app> skill: simulator driver + manifest, tokenized per sport.
+run_skill_name = f"run-{prefix.lower()}-{slug}"
+run_skill_src = os.path.join(SCRIPT_DIR, "assets", "skills", "run-app")
+if os.path.isdir(run_skill_src):
+    for fname in ("SKILL.md", "driver.swift"):
+        with open(os.path.join(run_skill_src, fname)) as f:
+            content = f.read()
+        content = (content
+                   .replace("com.blackkatt.bksbaseball", bundle_id)
+                   .replace("BKS Baseball", app_name)
+                   .replace("BKSBaseball", type_prefix)
+                   .replace("bks-baseball", f"{prefix.lower()}-{slug}"))
+        write(os.path.join(out_dir, ".claude", "skills", run_skill_name, fname), content)
+else:
+    print(f"  warning: {run_skill_src} not found — skipping {run_skill_name} skill")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # workspace.yml  (xcodegen workspace config)
@@ -8015,14 +8750,13 @@ print("  (Player lives in BKSCore — not generated)")
 print("  (DiagnosticLogger lives in BKSCore — not generated)")
 print()
 print("Services (sport-specific implementations — protocols in BKSCore):")
-print(f"  App/Sources/Core/Services/OpportunitiesService.swift")
-print(f"  App/Sources/Core/Services/ProjectionsService.swift")
+print(f"  App/Sources/Core/Services/BoardService.swift")
 print(f"  App/Sources/Core/Services/GamesService.swift")
-print(f"  App/Sources/Core/Services/PlayoffService.swift")
 print()
 print("Sport configuration (BKSCore owns base types; scaffold generates sport extensions):")
 print(f"  App/Sources/Core/Sport/SportPositionMap+{swift_name}.swift")
-print(f"  App/Sources/Core/Sport/{calc_name}.swift")
+if not use_null_calc:
+    print(f"  App/Sources/Core/Sport/{calc_name}.swift")
 print(f"  App/Sources/Core/Sport/SportConfiguration+{swift_name}.swift")
 print()
 print("Core UI & Utilities:")
@@ -8057,6 +8791,7 @@ print(f"  App/Config/Debug.xcconfig.template")
 print(f"  App/Config/Release.xcconfig                      ← gitignored; add real secrets")
 print(f"  App/Config/Release.xcconfig.template")
 print(f"  App/Tests/.gitkeep")
+print(f"  App/Tests/BoardPerformanceTests.swift")
 print(f"  App/Config/{app_target}Tests.xcconfig")
 print(f"  App/Sources/App/Resources/Info.plist")
 print(f"  App/Sources/App/Resources/InfoPlist.xcstrings")
@@ -8350,8 +9085,10 @@ if [[ -n "$XCODEGEN" ]]; then
 }
 RESOLVED_EOF
         echo "  wrote  Package.resolved (pinned package versions)"
-        echo "  Opening project in Xcode (packages pre-pinned, no resolution required)..."
-        open "$XCODEPROJ"
+        if [[ "${SCAFFOLD_OPEN:-1}" == "1" ]]; then
+            echo "  Opening project in Xcode (packages pre-pinned, no resolution required)..."
+            open "$XCODEPROJ"
+        fi
     fi
 else
     echo ""
