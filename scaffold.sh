@@ -2794,6 +2794,12 @@ final class BoardService: BoardServiceProtocol {{
             bkSpreadPick: dto.bkSpreadPick,
             bkSpreadPickCovers: dto.bkSpreadPickCovers,
             bkSpreadConfidence: dto.bkSpreadConfidence,
+            vegasOverUnder: dto.vegasOverUnder,
+            bkOuPick: dto.bkOuPick.flatMap(OUPick.init(rawValue:)),
+            bkOuEdge: dto.bkOuEdge,
+            bkOuConfidence: dto.bkOuConfidence,
+            ouPick: dto.ouPick.flatMap(OUPick.init(rawValue:)),
+            ouPickRationale: dto.ouPickRationale,
             isDoubleheader: dto.isDoubleheader,
             gameSequence: dto.gameSequence,
             scoringTier: dto.scoringTier
@@ -3007,6 +3013,14 @@ private struct BoardGameDTO: Decodable {{
     let bkSpreadPick: String?
     let bkSpreadPickCovers: Bool?
     let bkSpreadConfidence: Double?
+    let vegasOverUnder: Double?
+    // Picks decode as raw strings, not OUPick — a novel server value must degrade
+    // to nil in mapGame, not throw and kill the whole board decode.
+    let bkOuPick: String?
+    let bkOuEdge: Double?
+    let bkOuConfidence: Double?
+    let ouPick: String?
+    let ouPickRationale: String?
     let projTotal: Double?
     let homeProjTotal: Double?
     let visitorProjTotal: Double?
@@ -3028,6 +3042,12 @@ private struct BoardGameDTO: Decodable {{
         case bkSpreadPick = "bk_spread_pick"
         case bkSpreadPickCovers = "bk_spread_pick_covers"
         case bkSpreadConfidence = "bk_spread_confidence"
+        case vegasOverUnder = "vegas_over_under"
+        case bkOuPick = "bk_ou_pick"
+        case bkOuEdge = "bk_ou_edge"
+        case bkOuConfidence = "bk_ou_confidence"
+        case ouPick = "ou_pick"
+        case ouPickRationale = "ou_pick_rationale"
         case projTotal = "proj_total"
         case homeProjTotal = "home_proj_total"
         case visitorProjTotal = "visitor_proj_total"
@@ -9085,8 +9105,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSCore.git",
       "state" : {
-        "revision" : "9067cf30fbe49236d73933be69b4ca8c0d4fb684",
-        "version" : "2.4.12"
+        "revision" : "dfd64e581d939ea23d984b7b5e3a168176737942",
+        "version" : "2.4.14"
       }
     },
     {
@@ -9094,8 +9114,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSUICore.git",
       "state" : {
-        "revision" : "9250ca0c49b5b3229c03a51908d0731b257b6fde",
-        "version" : "1.5.60"
+        "revision" : "1f3c5a280072f406179ee80cd6745c5be7b2319f",
+        "version" : "1.5.62"
       }
     },
     {
