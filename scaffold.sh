@@ -6960,7 +6960,7 @@ struct PropSlateSynthesisCard: View {{
                 .font(.system(size: 11))
                 .foregroundStyle(.cyan.opacity(0.8))
                 .accessibilityHidden(true)
-            Text(String(localized: "props.slate.narrative.header", defaultValue: "SLATE ANALYSIS"))
+            Text(String(localized: "props.slate.narrative.header", defaultValue: "PROPS ANALYSIS"))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.7))
                 .kerning(0.8)
@@ -6996,7 +6996,7 @@ struct PropSlateSynthesisCard: View {{
 
     private var accessibilityLabel: String {{
         var parts: [String] = [
-            String(localized: "props.slate.narrative.header.a11y", defaultValue: "Slate Analysis"),
+            String(localized: "props.slate.narrative.header.a11y", defaultValue: "Props Analysis"),
             synthesis.dailyPropNarrative,
         ]
         for contradiction in synthesis.contradictions {{
