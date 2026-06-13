@@ -2734,7 +2734,8 @@ final class BoardService: BoardServiceProtocol {{
         return DailyAnalysis(
             date: dto.date,
             cached: false,
-            slateInsight: dto.slateInsight ?? "",
+            gameNarratives: dto.gameNarratives ?? [],
+            card: dto.card ?? "",
             slateNarrativeSections: nil,
             topProjections: dto.topProjections ?? [],
             keyTrends: dto.keyTrends ?? [],
@@ -2874,7 +2875,8 @@ private struct BoardAnalysisDTO: Decodable {{
     let generatedAt: String
     let model: String?
     let dataConfidence: String?
-    let slateInsight: String?
+    let gameNarratives: [String]?
+    let card: String?
     let topProjections: [String]?
     let keyTrends: [String]?
     let emergingPlays: [String]?
@@ -2885,7 +2887,8 @@ private struct BoardAnalysisDTO: Decodable {{
         case generatedAt = "generated_at"
         case model
         case dataConfidence = "data_confidence"
-        case slateInsight = "slate_insight"
+        case gameNarratives = "game_narratives"
+        case card
         case topProjections = "top_projections"
         case keyTrends = "key_trends"
         case emergingPlays = "emerging_plays"
@@ -2898,7 +2901,8 @@ private struct BoardAnalysisDTO: Decodable {{
         generatedAt = try container.decode(String.self, forKey: .generatedAt)
         model = try container.decodeIfPresent(String.self, forKey: .model)
         dataConfidence = try container.decodeIfPresent(String.self, forKey: .dataConfidence)
-        slateInsight = try container.decodeIfPresent(String.self, forKey: .slateInsight)
+        gameNarratives = try container.decodeIfPresent([String].self, forKey: .gameNarratives)
+        card = try container.decodeIfPresent(String.self, forKey: .card)
         topProjections = try container.decodeIfPresent([String].self, forKey: .topProjections)
         keyTrends = try container.decodeIfPresent([String].self, forKey: .keyTrends)
         emergingPlays = try container.decodeIfPresent([String].self, forKey: .emergingPlays)
@@ -2920,7 +2924,8 @@ private struct BoardAnalysisDTO: Decodable {{
     }}
 }}
 
-private struct PropSlateSynthesisDTO: Decodable {{
+// Internal (not private) so decode-tolerance tests can exercise it directly.
+struct PropSlateSynthesisDTO: Decodable {{
     let rankedPicks: [SlatePickDTO]
     let dailyPropNarrative: String
     let contradictions: [String]
@@ -2933,13 +2938,36 @@ private struct PropSlateSynthesisDTO: Decodable {{
 
     init(from decoder: Decoder) throws {{
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        rankedPicks = try container.decodeIfPresent([SlatePickDTO].self, forKey: .rankedPicks) ?? []
+        // Lossy per-element decode: synthesis is unvalidated LLM output and the
+        // server has shipped ranked_picks entries as bare strings (2026-06-12).
+        // A malformed pick is dropped; it must never fail the whole board response.
+        if var picksContainer = try? container.nestedUnkeyedContainer(forKey: .rankedPicks) {{
+            var parsed: [SlatePickDTO] = []
+            while !picksContainer.isAtEnd {{
+                if let pick = try? picksContainer.decode(SlatePickDTO.self) {{
+                    parsed.append(pick)
+                }} else if (try? picksContainer.decode(DecodableSkip.self)) == nil {{
+                    break // container refused to advance — bail rather than spin
+                }}
+            }}
+            rankedPicks = parsed
+        }} else {{
+            rankedPicks = []
+        }}
         dailyPropNarrative = try container.decode(String.self, forKey: .dailyPropNarrative)
         contradictions = try container.decodeIfPresent([String].self, forKey: .contradictions) ?? []
     }}
 }}
 
-private struct SlatePickDTO: Decodable {{
+/// Consumes and discards one element of any shape from an unkeyed container.
+/// A failed `decode` does NOT advance an unkeyed container's index, so a bad
+/// element would otherwise spin `while !isAtEnd` forever; decoding this empty
+/// type always succeeds and moves past it.
+private struct DecodableSkip: Decodable {{
+    init(from decoder: Decoder) throws {{}}
+}}
+
+struct SlatePickDTO: Decodable {{
     let playerID: String
     let market: String
     let conviction: String
@@ -9105,8 +9133,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSCore.git",
       "state" : {
-        "revision" : "dfd64e581d939ea23d984b7b5e3a168176737942",
-        "version" : "2.4.14"
+        "revision" : "7fdfae9c4b3b78a57413359e83d4adf2ac588e3a",
+        "version" : "2.4.15"
       }
     },
     {
@@ -9114,8 +9142,8 @@ if [[ -n "$XCODEGEN" ]]; then
       "kind" : "remoteSourceControl",
       "location" : "git@github.com:bkatnich/BKSUICore.git",
       "state" : {
-        "revision" : "1f3c5a280072f406179ee80cd6745c5be7b2319f",
-        "version" : "1.5.62"
+        "revision" : "483241253fa330621e339bfb8ff6d4b88b77da82",
+        "version" : "1.5.63"
       }
     },
     {
